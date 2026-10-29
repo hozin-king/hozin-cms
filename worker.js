@@ -8,7 +8,12 @@
 //   dan komentar itu pun pending sampai admin setujui.
 // - Login di-rate-limit: 5x gagal dari satu IP dalam 15 menit -> diblokir sementara (429).
 // - Semua aksi admin POST wajib membawa token CSRF yang terikat sesi (HMAC).
-// - Header keamanan di semua respons HTML. Konten user di-escape — tidak ada HTML mentah user.
+// - Backup: database stopwatch khusus jadi tempat backup CMS (bukan database
+//   live kedua). Panel admin super-super-admin punya tombol "Buat Backup
+//   Sekarang" + riwayat backup (berhasil/gagal, jumlah baris, pesan error).
+//   Backup menyalin post, komentar, pengaturan, dan plugin dari DB utama
+//   ke tabel cms_backup_* di stopwatch. Satu-satunya sumber kebenaran tetap
+//   DB utama; salinan di stopwatch tidak pernah ditulis dari admin.
 // Admin: login pakai ADMIN_TOKEN (secret di Worker, BUKAN di kode ini, buat acak >=32 karakter,
 //   jangan dibagikan, ganti segera bila bocor) -> cookie sesi HMAC 7 hari (HttpOnly, Secure, SameSite=Lax).
 // Deploy: esbuild worker.js --bundle --format=esm, upload dengan binding D1 bernama DB + secret ADMIN_TOKEN.
@@ -82,6 +87,7 @@ async function ensureSchema(env) {
         env.DB.prepare(`CREATE TABLE IF NOT EXISTS cms_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`),
         env.DB.prepare(`CREATE TABLE IF NOT EXISTS cms_plugins (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1)`),
         env.DB.prepare(`CREATE TABLE IF NOT EXISTS cms_login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, created_at TEXT NOT NULL)`),
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS cms_backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, status TEXT NOT NULL, posts INTEGER NOT NULL DEFAULT 0, comments INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '')`),
       ]);
       await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('site_title', 'Hozin King')`).run();
       await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`).run();
@@ -105,6 +111,45 @@ async function getEnabledPlugins(env) {
   const rows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
   const map = new Map((rows.results || []).map(r => [r.id, Number(r.enabled) === 1]));
   return pluginDefs.filter(p => map.get(p.id) !== false);
+}
+// Backup CMS ke stopwatch (binding BACKUP_DB). Mengembalikan {posts, comments}.
+// Salinan = snapshot penuh terbaru: tabel backup dihapus dulu, lalu diisi ulang
+// dari DB utama. Bukan tulis ganda live: fungsi ini hanya jalan saat admin
+// menekan tombol backup, dan salinan tidak pernah ditulis dari jalur lain.
+async function doBackup(env) {
+  if (!env.BACKUP_DB) throw new Error('Binding BACKUP_DB belum dipasang di Worker');
+  const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at ASC`).all();
+  const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at ASC`).all();
+  const settings = await env.DB.prepare(`SELECT * FROM cms_settings ORDER BY key ASC`).all();
+  const plugins = await env.DB.prepare(`SELECT * FROM cms_plugins ORDER BY id ASC`).all();
+  const now = new Date().toISOString();
+  const bak = env.BACKUP_DB;
+  await bak.batch([
+    bak.prepare(`CREATE TABLE IF NOT EXISTS cms_backup_posts (id TEXT PRIMARY KEY, slug TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT 'Umum', status TEXT NOT NULL DEFAULT 'published', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, backup_at TEXT NOT NULL)`),
+    bak.prepare(`CREATE TABLE IF NOT EXISTS cms_backup_comments (id INTEGER PRIMARY KEY, post_id TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, backup_at TEXT NOT NULL)`),
+    bak.prepare(`CREATE TABLE IF NOT EXISTS cms_backup_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, backup_at TEXT NOT NULL)`),
+    bak.prepare(`CREATE TABLE IF NOT EXISTS cms_backup_plugins (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, backup_at TEXT NOT NULL)`),
+  ]);
+  const stmts = [
+    bak.prepare(`DELETE FROM cms_backup_posts`),
+    bak.prepare(`DELETE FROM cms_backup_comments`),
+    bak.prepare(`DELETE FROM cms_backup_settings`),
+    bak.prepare(`DELETE FROM cms_backup_plugins`),
+  ];
+  for (const p of (posts.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_posts (id, slug, title, body, category, status, created_at, updated_at, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(p.id, p.slug, p.title, p.body, p.category, p.status, p.created_at, p.updated_at, now));
+  }
+  for (const c of (comments.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_comments (id, post_id, name, text, status, created_at, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(c.id, c.post_id, c.name, c.text, c.status, c.created_at, now));
+  }
+  for (const s of (settings.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_settings (key, value, backup_at) VALUES (?, ?, ?)`).bind(s.key, s.value, now));
+  }
+  for (const p of (plugins.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_plugins (id, enabled, backup_at) VALUES (?, ?, ?)`).bind(p.id, p.enabled, now));
+  }
+  await bak.batch(stmts);
+  return { posts: (posts.results || []).length, comments: (comments.results || []).length };
 }
 async function renderPage(env, pageTitle, content) {
   const siteTitle = await getSetting(env, 'site_title', 'Hozin King');
@@ -210,7 +255,10 @@ export default {
         const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/admin/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/admin/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('');
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
         const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/admin/plugins/toggle">${csrfField}<input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
-        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain, tidak ada pendaftar publik.</p><form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form><div class="card"><h3>Pengaturan</h3><form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Post Baru</h3><form method="post" action="/admin/posts">${csrfField}<label>Judul</label><input name="title" required><label>Kategori</label><input name="category" value="Umum"><label>Isi</label><textarea name="body" required></textarea><button type="submit">Terbitkan</button></form></div><h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Plugin</h3>${pluginForms}`;
+        const backupRuns = await env.DB.prepare(`SELECT * FROM cms_backup_runs ORDER BY created_at DESC LIMIT 10`).all();
+        const backupRows = (backupRuns.results || []).map(r => `<div class="card"><b>${esc(r.status)}</b> · ${esc(r.created_at)} · ${r.posts} post, ${r.comments} komentar${r.error ? `<p>Error: ${esc(r.error)}</p>` : ''}</div>`).join('') || '<p>Belum ada backup.</p>';
+        const backupCard = `<div class="card"><h3>Backup ke Stopwatch</h3><p>Database stopwatch khusus dipakai sebagai tempat backup CMS. Salinan tidak pernah ditulis dari jalur lain — hanya tombol ini yang menulis ke sana.</p><form method="post" action="/admin/backup">${csrfField}<button type="submit">Buat Backup Sekarang</button></form><h4>Riwayat Backup</h4>${backupRows}</div>`;
+        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain, tidak ada pendaftar publik.</p><form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}<div class="card"><h3>Pengaturan</h3><form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Post Baru</h3><form method="post" action="/admin/posts">${csrfField}<label>Judul</label><input name="title" required><label>Kategori</label><input name="category" value="Umum"><label>Isi</label><textarea name="body" required></textarea><button type="submit">Terbitkan</button></form></div><h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Plugin</h3>${pluginForms}`;
         return html(await renderPage(env, 'Admin', content));
       }
     }
@@ -220,6 +268,16 @@ export default {
       const form = await request.formData();
       if (String(form.get('csrf') || '') !== await csrfToken(env, sessionExp(request))) {
         return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid. Muat ulang dashboard lalu coba lagi.</p></div>'), 403);
+      }
+      if (path === '/admin/backup') {
+        const now = new Date().toISOString();
+        try {
+          const counts = await doBackup(env);
+          await env.DB.prepare(`INSERT INTO cms_backup_runs (created_at, status, posts, comments, error) VALUES (?, 'BERHASIL', ?, ?, '')`).bind(now, counts.posts, counts.comments).run();
+        } catch (e) {
+          await env.DB.prepare(`INSERT INTO cms_backup_runs (created_at, status, posts, comments, error) VALUES (?, 'GAGAL', 0, 0, ?)`).bind(now, String(e && e.message ? e.message : e).slice(0, 300)).run();
+        }
+        return redirect('/admin');
       }
       if (path === '/admin/settings') {
         const siteTitle = String(form.get('site_title') || '').trim().slice(0, 100) || 'Hozin King';

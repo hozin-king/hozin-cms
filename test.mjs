@@ -11,7 +11,7 @@ class Stmt {
 }
 class MockDB {
   constructor() {
-    this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = [];
+    this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = [];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { for (const s of stmts) await s.run(); }
@@ -36,8 +36,24 @@ class MockDB {
     if (s.startsWith('INSERT INTO cms_login_attempts')) { this.attempts.push({ ip: a[0], created_at: a[1] }); return []; }
     if (s.startsWith('SELECT COUNT(*) AS n FROM cms_login_attempts')) return [{ n: this.attempts.filter(x => x.ip === a[0] && x.created_at > a[1]).length }];
     if (s.startsWith('DELETE FROM cms_login_attempts')) { this.attempts = this.attempts.filter(x => x.ip !== a[0]); return []; }
+    if (s.startsWith('INSERT INTO cms_backup_runs')) {
+      const status = (s.match(/'(BERHASIL|GAGAL)'/) || [])[1] || 'GAGAL';
+      this.backupRuns.push(status === 'BERHASIL'
+        ? { created_at: a[0], status, posts: a[1], comments: a[2], error: '' }
+        : { created_at: a[0], status, posts: 0, comments: 0, error: a[1] });
+      return [];
+    }
+    if (s.startsWith('SELECT * FROM cms_backup_runs')) return [...this.backupRuns].sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, 10);
+    // Mock backup DB: tabel cms_backup_* disimpan di objek yang sama, cukup terima tulisnya
+    if (s.startsWith('CREATE TABLE IF NOT EXISTS cms_backup')) return [];
+    if (s.startsWith('DELETE FROM cms_backup')) return [];
+    if (s.startsWith('INSERT INTO cms_backup_posts')) { this.backupPosts = (this.backupPosts || 0) + 1; return []; }
+    if (s.startsWith('INSERT INTO cms_backup_comments')) { this.backupComments = (this.backupComments || 0) + 1; return []; }
+    if (s.startsWith('INSERT INTO cms_backup_settings') || s.startsWith('INSERT INTO cms_backup_plugins')) return [];
     if (s === 'SELECT COUNT(*) AS n FROM cms_posts') return [{ n: this.posts.length }];
     if (s.startsWith('SELECT value FROM cms_settings')) return this.settings.has(a[0]) ? [{ value: this.settings.get(a[0]) }] : [];
+    if (s.startsWith('SELECT * FROM cms_settings ORDER')) return [...this.settings.entries()].map(([key, value]) => ({ key, value })).sort((x, y) => x.key.localeCompare(y.key));
+    if (s.startsWith('SELECT * FROM cms_plugins ORDER')) return [...this.plugins.entries()].map(([id, enabled]) => ({ id, enabled })).sort((x, y) => x.id.localeCompare(y.id));
     if (s.startsWith('SELECT * FROM cms_plugins') || s.startsWith('SELECT id, enabled FROM cms_plugins')) return [...this.plugins.entries()].map(([id, enabled]) => ({ id, enabled }));
     if (s.startsWith('SELECT * FROM cms_posts WHERE status')) return [...this.posts].filter(p => p.status === 'published').sort((x, y) => y.created_at.localeCompare(x.created_at));
     if (s.startsWith('SELECT * FROM cms_posts WHERE slug')) return this.posts.filter(p => p.slug === a[0]);
@@ -53,7 +69,7 @@ class MockDB {
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
-const env = { DB: new MockDB(), ADMIN_TOKEN: 'test-admin-token' };
+const env = { DB: new MockDB(), BACKUP_DB: new MockDB(), ADMIN_TOKEN: 'test-admin-token' };
 const base = 'https://cms.test';
 async function call(method, path, body = null, cookie = '') {
   const headers = {};
@@ -110,4 +126,16 @@ const cid2 = env.DB.comments[env.DB.comments.length - 1].id;
 await call('POST', '/admin/comments/approve', { csrf, id: String(cid2) }, cookie);
 r = await call('GET', '/p/post-uji'); t = await r.text();
 assert(!t.includes('<script>alert(1)</script>') && t.includes('&lt;script&gt;'), 'komentar jahat di-escape');
+
+// 7. Backup ke stopwatch: tombol admin -> salinan di BACKUP_DB + riwayat BERHASIL tampil
+r = await call('POST', '/admin/backup', { csrf }, cookie); assert(r.status === 303, 'tombol backup redirect');
+r = await call('GET', '/admin', null, cookie); t = await r.text();
+assert(t.includes('Backup ke Stopwatch') && t.includes('BERHASIL'), 'riwayat backup BERHASIL tampil di dashboard');
+assert(env.BACKUP_DB.backupPosts >= 2, 'backup menyalin post ke stopwatch');
+// Backup tanpa BACKUP_DB -> dicatat GAGAL, bukan crash
+const savedBak = env.BACKUP_DB; delete env.BACKUP_DB;
+r = await call('POST', '/admin/backup', { csrf }, cookie); assert(r.status === 303, 'backup gagal tetap redirect');
+r = await call('GET', '/admin', null, cookie); t = await r.text();
+assert(t.includes('GAGAL'), 'riwayat backup GAGAL tampil di dashboard');
+env.BACKUP_DB = savedBak;
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

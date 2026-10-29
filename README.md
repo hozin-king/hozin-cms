@@ -17,7 +17,14 @@ khusus CMS ini (lihat `plugins.js` dan `themes.js`).
   template — ganti tema tidak terasa seperti ganti situs lain.
 - **Plugin:** Waktu Baca, Bagikan (WhatsApp/X), Post Terkait. Aktif/nonaktif
   dari panel admin. Tambah plugin = tambah entri di `plugins.js`, redeploy.
-- **Admin:** `/admin`, login pakai password = secret `ADMIN_TOKEN` di Worker.
+- **Backup ke stopwatch:** panel admin super-super-admin punya tombol
+  “Buat Backup Sekarang” + riwayat 10 backup terakhir (BERHASIL/GAGAL,
+  jumlah post & komentar, pesan error bila gagal). Backup menyalin post,
+  komentar (termasuk yang masih pending), pengaturan, dan plugin dari DB
+  utama ke tabel `cms_backup_*` di database stopwatch. Stopwatch khusus
+  jadi tempat backup, bukan database live kedua — salinan tidak pernah
+  ditulis dari jalur lain. Bila binding `BACKUP_DB` belum dipasang, tombol
+  backup mencatat GAGAL dengan pesan jelas, bukan crash.
   Sesi cookie HMAC 7 hari. Admin bisa: ubah judul situs & tema, buat/hapus
   post, setujui/hapus komentar, aktif/nonaktifkan plugin.
 - **Footer dipertahankan dari situs lama:** copyright `© 2024–tahun berjalan`
