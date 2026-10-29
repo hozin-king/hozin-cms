@@ -128,8 +128,18 @@ export async function doBackup(env) {
   return { posts: (posts.results || []).length, comments: (comments.results || []).length };
 }
 
+// Judul dari variabel Worker (SITE_TITLE) menang atas D1, D1 menang
+// atas default WorkerCMS. Ini yang membuat repo tetap netral (tidak ada
+// nama pribadi di kode) sementara instance yang di-deploy di domain
+// pemilik tampil dengan judulnya sendiri — tanpa mengubah site_title
+// di D1 dan tanpa redeploy ulang bila variabel diubah dari dashboard.
+export function envSiteTitle(env) {
+  const v = env && typeof env.SITE_TITLE === 'string' ? env.SITE_TITLE.trim().slice(0, 100) : '';
+  return v;
+}
+
 export async function renderPage(env, pageTitle, content) {
-  const siteTitle = await getSetting(env, 'site_title', 'WorkerCMS');
+  const siteTitle = envSiteTitle(env) || await getSetting(env, 'site_title', 'WorkerCMS');
   const themeId = await getSetting(env, 'theme', 'terang');
   const theme = themes[themeId] || themes.terang;
   return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content });

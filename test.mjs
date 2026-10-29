@@ -2,6 +2,7 @@
 // Jalankan: node test.mjs  (harus keluar semua OK (kini 18+ cek, termasuk CSRF & rate-limit))
 import worker from './worker.js';
 import { themes } from './themes.js';
+import { renderPage, envSiteTitle } from './store.js';
 
 class Stmt {
   constructor(db, sql) { this.db = db; this.sql = sql; this.args = []; }
@@ -313,4 +314,13 @@ r = await call('POST', '/p/post-uji/comment/vote', { csrf: userCsrf, comment_id:
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('👍 1'), 'like kedua kalinya membatalkan');
 r = await call('POST', '/p/post-uji/comment/vote', { csrf: userCsrf, comment_id: String(commentId), vote: '-1' }, userCookie);
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('👎 1'), 'dislike terhitung');
+// 14. Branding instance: logo SVG animasi + SITE_TITLE menang atas D1
+const brandHtml = themes.terang.render({ siteTitle: 'Hozin King', pageTitle: 'X', content: '' });
+assert(brandHtml.includes('<svg') && brandHtml.includes('animateTransform') && brandHtml.includes('>H</text>') && brandHtml.includes('Hozin King'), 'logo SVG: animasi kilau + mark H untuk Hozin King');
+assert(envSiteTitle({ SITE_TITLE: '  Hozin King  ' }) === 'Hozin King' && envSiteTitle({}) === '' && envSiteTitle({ SITE_TITLE: '   ' }) === '', 'envSiteTitle: trim, kosong bila tidak ada');
+r = await renderPage({ DB: env.DB, SITE_TITLE: 'Hozin King' }, 'Beranda', '<p>uji</p>'); t = r;
+assert(t.includes('Hozin King') && !t.includes('>WorkerCMS<') && t.includes('>H</text>'), 'renderPage: SITE_TITLE menang atas site_title D1 (WorkerCMS)');
+const downEnvTitle = { ...downEnv, SITE_TITLE: 'Hozin King' };
+r = await worker.fetch(new Request(base + '/', { method: 'GET' }), downEnvTitle); t = await r.text();
+assert(r.status === 503 && t.includes('Hozin King') && t.includes('>H</text>') && !t.includes('WorkerCMS'), 'maintenance: SITE_TITLE tampil, bukan WorkerCMS, saat D1 mati');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

@@ -29,7 +29,7 @@ import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientI
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie } from './auth.js';
 import { checkRateLimit } from './security.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree } from './content.js';
-import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage } from './store.js';
+import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle } from './store.js';
 import { editorCard } from './editor.js';
 
 export default {
@@ -83,7 +83,7 @@ export default {
       // dijadikan Inggris dan berlaku untuk seluruh situs, termasuk beranda
       // (menggantikan fallback beranda statis sebelumnya).
       const maintenance = `<div class="card"><h2>Under Maintenance</h2><p>This site is currently under maintenance. We'll be back soon.</p><p>Please check back later.</p></div>`;
-      return html(theme.render({ siteTitle: 'WorkerCMS', pageTitle: 'Under Maintenance', content: maintenance }), 503);
+      return html(theme.render({ siteTitle: esc(envSiteTitle(env) || 'WorkerCMS'), pageTitle: 'Under Maintenance', content: maintenance }), 503);
     }
   },
 };
@@ -97,7 +97,7 @@ async function handleFetch(request, env) {
     if (request.method === 'POST') {
       const cl = Number(request.headers.get('content-length') || '0');
       if (cl > 200000) {
-        return html(themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
+        return html(themes.terang.render({ siteTitle: esc(envSiteTitle(env) || 'WorkerCMS'), pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
       }
     }
     await ensureSchema(env);
@@ -379,7 +379,7 @@ async function handleFetch(request, env) {
         const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all();
         const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
         const themeId = await getSetting(env, 'theme', 'terang');
-        const siteTitle = await getSetting(env, 'site_title', 'WorkerCMS');
+        const siteTitle = envSiteTitle(env) || await getSetting(env, 'site_title', 'WorkerCMS');
         const pluginRows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
         const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
         const csrf = await csrfToken(env);
@@ -400,7 +400,7 @@ async function handleFetch(request, env) {
         const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/admin/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
         const sessionsCard = `<div class="card"><h3>Sesi & Perangkat</h3><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/admin/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
         const editorCardHtml = editorCard(csrfField);
-        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3><form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div>${editorCardHtml}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
+        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3>${envSiteTitle(env) ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div>${editorCardHtml}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
         return html(await renderPage(env, 'Admin', content));
       }
     }
