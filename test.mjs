@@ -55,6 +55,7 @@ function assert(cond, label) { console.log((cond ? 'OK  ' : 'GAGAL ') + label); 
 let r = await call('GET', '/'); let t = await r.text();
 assert(t.includes('Selamat Datang di CMS Hozin'), 'beranda: post sambutan tampil');
 assert(t.includes('menit baca'), 'beranda: plugin waktu baca aktif');
+assert(t.includes('id="copyr"') && t.includes('id="uptime"') && t.includes('2024-01-01'), 'beranda: footer copyright + uptime dipertahankan');
 
 // 2. Login admin (salah -> 403, benar -> cookie sesi)
 r = await call('POST', '/admin/login', { password: 'salah' }); assert(r.status === 403, 'login salah ditolak');
