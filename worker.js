@@ -185,7 +185,29 @@ function postCard(post, plugins) {
 }
 
 export default {
+  // Fallback anti-1101 (insiden 29 Okt 2026 20:28 WIB): bila D1 tidak bisa
+  // diakses — mis. kuota baca harian gratis habis — JANGAN lempar exception
+  // (Cloudflare mengubahnya jadi Error 1101 di semua halaman). Beranda tampil
+  // statis, jalur lain dapat halaman 503 yang jelas. Begitu D1 bisa diakses
+  // lagi (kuota reset tengah malam UTC = 07:00 WIB), semua kembali normal
+  // tanpa redeploy, karena schemaReady di-reset saat gagal. Data tidak hilang:
+  // ini hanya gagal baca, bukan gagal tulis.
   async fetch(request, env) {
+    try {
+      return await handleFetch(request, env);
+    } catch (e) {
+      const theme = themes.terang;
+      const u = new URL(request.url);
+      if (request.method === 'GET' && u.pathname === '/') {
+        const content = `<article class="card"><h2>Selamat Datang di CMS Hozin</h2><p class="meta">Umum</p><p>Ini post pertama. Dari panel admin, kamu bisa menambah post baru, menyetujui komentar, mengganti tema, dan mengaktifkan plugin.</p></article><div class="card"><p>Database sedang tidak bisa diakses sementara (batas harian D1 tercapai). Post, komentar, dan panel admin kembali normal setelah kuota reset pukul 07:00 WIB.</p></div>`;
+        return html(theme.render({ siteTitle: 'Hozin King', pageTitle: 'Beranda', content }));
+      }
+      return html(theme.render({ siteTitle: 'Hozin King', pageTitle: 'Sementara tidak tersedia', content: '<div class="card"><p>Layanan database sementara tidak tersedia (batas harian D1 tercapai). Coba lagi setelah kuota reset pukul 07:00 WIB. Data tidak hilang.</p></div>' }), 503);
+    }
+  },
+};
+
+async function handleFetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
     await ensureSchema(env);
@@ -348,5 +370,4 @@ export default {
       return html(await renderPage(env, 'Admin', '<div class="card"><p>Butuh login admin.</p><p><a href="/admin">Ke login</a></p></div>'), 403);
     }
     return html(await renderPage(env, 'Tidak ditemukan', '<div class="card"><p>Halaman tidak ditemukan.</p></div>'), 404);
-  },
-};
+}
