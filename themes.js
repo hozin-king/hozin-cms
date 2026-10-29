@@ -12,7 +12,7 @@
 // aksen yang SAMA, hanya latarnya yang dibalik, jadi ganti tema tidak
 // terasa seperti ganti situs lain.
 function baseCss(bg, fg, card, muted, accent, border, accent2) {
-  return `body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:${bg};color:${fg};line-height:1.6}` +
+  return `body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:${bg};color:${fg};line-height:1.6;display:flex;flex-direction:column;min-height:100vh}` +
     `header{padding:18px 20px;border-bottom:1px solid ${border}}header a{color:${fg};text-decoration:none}` +
     `header .brand{font-size:20px;font-weight:800;letter-spacing:-.02em;display:inline-flex;align-items:center}header .mark{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,${accent},${accent2});display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:800;margin-right:10px}header nav{margin-top:8px;font-size:14px}` +
     `header nav a{margin-right:14px;color:${accent}}main{max-width:720px;margin:0 auto;padding:20px}` +
@@ -20,7 +20,7 @@ function baseCss(bg, fg, card, muted, accent, border, accent2) {
     `.card h2{margin:0 0 6px;font-weight:800;letter-spacing:-.02em}.card h2 a{color:${fg};text-decoration:none}.meta{color:${muted};font-size:12px;letter-spacing:.04em;text-transform:uppercase}` +
     `a{color:${accent}}input,textarea,select{width:100%;box-sizing:border-box;padding:10px;margin:6px 0 12px;border:1px solid ${border};border-radius:10px;background:${card};color:${fg}}` +
     `button{padding:10px 16px;border:0;border-radius:10px;background:linear-gradient(135deg,${accent},${accent2});color:#fff;font-weight:700;cursor:pointer}` +
-    `footer{max-width:720px;margin:0 auto;padding:20px;color:${muted};font-size:13px}`;
+    `footer{max-width:720px;margin:0 auto;padding:20px;color:${muted};font-size:13px;margin-top:auto}`;
 }
 function shell(css, siteTitle, pageTitle, content) {
   // Footer dipertahankan dari situs lama hozinking.my.id (homepage.js):
