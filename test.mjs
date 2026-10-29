@@ -186,4 +186,20 @@ const csrf3 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 r = await call('POST', '/admin/logout', { csrf: csrf3 }, cookie); assert(r.status === 303, 'logout satu perangkat redirect');
 r = await call('GET', '/admin', null, refreshOnly3); t = await r.text();
 assert(!t.includes('Dashboard Admin'), 'setelah logout, refresh perangkat itu tidak bisa memperpanjang sesi');
+// 9. Failsafe = halaman Pemeliharaan berbahasa Inggris untuk SELURUH situs
+// saat database hilang/error (perintah pemilik 29 Okt 2026 20:44 WIB;
+// sebelumnya 20:42-20:43: tanpa detail teknis di situs, bentuk pemeliharaan).
+// DB yang selalu melempar mensimulasikan database yang tidak bisa diakses.
+const throwingDB = { prepare() { throw new Error('D1_ERROR: limit'); }, async batch() { throw new Error('D1_ERROR: limit'); } };
+const downEnv = { DB: throwingDB, BACKUP_DB: throwingDB, ADMIN_TOKEN: 'test-admin-token' };
+async function callDown(method, path) {
+  const req = new Request(base + path, { method });
+  return worker.fetch(req, downEnv);
+}
+r = await callDown('GET', '/'); t = await r.text();
+assert(r.status === 503 && t.includes('Under Maintenance') && t.includes('currently under maintenance') && !t.includes('Selamat Datang di CMS Hozin') && !t.includes('D1') && !t.includes('kuota'), 'failsafe beranda: halaman pemeliharaan Inggris, tanpa detail teknis');
+r = await callDown('GET', '/admin'); t = await r.text();
+assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1') && !t.includes('kuota') && !t.includes('pukul 07:00'), 'failsafe admin: halaman pemeliharaan Inggris, tanpa detail teknis');
+r = await callDown('GET', '/p/post-uji'); t = await r.text();
+assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1'), 'failsafe halaman lain: halaman pemeliharaan Inggris, tanpa detail teknis');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

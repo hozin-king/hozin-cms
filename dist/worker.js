@@ -318,12 +318,8 @@ var worker_default = {
       return res;
     } catch (e) {
       const theme = themes.terang;
-      const u = new URL(request.url);
-      if (request.method === "GET" && u.pathname === "/") {
-        const content = `<article class="card"><h2>Selamat Datang di CMS Hozin</h2><p class="meta">Umum</p><p>Ini post pertama. Dari panel admin, kamu bisa menambah post baru, menyetujui komentar, mengganti tema, dan mengaktifkan plugin.</p></article><div class="card"><p>Database sedang tidak bisa diakses sementara (batas harian D1 tercapai). Post, komentar, dan panel admin kembali normal setelah kuota reset pukul 07:00 WIB.</p></div>`;
-        return html(theme.render({ siteTitle: "Hozin King", pageTitle: "Beranda", content }));
-      }
-      return html(theme.render({ siteTitle: "Hozin King", pageTitle: "Sementara tidak tersedia", content: '<div class="card"><p>Layanan database sementara tidak tersedia (batas harian D1 tercapai). Coba lagi setelah kuota reset pukul 07:00 WIB. Data tidak hilang.</p></div>' }), 503);
+      const maintenance = `<div class="card"><h2>Under Maintenance</h2><p>This site is currently under maintenance. We'll be back soon.</p><p>Please check back later.</p></div>`;
+      return html(theme.render({ siteTitle: "Hozin King", pageTitle: "Under Maintenance", content: maintenance }), 503);
     }
   }
 };
