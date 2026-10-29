@@ -11,7 +11,10 @@ khusus CMS ini (lihat `plugins.js` dan `themes.js`).
 - **Komentar:** pengunjung kirim komentar -> status `pending`, admin setujui
   di panel admin baru tampil. Komentar di-escape (tag `<script>` tidak jalan).
 - **Tema:** Terang dan Gelap, ganti dari panel admin (pengaturan tersimpan
-  di D1, bukan di kode).
+  di D1, bukan di kode). **Anti AI slop:** kedua tema memakai identitas
+  situs lama hozinking.my.id (latar malam #05070d, gradasi biru-ungu
+  #3b82f6 -> #8b5cf6, mark “H” di header), bukan palet slate/sky default
+  template — ganti tema tidak terasa seperti ganti situs lain.
 - **Plugin:** Waktu Baca, Bagikan (WhatsApp/X), Post Terkait. Aktif/nonaktif
   dari panel admin. Tambah plugin = tambah entri di `plugins.js`, redeploy.
 - **Admin:** `/admin`, login pakai password = secret `ADMIN_TOKEN` di Worker.

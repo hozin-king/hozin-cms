@@ -18,8 +18,18 @@ class MockDB {
   exec(sql, a, mode) {
     const s = sql.replace(/\s+/g, ' ').trim();
     if (s.startsWith('CREATE TABLE')) return [];
-    if (s.startsWith('INSERT OR IGNORE INTO cms_settings')) { if (!this.settings.has(a[0])) this.settings.set(a[0], a[1]); return []; }
-    if (s.startsWith('INSERT OR REPLACE INTO cms_settings')) { this.settings.set(a[0], a[1]); return []; }
+    if (s.startsWith('INSERT OR IGNORE INTO cms_settings')) {
+      // SQL worker memakai kunci literal di VALUES, bukan bind: ('theme', 'terang')
+      const m = s.match(/VALUES \('([^']+)', '([^']+)'\)/);
+      if (m && !this.settings.has(m[1])) this.settings.set(m[1], m[2]);
+      return [];
+    }
+    if (s.startsWith('INSERT OR REPLACE INTO cms_settings')) {
+      // SQL worker: VALUES ('theme', ?) dengan nilai di-bind sebagai a[0]
+      const m = s.match(/VALUES \('([^']+)',/);
+      if (m) this.settings.set(m[1], a[0]);
+      return [];
+    }
     if (s.startsWith('INSERT OR IGNORE INTO cms_plugins')) { if (!this.plugins.has(a[0])) this.plugins.set(a[0], 1); return []; }
     if (s.startsWith('INSERT INTO cms_posts')) { this.posts.push({ id: a[0], slug: a[1], title: a[2], body: a[3], category: a[4], status: 'published', created_at: a[5], updated_at: a[6] }); return []; }
     if (s.startsWith('INSERT INTO cms_comments')) { this.comments.push({ id: ++this.commentSeq, post_id: a[0], name: a[1], text: a[2], status: 'pending', created_at: a[3] }); return []; }
@@ -90,7 +100,7 @@ r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('Kom
 
 // 5. Ganti tema ke gelap + nonaktifkan plugin share, cek halaman berubah
 r = await call('POST', '/admin/settings', { csrf, site_title: 'Hozin King', theme: 'gelap' }, cookie);
-r = await call('GET', '/'); t = await r.text(); assert(t.includes('#0f172a'), 'tema gelap terpakai');
+r = await call('GET', '/'); t = await r.text(); assert(t.includes('#05070d'), 'tema gelap terpakai (identitas situs lama, bukan slate generik)');
 r = await call('POST', '/admin/plugins/toggle', { csrf, id: 'share', enabled: '0' }, cookie);
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Bagikan:'), 'plugin share nonaktif hilang dari post');
 
