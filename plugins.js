@@ -1,4 +1,4 @@
-// Plugin CMS Hozin — menambah plugin baru = tambah satu entri di sini, lalu redeploy.
+// Plugin WorkerCMS — menambah plugin baru = tambah satu entri di sini, lalu redeploy.
 // Tiap plugin: { id, name, description, postMeta?, postFooter? }
 // postMeta(post) -> cuplikan HTML kecil di bawah judul.
 // postFooter(post, ctx) -> HTML di bawah isi post; ctx = { related: [post...], baseUrl }.

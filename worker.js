@@ -1,19 +1,18 @@
-// CMS Hozin — Worker Cloudflare (satu Worker, D1, tanpa build step selain esbuild untuk deploy).
-// Fitur v1: post (buat/edit/hapus dari admin), komentar (moderasi: pending -> admin setujui),
-// tema (Terang/Gelap, ganti dari admin), plugin (aktif/nonaktif dari admin, lihat plugins.js).
-// KEAMANAN SUPER-SUPER-ADMIN (perintah pemilik 29 Okt 2026):
+// WorkerCMS — Worker Cloudflare (satu Worker, D1, tanpa build step selain esbuild untuk deploy).
+// Modul: util.js (helper), auth.js (sesi + akun), security.js (rate limit),
+// content.js (post + komentar), store.js (skema + backup + render),
+// editor.js (editor post 3 mode), themes.js (tema), plugins.js (plugin).
+// Fitur: post (buat/hapus dari admin), komentar (moderasi + balasan + vote),
+// tema (ganti dari admin), plugin (aktif/nonaktif dari admin).
+// KEAMANAN SATU ADMIN:
 // - HANYA SATU admin: pemilik dengan ADMIN_TOKEN. TIDAK ADA akun editor, penulis, atau
 //   pendaftar publik. TIDAK ADA endpoint publik untuk membuat post — post hanya lewat
 //   POST /admin/* dengan sesi admin + token CSRF. Pengunjung hanya bisa kirim komentar,
 //   dan komentar itu pun pending sampai admin setujui.
 // - Login di-rate-limit: 5x gagal dari satu IP dalam 15 menit -> diblokir sementara (429).
 // - Semua aksi admin POST wajib membawa token CSRF yang terikat sesi (HMAC).
-// - Backup: database stopwatch khusus jadi tempat backup CMS (bukan database
-//   live kedua). Panel admin super-super-admin punya tombol "Buat Backup
-//   Sekarang" + riwayat backup (berhasil/gagal, jumlah baris, pesan error).
-//   Backup menyalin post, komentar, pengaturan, dan plugin dari DB utama
-//   ke tabel cms_backup_* di stopwatch. Satu-satunya sumber kebenaran tetap
-//   DB utama; salinan di stopwatch tidak pernah ditulis dari admin.
+// - Backup: database kedua khusus jadi tempat backup CMS (bukan database live kedua).
+//   Panel admin punya tombol "Buat Backup Sekarang" + riwayat backup.
 // Admin: login pakai ADMIN_TOKEN (secret di Worker, BUKAN di kode ini, buat acak >=32 karakter,
 //   jangan dibagikan, ganti segera bila bocor) -> sistem token ala video login:
 //   token AKSES stateless HMAC 1 jam + token REFRESH opaque di D1 (hash SHA-256 saja
@@ -21,483 +20,17 @@
 //   Tanpa "ingat saya": refresh 1 hari; dengan "ingat saya": refresh 30 hari.
 //   Refresh lama yang sudah diputar lalu dipakai lagi = tanda pencurian -> semua
 //   sesi dicabut. "Keluar dari Semua Perangkat" mencabut semua refresh token.
-//   Sesi HMAC 7 hari lama TIDAK lagi berlaku sejak sistem ini aktif: login ulang sekali.
 // Deploy: esbuild worker.js --bundle --format=esm, upload dengan binding D1 bernama DB + secret ADMIN_TOKEN.
-// Catatan deploy root: Worker ini MENGGANTIKAN isi root bila di-route ke hozinking.my.id.
-// Situs Tools yang sekarang ada di root harus dipindah ke subdomain dulu bila root mau jadi CMS ini.
+// Catatan deploy root: Worker ini MENGGANTIKAN isi root bila di-route ke domain utama.
+// Situs lama yang ada di root harus dipindah ke subdomain dulu bila root mau jadi CMS ini.
 import { themes } from './themes.js';
 import { pluginDefs } from './plugins.js';
-
-const ACCESS_TTL_MS = 60 * 60 * 1000;
-const REFRESH_TTL_MS = 24 * 3600 * 1000;
-const REFRESH_REMEMBER_TTL_MS = 30 * 24 * 3600 * 1000;
-let schemaReady = null;
-
-function esc(s) {
-  return String(s ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
-}
-function para(text) {
-  return esc(text).split(/\n\s*\n/).map(p => `<p>${p.replaceAll('\n', '<br>')}</p>`).join('');
-}
-function slugify(title) {
-  return String(title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'post';
-}
-function html(body, status = 200, headers = {}) {
-  return new Response(body, { status, headers: {
-    'content-type': 'text/html; charset=utf-8',
-    'x-content-type-options': 'nosniff',
-    'x-frame-options': 'DENY',
-    'referrer-policy': 'strict-origin-when-cross-origin',
-    'permissions-policy': 'camera=(), microphone=(), geolocation=()',
-    // CSP: skrip/style inline diizinkan karena tema + editor blok memakai
-    // skrip inline (footer uptime, editor). Yang dilarang keras: objek/embed
-    // (Flash/Java), frame dari luar (clickjacking sudah DENY juga), form ke
-    // luar situs, dan gambar hanya dari situs sendiri / https / data.
-    'content-security-policy': "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
-    ...headers,
-  } });
-}
-function redirect(location, headers = {}) {
-  return new Response(null, { status: 303, headers: { location, ...headers } });
-}
-async function hmacHex(key, text) {
-  const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sig = await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(text));
-  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
-}
-function parseCookies(request) {
-  const out = {};
-  for (const part of (request.headers.get('cookie') || '').split(';')) {
-    const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
-  }
-  return out;
-}
-async function isAdmin(request, env) {
-  if (!env.ADMIN_TOKEN) return false;
-  const cookie = parseCookies(request).cms_access || '';
-  const [exp, sig] = cookie.split('.');
-  if (!exp || !sig || Number(exp) < Date.now()) return false;
-  return sig === await hmacHex(env.ADMIN_TOKEN, 'access:' + exp);
-}
-function sessionExp(request) {
-  const cookie = parseCookies(request).cms_access || '';
-  const [exp] = cookie.split('.');
-  return exp || '';
-}
-// CSRF sengaja TIDAK diikat ke masa berlaku token akses: token akses diputar
-// tiap jam, dan form dashboard yang sudah dimuat harus tetap sah setelah
-// rotasi. Karena hanya ada satu admin, token CSRF tetap yang hanya diketahui
-// admin yang login sudah cukup melawan pemalsuan lintas situs.
-async function csrfToken(env) {
-  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'csrf') : '';
-}
-function b64url(bytes) {
-  let s = '';
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
-}
-async function sha256Hex(text) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
-}
-function randomHex(n) {
-  return [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, '0')).join('');
-}
-function accessCookie(env, exp) {
-  return hmacHex(env.ADMIN_TOKEN, 'access:' + exp).then(sig =>
-    `cms_access=${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ACCESS_TTL_MS / 1000)}`);
-}
-async function issueTokens(env, request, remember) {
-  const now = Date.now();
-  const exp = String(now + ACCESS_TTL_MS);
-  const access = await accessCookie(env, exp);
-  const raw = b64url(crypto.getRandomValues(new Uint8Array(32)));
-  const hash = await sha256Hex(raw);
-  const id = randomHex(12);
-  const ttl = remember ? REFRESH_REMEMBER_TTL_MS : REFRESH_TTL_MS;
-  const iso = new Date(now).toISOString();
-  const expires = new Date(now + ttl).toISOString();
-  const device = (request.headers.get('user-agent') || '').slice(0, 80);
-  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(id, hash, device, clientIp(request), iso, iso, expires, remember ? 1 : 0).run();
-  const refresh = `cms_refresh=${raw}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
-  return [access, refresh];
-}
-async function getRefreshRow(request, env) {
-  const raw = parseCookies(request).cms_refresh || '';
-  if (!raw) return null;
-  const hash = await sha256Hex(raw);
-  return await env.DB.prepare(`SELECT * FROM cms_refresh_tokens WHERE token_hash = ?`).bind(hash).first();
-}
-async function revokeAllRefresh(env) {
-  await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE revoked = 0`).run();
-}
-function setCookieInHeader(header, name, value) {
-  const parts = (header || '').split(';').map(p => p.trim()).filter(p => p && !p.startsWith(name + '='));
-  parts.push(`${name}=${value}`);
-  return parts.join('; ');
-}
-// Putar refresh token. Kembalikan {request, cookies} bila berhasil, null bila
-// refresh tidak sah/kedaluwarsa/dicabut. Error D1 dilempar ke fallback 503,
-// bukan ditelan, supaya kegagalan database terlihat jelas, bukan login palsu.
-async function tryRefresh(request, env) {
-  const raw = parseCookies(request).cms_refresh || '';
-  if (!raw || !env.ADMIN_TOKEN) return null;
-  const row = await getRefreshRow(request, env);
-  if (!row) return null;
-  if (row.revoked) {
-    // Refresh yang sudah diputar lalu dipakai lagi = token dicuri (kasus di
-    // video: token bocor dipakai penyerang). Cabut semua sesi, paksa login ulang.
-    if (row.replaced_by) await revokeAllRefresh(env);
-    return null;
-  }
-  if (String(row.expires_at) <= new Date().toISOString()) {
-    await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(row.id).run();
-    return null;
-  }
-  const now = Date.now();
-  const newRaw = b64url(crypto.getRandomValues(new Uint8Array(32)));
-  const newHash = await sha256Hex(newRaw);
-  const newId = randomHex(12);
-  const ttl = row.remember ? REFRESH_REMEMBER_TTL_MS : REFRESH_TTL_MS;
-  const iso = new Date(now).toISOString();
-  const expires = new Date(now + ttl).toISOString();
-  await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1, replaced_by = ? WHERE id = ?`).bind(newId, row.id).run();
-  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(newId, newHash, row.device || '', row.ip || '', iso, iso, expires, row.remember ? 1 : 0).run();
-  const access = await accessCookie(env, String(now + ACCESS_TTL_MS));
-  const refresh = `cms_refresh=${newRaw}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
-  const headers = new Headers(request.headers);
-  let cookieHeader = request.headers.get('cookie') || '';
-  cookieHeader = setCookieInHeader(cookieHeader, 'cms_access', access.split(';')[0].split('=')[1]);
-  cookieHeader = setCookieInHeader(cookieHeader, 'cms_refresh', newRaw);
-  headers.set('cookie', cookieHeader);
-  return { request: new Request(request, { headers }), cookies: [access, refresh] };
-}
-function redirectWithCookies(location, cookies) {
-  const headers = new Headers({ location });
-  for (const c of cookies) headers.append('set-cookie', c);
-  return new Response(null, { status: 303, headers });
-}
-function clearAuthCookies() {
-  return [
-    'cms_access=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
-    'cms_refresh=; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
-    'cms_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
-  ];
-}
-function clientIp(request) {
-  return request.headers.get('cf-connecting-ip') || (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-}
-function stripTags(s) {
-  return String(s ?? '').replace(/<[^>]*>/g, '');
-}
-// Sanitasi HTML mode (editor HTML / blok): daftar putih tag + atribut saja.
-// Yang dibuang total: script/style/iframe/object/embed/form dan isinya,
-// komentar HTML, semua atribut on* (onclick dsb), style, dan URL
-// javascript:/data:/vbscript:. Tag di luar daftar putih dibuang tapi teks
-// di dalamnya dipertahankan, jadi tidak ada markup jahat yang lolos ke
-// pengunjung. Disimpan sudah bersih, dan saat render dibersihkan sekali
-// lagi (defense in depth) — jadi baris lama di DB pun tidak bisa menyisip
-// skrip. Catatan jujur: sanitasi regex bukan parser HTML penuh; untuk
-// situs satu admin ini cukup, dan post hanya bisa dibuat admin yang login.
-const ALLOWED_TAGS = new Set(['p', 'h2', 'h3', 'h4', 'strong', 'b', 'em', 'i', 'u', 's', 'a', 'ul', 'ol', 'li', 'blockquote', 'br', 'hr', 'img', 'figure', 'figcaption', 'pre', 'code', 'span', 'div', 'video', 'audio', 'source']);
-const ALLOWED_ATTRS = {
-  a: new Set(['href', 'title']),
-  img: new Set(['src', 'alt', 'title', 'width', 'height']),
-  video: new Set(['src', 'poster', 'controls', 'preload']),
-  audio: new Set(['src', 'controls', 'preload']),
-  source: new Set(['src', 'type']),
-};
-function safeUrl(u) {
-  const v = String(u || '').trim();
-  if (/^(https?:\/\/|\/|#|mailto:)/i.test(v)) return v;
-  return '';
-}
-function sanitizeHtml(input) {
-  let s = String(input || '');
-  s = s.replace(/<!--[\s\S]*?-->/g, '');
-  for (const tag of ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'textarea', 'select', 'button', 'link', 'meta', 'title', 'head', 'body', 'html']) {
-    s = s.replace(new RegExp('<' + tag + '\\b[^>]*>[\\s\\S]*?<\\/' + tag + '\\s*>', 'gi'), '');
-    s = s.replace(new RegExp('<' + tag + '\\b[^>]*\\/?>', 'gi'), '');
-  }
-  s = s.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>/g, (whole, tagName, attrs) => {
-    const tag = tagName.toLowerCase();
-    const closing = whole.startsWith('</');
-    if (!ALLOWED_TAGS.has(tag)) return '';
-    if (closing) return '</' + tag + '>';
-    const allowed = ALLOWED_ATTRS[tag] || new Set();
-    let out = '';
-    const attrRe = /([a-zA-Z-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
-    let m;
-    while ((m = attrRe.exec(attrs || '')) !== null) {
-      const name = m[1].toLowerCase();
-      if (!allowed.has(name)) continue;
-      if (name === 'controls') { out += ' controls'; continue; }
-      const val = m[2] ?? m[3] ?? m[4] ?? '';
-      if (name === 'href' || name === 'src' || name === 'poster') {
-        const safe = safeUrl(val);
-        if (!safe) continue;
-        out += ' ' + name + '="' + esc(safe) + '"';
-      } else {
-        out += ' ' + name + '="' + esc(val) + '"';
-      }
-    }
-    const selfClose = (tag === 'br' || tag === 'hr' || tag === 'img' || tag === 'source') ? ' /' : '';
-    return '<' + tag + out + selfClose + '>';
-  });
-  return s;
-}
-// Rate limit ringan di D1 (anti-spam / anti-brute-force lapis aplikasi).
-// Dipakai HANYA untuk POST (komentar, daftar, login akun, buka kunci post,
-// vote) — bukan untuk GET, supaya tidak membakar kuota D1 di tiap kunjungan.
-// Serangan DDoS volumetrik sendiri ditangani jaringan Cloudflare (selalu
-// aktif, tanpa kuota), bukan oleh kode ini; lapis ini menghentikan spam
-// dan brute-force dari satu IP / satu akun.
-async function checkRateLimit(env, key, limit, windowMs) {
-  const bucket = Math.floor(Date.now() / windowMs);
-  const k = key + ':' + bucket;
-  const row = await env.DB.prepare(`SELECT count FROM cms_rate_limits WHERE key = ?`).bind(k).first();
-  const n = row ? Number(row.count) : 0;
-  if (n >= limit) return false;
-  await env.DB.prepare(`INSERT INTO cms_rate_limits (key, count, window_start) VALUES (?, 1, ?) ON CONFLICT(key) DO UPDATE SET count = count + 1`).bind(k, new Date().toISOString()).run();
-  return true;
-}
-// Password (akun komentator + post terkunci): PBKDF2-SHA256, 100.000 iterasi,
-// garam acak 16 byte. Yang disimpan hanya garam + hash, tidak pernah password
-// mentah. Verifikasi memakai perbandingan waktu-konstan sederhana.
-async function hashPassword(password, saltHex) {
-  const salt = new Uint8Array(saltHex.match(/.{2}/g).map(h => parseInt(h, 16)));
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, key, 256);
-  return [...new Uint8Array(bits)].map(b => b.toString(16).padStart(2, '0')).join('');
-}
-async function verifyPassword(password, saltHex, hashHex) {
-  const h = await hashPassword(password, saltHex);
-  if (h.length !== hashHex.length) return false;
-  let diff = 0;
-  for (let i = 0; i < h.length; i++) diff |= h.charCodeAt(i) ^ hashHex.charCodeAt(i);
-  return diff === 0;
-}
-async function userCsrf(env, userId) {
-  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'user-csrf:' + userId) : '';
-}
-async function getCommenter(request, env) {
-  if (!env.ADMIN_TOKEN) return null;
-  const cookie = parseCookies(request).cms_user || '';
-  const parts = cookie.split('.');
-  if (parts.length !== 3) return null;
-  const [userId, exp, sig] = parts;
-  if (!userId || !exp || !sig || Number(exp) < Date.now()) return null;
-  if (sig !== await hmacHex(env.ADMIN_TOKEN, 'user:' + userId + ':' + exp)) return null;
-  const row = await env.DB.prepare(`SELECT * FROM cms_users WHERE id = ?`).bind(userId).first();
-  return row || null;
-}
-async function userSessionCookie(env, userId) {
-  const exp = String(Date.now() + 30 * 24 * 3600 * 1000);
-  const sig = await hmacHex(env.ADMIN_TOKEN, 'user:' + userId + ':' + exp);
-  return `cms_user=${userId}.${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${30 * 24 * 3600}`;
-}
-function unlockCookieName(postId) {
-  return 'cms_unlock_' + String(postId).replace(/[^A-Za-z0-9_-]/g, '_');
-}
-async function isPostUnlocked(request, env, postId) {
-  if (!env.ADMIN_TOKEN) return false;
-  const cookie = parseCookies(request)[unlockCookieName(postId)] || '';
-  const parts = cookie.split('.');
-  if (parts.length !== 2) return false;
-  const [exp, sig] = parts;
-  if (!exp || !sig || Number(exp) < Date.now()) return false;
-  return sig === await hmacHex(env.ADMIN_TOKEN, 'post-unlock:' + postId + ':' + exp);
-}
-async function postUnlockCookie(env, postId) {
-  const exp = String(Date.now() + 24 * 3600 * 1000);
-  const sig = await hmacHex(env.ADMIN_TOKEN, 'post-unlock:' + postId + ':' + exp);
-  return `${unlockCookieName(postId)}=${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${24 * 3600}`;
-}
-// Visibilitas post: 'public' (beranda + link), 'private' (hanya admin),
-// 'unlisted' (tidak di beranda, bisa dibuka siapa pun yang tahu link),
-// 'password' (link + password, isi TIDAK dimuat sama sekali sebelum kunci
-// dibuka — lihat rute detail: metadata dulu, body hanya diambil setelah
-// lolos). Terjadwal = publish_at di masa depan: beranda + pengunjung belum
-// bisa melihat, admin bisa pratinjau. Tidak butuh cron: tiap request
-// membandingkan publish_at dengan waktu sekarang, jadi begitu waktunya
-// lewat, post otomatis tampil.
-function isScheduled(post, nowIso) {
-  return post.publish_at && String(post.publish_at) > nowIso;
-}
-function visibilityLabel(post, nowIso) {
-  if (isScheduled(post, nowIso)) return 'Terjadwal';
-  if (post.visibility === 'private') return 'Private';
-  if (post.visibility === 'unlisted') return 'Link saja';
-  if (post.visibility === 'password') return 'Password';
-  return 'Publik';
-}
-async function ensureSchema(env) {
-  if (!schemaReady) {
-    schemaReady = (async () => {
-      // DDL dijalankan satu per satu, BUKAN batch: D1 batch menolak/menggagalkan
-      // CREATE TABLE di beberapa kasus, dan itu membuat Worker melempar 1101
-      // di setiap request. DML (INSERT/DELETE) tetap boleh batch.
-      const ddl = [
-        `CREATE TABLE IF NOT EXISTS cms_posts (id TEXT PRIMARY KEY, slug TEXT UNIQUE NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT 'Umum', status TEXT NOT NULL DEFAULT 'published', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body_mode TEXT NOT NULL DEFAULT 'text', visibility TEXT NOT NULL DEFAULT 'public', publish_at TEXT NOT NULL DEFAULT '', post_password_hash TEXT NOT NULL DEFAULT '', post_password_salt TEXT NOT NULL DEFAULT '', views INTEGER NOT NULL DEFAULT 0)`,
-        `CREATE TABLE IF NOT EXISTS cms_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, post_id TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, parent_id INTEGER)`,
-        `CREATE TABLE IF NOT EXISTS cms_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
-        `CREATE TABLE IF NOT EXISTS cms_plugins (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1)`,
-        `CREATE TABLE IF NOT EXISTS cms_login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, created_at TEXT NOT NULL)`,
-        `CREATE TABLE IF NOT EXISTS cms_backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, status TEXT NOT NULL, posts INTEGER NOT NULL DEFAULT 0, comments INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '')`,
-        `CREATE TABLE IF NOT EXISTS cms_refresh_tokens (id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, device TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_used_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, replaced_by TEXT NOT NULL DEFAULT '', remember INTEGER NOT NULL DEFAULT 0)`,
-        `CREATE TABLE IF NOT EXISTS cms_users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL)`,
-        `CREATE TABLE IF NOT EXISTS cms_comment_votes (comment_id INTEGER NOT NULL, user_key TEXT NOT NULL, vote INTEGER NOT NULL, PRIMARY KEY (comment_id, user_key))`,
-        `CREATE TABLE IF NOT EXISTS cms_rate_limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, window_start TEXT NOT NULL)`,
-      ];
-      for (const sql of ddl) await env.DB.prepare(sql).run();
-      // Migrasi pertahanan: CREATE IF NOT EXISTS tidak memperbaiki tabel yang
-      // sudah ada tapi kolomnya tidak lengkap (insiden nyata 29 Okt 2026:
-      // cms_posts di cms-db hanya punya id/slug/title, sehingga query
-      // WHERE status melempar SQLITE_ERROR dan Worker 1101 di semua request).
-      // Bila kolom hilang, tambahkan lewat ALTER TABLE, jangan DROP (data aman).
-      const info = await env.DB.prepare(`PRAGMA table_info(cms_posts)`).all();
-      const have = new Set((info.results || []).map(r => r.name));
-      const missing = {
-        body: `ALTER TABLE cms_posts ADD COLUMN body TEXT NOT NULL DEFAULT ''`,
-        category: `ALTER TABLE cms_posts ADD COLUMN category TEXT NOT NULL DEFAULT 'Umum'`,
-        status: `ALTER TABLE cms_posts ADD COLUMN status TEXT NOT NULL DEFAULT 'published'`,
-        created_at: `ALTER TABLE cms_posts ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`,
-        updated_at: `ALTER TABLE cms_posts ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`,
-        body_mode: `ALTER TABLE cms_posts ADD COLUMN body_mode TEXT NOT NULL DEFAULT 'text'`,
-        visibility: `ALTER TABLE cms_posts ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'`,
-        publish_at: `ALTER TABLE cms_posts ADD COLUMN publish_at TEXT NOT NULL DEFAULT ''`,
-        post_password_hash: `ALTER TABLE cms_posts ADD COLUMN post_password_hash TEXT NOT NULL DEFAULT ''`,
-        post_password_salt: `ALTER TABLE cms_posts ADD COLUMN post_password_salt TEXT NOT NULL DEFAULT ''`,
-        views: `ALTER TABLE cms_posts ADD COLUMN views INTEGER NOT NULL DEFAULT 0`,
-      };
-      for (const [col, sql] of Object.entries(missing)) {
-        if (!have.has(col)) await env.DB.prepare(sql).run();
-      }
-      // Migrasi komentar: balasan butuh parent_id (NULL = komentar utama).
-      const cInfo = await env.DB.prepare(`PRAGMA table_info(cms_comments)`).all();
-      const cHave = new Set((cInfo.results || []).map(r => r.name));
-      if (!cHave.has('parent_id')) await env.DB.prepare(`ALTER TABLE cms_comments ADD COLUMN parent_id INTEGER`).run();
-      await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('site_title', 'Hozin King')`).run();
-      await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`).run();
-      for (const p of pluginDefs) {
-        await env.DB.prepare(`INSERT OR IGNORE INTO cms_plugins (id, enabled) VALUES (?, 1)`).bind(p.id).run();
-      }
-      const existing = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_posts`).first();
-      if (existing && Number(existing.n) === 0) {
-        const now = new Date().toISOString();
-        await env.DB.prepare(`INSERT INTO cms_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views) VALUES (?, ?, ?, ?, ?, 'published', ?, ?, 'text', 'public', ?, '', '', 0)`).bind('p-welcome', 'selamat-datang', 'Selamat Datang di CMS Hozin', 'Ini post pertama. Dari panel admin, kamu bisa menambah post baru, menyetujui komentar, mengganti tema, dan mengaktifkan plugin.', 'Umum', now, now, now).run();
-      }
-    })().catch(e => { schemaReady = null; throw e; });
-  }
-  return schemaReady;
-}
-async function getSetting(env, key, fallback) {
-  const row = await env.DB.prepare(`SELECT value FROM cms_settings WHERE key = ?`).bind(key).first();
-  return row ? row.value : fallback;
-}
-async function getEnabledPlugins(env) {
-  const rows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
-  const map = new Map((rows.results || []).map(r => [r.id, Number(r.enabled) === 1]));
-  return pluginDefs.filter(p => map.get(p.id) !== false);
-}
-// Backup CMS ke stopwatch (binding BACKUP_DB). Mengembalikan {posts, comments}.
-// Salinan = snapshot penuh terbaru: tabel backup dihapus dulu, lalu diisi ulang
-// dari DB utama. Bukan tulis ganda live: fungsi ini hanya jalan saat admin
-// menekan tombol backup, dan salinan tidak pernah ditulis dari jalur lain.
-async function doBackup(env) {
-  if (!env.BACKUP_DB) throw new Error('Binding BACKUP_DB belum dipasang di Worker');
-  const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at ASC`).all();
-  const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at ASC`).all();
-  const settings = await env.DB.prepare(`SELECT * FROM cms_settings ORDER BY key ASC`).all();
-  const plugins = await env.DB.prepare(`SELECT * FROM cms_plugins ORDER BY id ASC`).all();
-  const users = await env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at ASC`).all();
-  const votes = await env.DB.prepare(`SELECT * FROM cms_comment_votes ORDER BY comment_id ASC`).all();
-  const now = new Date().toISOString();
-  const bak = env.BACKUP_DB;
-  // DDL satu per satu, alasan sama seperti ensureSchema (batch DDL rawan 1101).
-  for (const sql of [
-    `CREATE TABLE IF NOT EXISTS cms_backup_posts (id TEXT PRIMARY KEY, slug TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT 'Umum', status TEXT NOT NULL DEFAULT 'published', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body_mode TEXT NOT NULL DEFAULT 'text', visibility TEXT NOT NULL DEFAULT 'public', publish_at TEXT NOT NULL DEFAULT '', post_password_hash TEXT NOT NULL DEFAULT '', post_password_salt TEXT NOT NULL DEFAULT '', views INTEGER NOT NULL DEFAULT 0, backup_at TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS cms_backup_comments (id INTEGER PRIMARY KEY, post_id TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, parent_id INTEGER, backup_at TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS cms_backup_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, backup_at TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS cms_backup_plugins (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, backup_at TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS cms_backup_users (id TEXT PRIMARY KEY, username TEXT NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL, backup_at TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS cms_backup_votes (comment_id INTEGER NOT NULL, user_key TEXT NOT NULL, vote INTEGER NOT NULL, backup_at TEXT NOT NULL, PRIMARY KEY (comment_id, user_key))`,
-  ]) await bak.prepare(sql).run();
-  const stmts = [
-    bak.prepare(`DELETE FROM cms_backup_posts`),
-    bak.prepare(`DELETE FROM cms_backup_comments`),
-    bak.prepare(`DELETE FROM cms_backup_settings`),
-    bak.prepare(`DELETE FROM cms_backup_plugins`),
-    bak.prepare(`DELETE FROM cms_backup_users`),
-    bak.prepare(`DELETE FROM cms_backup_votes`),
-  ];
-  for (const p of (posts.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(p.id, p.slug, p.title, p.body, p.category, p.status, p.created_at, p.updated_at, p.body_mode || 'text', p.visibility || 'public', p.publish_at || p.created_at || '', p.post_password_hash || '', p.post_password_salt || '', Number(p.views) || 0, now));
-  }
-  for (const c of (comments.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_comments (id, post_id, name, text, status, created_at, parent_id, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(c.id, c.post_id, c.name, c.text, c.status, c.created_at, c.parent_id ?? null, now));
-  }
-  for (const u of (users.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_users (id, username, password_hash, salt, created_at, backup_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(u.id, u.username, u.password_hash, u.salt, u.created_at, now));
-  }
-  for (const v of (votes.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_votes (comment_id, user_key, vote, backup_at) VALUES (?, ?, ?, ?)`).bind(v.comment_id, v.user_key, v.vote, now));
-  }
-  for (const s of (settings.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_settings (key, value, backup_at) VALUES (?, ?, ?)`).bind(s.key, s.value, now));
-  }
-  for (const p of (plugins.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_plugins (id, enabled, backup_at) VALUES (?, ?, ?)`).bind(p.id, p.enabled, now));
-  }
-  await bak.batch(stmts);
-  return { posts: (posts.results || []).length, comments: (comments.results || []).length };
-}
-async function renderPage(env, pageTitle, content) {
-  const siteTitle = await getSetting(env, 'site_title', 'Hozin King');
-  const themeId = await getSetting(env, 'theme', 'terang');
-  const theme = themes[themeId] || themes.terang;
-  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content });
-}
-function postCard(post, plugins) {
-  const meta = plugins.map(p => p.postMeta ? p.postMeta(post) : '').join('');
-  // Cuplikan selalu dari teks polos (tag HTML post dibuang), jadi cuplikan
-  // tidak pernah membocorkan markup. Jumlah tayang hanya logo mata + angka,
-  // tanpa kata "dilihat" — sesuai permintaan pemilik.
-  const plain = stripTags(post.body || '');
-  const views = Number(post.views) || 0;
-  return `<article class="card"><h2><a href="/p/${esc(post.slug)}">${esc(post.title)}</a></h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · 👁 ${views}${meta}</p><p>${esc(plain.slice(0, 200))}${plain.length > 200 ? '…' : ''}</p></article>`;
-}
-// Pohon komentar: balasan menempel di bawah induknya, indent dibatasi
-// supaya tidak bergeser terlalu jauh di layar HP.
-function renderCommentsTree(comments, votes, myVotes, csrfField, canReply, postSlug) {
-  const byParent = new Map();
-  for (const c of comments) {
-    const key = c.parent_id ? String(c.parent_id) : 'root';
-    if (!byParent.has(key)) byParent.set(key, []);
-    byParent.get(key).push(c);
-  }
-  const renderOne = (c, depth) => {
-    const v = votes.get(c.id) || { like: 0, dislike: 0 };
-    const mine = myVotes.get(c.id) || 0;
-    const indent = Math.min(depth, 3) * 18;
-    const replyForm = canReply
-      ? `<form method="post" action="/p/${esc(postSlug)}/comment" style="margin-top:8px"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="parent_id" value="${c.id}"><textarea name="text" maxlength="2000" placeholder="Balas ${esc(c.name)}…" required></textarea><button type="submit">Balas</button></form>`
-      : '';
-    const voteForms = canReply
-      ? `<form method="post" action="/p/${esc(postSlug)}/comment/vote" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="1"><button type="submit">${mine === 1 ? '<b>👍 ' + v.like + '</b>' : '👍 ' + v.like}</button></form> <form method="post" action="/p/${esc(postSlug)}/comment/vote" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="-1"><button type="submit">${mine === -1 ? '<b>👎 ' + v.dislike + '</b>' : '👎 ' + v.dislike}</button></form>`
-      : `<span>👍 ${v.like} · 👎 ${v.dislike}</span>`;
-    const kids = (byParent.get(String(c.id)) || []).map(k => renderOne(k, depth + 1)).join('');
-    return `<div class="card" style="margin-left:${indent}px"><p><b>${esc(c.name)}</b></p><p>${esc(c.text)}</p><p>${voteForms}</p>${replyForm}${kids}</div>`;
-  };
-  // Komentar yang induknya sudah dihapus diperlakukan sebagai komentar utama,
-  // supaya tidak hilang diam-diam.
-  const roots = [...(byParent.get('root') || [])];
-  for (const c of comments) {
-    if (c.parent_id && !comments.some(p => p.id === c.parent_id) && !roots.includes(c)) roots.push(c);
-  }
-  return roots.map(c => renderOne(c, 0)).join('') || '<p>Belum ada komentar.</p>';
-}
+import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex } from './util.js';
+import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie } from './auth.js';
+import { checkRateLimit } from './security.js';
+import { isScheduled, visibilityLabel, postCard, renderCommentsTree } from './content.js';
+import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage } from './store.js';
+import { editorCard } from './editor.js';
 
 export default {
   // Fallback anti-1101 (insiden 29 Okt 2026 20:28 WIB): bila D1 tidak bisa
@@ -550,7 +83,7 @@ export default {
       // dijadikan Inggris dan berlaku untuk seluruh situs, termasuk beranda
       // (menggantikan fallback beranda statis sebelumnya).
       const maintenance = `<div class="card"><h2>Under Maintenance</h2><p>This site is currently under maintenance. We'll be back soon.</p><p>Please check back later.</p></div>`;
-      return html(theme.render({ siteTitle: 'Hozin King', pageTitle: 'Under Maintenance', content: maintenance }), 503);
+      return html(theme.render({ siteTitle: 'WorkerCMS', pageTitle: 'Under Maintenance', content: maintenance }), 503);
     }
   },
 };
@@ -564,7 +97,7 @@ async function handleFetch(request, env) {
     if (request.method === 'POST') {
       const cl = Number(request.headers.get('content-length') || '0');
       if (cl > 200000) {
-        return html(themes.terang.render({ siteTitle: 'Hozin King', pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
+        return html(themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
       }
     }
     await ensureSchema(env);
@@ -846,7 +379,7 @@ async function handleFetch(request, env) {
         const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all();
         const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
         const themeId = await getSetting(env, 'theme', 'terang');
-        const siteTitle = await getSetting(env, 'site_title', 'Hozin King');
+        const siteTitle = await getSetting(env, 'site_title', 'WorkerCMS');
         const pluginRows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
         const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
         const csrf = await csrfToken(env);
@@ -866,8 +399,8 @@ async function handleFetch(request, env) {
         const currentRefresh = await getRefreshRow(request, env);
         const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/admin/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
         const sessionsCard = `<div class="card"><h3>Sesi & Perangkat</h3><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/admin/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
-        const editorCard = `<div class="card"><h3>Post Baru</h3><p><button type="button" id="modeTextBtn">Teks Biasa</button> <button type="button" id="modeBlocksBtn">Blok Mudah (drag &amp; drop)</button> <button type="button" id="modeHtmlBtn">HTML</button></p><form method="post" action="/admin/posts" id="postForm">${csrfField}<input type="hidden" name="body_mode" id="postMode" value="text"><input type="hidden" name="publish_at_iso" id="publishAtIso"><label>Judul</label><input name="title" required><label>Kategori</label><input name="category" value="Umum"><label>Visibilitas</label><select name="visibility" id="visSelect"><option value="public">Publik (beranda + link)</option><option value="private">Private (hanya admin)</option><option value="unlisted">Link saja (tidak di beranda)</option><option value="password">Password (link + password)</option></select><div id="pwWrap" style="display:none"><label>Password post (minimal 8 karakter)</label><input type="password" name="post_password"></div><label>Terbit pada (kosong = sekarang, isi = terjadwal)</label><input type="datetime-local" id="publishAt"><div id="edText"><label>Isi</label><textarea name="body" id="bodyText"></textarea></div><div id="edHtml" style="display:none"><label>Kode HTML</label><textarea id="htmlBody" placeholder="&lt;p&gt;Tulis HTML di sini&lt;/p&gt;"></textarea><p>Tag script, iframe, dan atribut onclick dibuang otomatis saat disimpan.</p></div><div id="edBlocks" style="display:none"><p>Tambah blok:</p><p><button type="button" id="addParaBtn">Paragraf</button> <button type="button" id="addJudulBtn">Judul</button> <button type="button" id="addDaftarBtn">Daftar</button> <button type="button" id="addKutipanBtn">Kutipan</button> <button type="button" id="addGambarBtn">Gambar</button> <button type="button" id="addVideoBtn">Video</button> <button type="button" id="addAudioBtn">Audio</button></p><div id="blocks"></div><p>Di HP, pakai tombol Naik / Turun untuk memindah blok. Di PC, blok bisa ditarik pakai mouse.</p></div><button type="submit">Terbitkan</button></form><script>var edMode='text';var dragged=null;function escH(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}function showMode(m){edMode=m;document.getElementById('postMode').value=m;document.getElementById('edText').style.display=(m==='text'?'block':'none');document.getElementById('edHtml').style.display=(m==='html'?'block':'none');document.getElementById('edBlocks').style.display=(m==='blocks'?'block':'none');if(m==='blocks'&&document.getElementById('blocks').children.length===0){addBlock('paragraf')}}document.getElementById('modeTextBtn').onclick=function(){showMode('text')};document.getElementById('modeBlocksBtn').onclick=function(){showMode('blocks')};document.getElementById('modeHtmlBtn').onclick=function(){showMode('html')};document.getElementById('visSelect').onchange=function(){document.getElementById('pwWrap').style.display=(this.value==='password'?'block':'none')};function blockLabel(t){if(t==='paragraf')return 'Paragraf';if(t==='judul')return 'Judul';if(t==='daftar')return 'Daftar';if(t==='kutipan')return 'Kutipan';if(t==='gambar')return 'Gambar';if(t==='video')return 'Video';return 'Audio'}function blockField(t){if(t==='gambar')return '<label>Link gambar (https://...)</label><input class="blockUrl" placeholder="https://..."><label>Teks alt (opsional)</label><input class="blockAlt">';if(t==='video')return '<label>Link video langsung MP4/WebM (bukan link YouTube)</label><input class="blockUrl" placeholder="https://..."><label>Link poster (opsional)</label><input class="blockPoster">';if(t==='audio')return '<label>Link audio MP3 (https://...)</label><input class="blockUrl" placeholder="https://...">';if(t==='daftar')return '<label>Satu baris per item</label><textarea class="blockText"></textarea>';return '<label>Isi</label><textarea class="blockText"></textarea>'}function addBlock(t){var d=document.createElement('div');d.className='card block';d.draggable=true;d.setAttribute('data-type',t);d.innerHTML='<p><b>☰ '+blockLabel(t)+'</b></p>'+blockField(t)+'<p><button type="button" class="upBtn">Naik</button> <button type="button" class="downBtn">Turun</button> <button type="button" class="delBtn">Hapus</button></p>';d.querySelector('.upBtn').onclick=function(){var p=d.previousElementSibling;if(p){d.parentNode.insertBefore(d,p)}};d.querySelector('.downBtn').onclick=function(){var n=d.nextElementSibling;if(n){d.parentNode.insertBefore(n,d)}};d.querySelector('.delBtn').onclick=function(){d.remove()};d.addEventListener('dragstart',function(e){dragged=d;e.dataTransfer.setData('text/plain','x')});d.addEventListener('dragover',function(e){e.preventDefault()});d.addEventListener('drop',function(e){e.preventDefault();var c=document.getElementById('blocks');if(dragged&&dragged!==d){c.insertBefore(dragged,d)}});document.getElementById('blocks').appendChild(d)}document.getElementById('addParaBtn').onclick=function(){addBlock('paragraf')};document.getElementById('addJudulBtn').onclick=function(){addBlock('judul')};document.getElementById('addDaftarBtn').onclick=function(){addBlock('daftar')};document.getElementById('addKutipanBtn').onclick=function(){addBlock('kutipan')};document.getElementById('addGambarBtn').onclick=function(){addBlock('gambar')};document.getElementById('addVideoBtn').onclick=function(){addBlock('video')};document.getElementById('addAudioBtn').onclick=function(){addBlock('audio')};function safeU(u){u=String(u||'').trim();if(u.indexOf('http://')===0||u.indexOf('https://')===0){return u}return ''}function collectBlocks(){var out='';var kids=document.getElementById('blocks').children;for(var i=0;i<kids.length;i++){var b=kids[i];var ty=b.getAttribute('data-type');var ta=b.querySelector('.blockText');var txt=ta?ta.value:'';if(ty==='paragraf'){out+='<p>'+escH(txt).replace(/\n/g,'<br>')+'</p>'}else if(ty==='judul'){out+='<h2>'+escH(txt)+'</h2>'}else if(ty==='daftar'){var items=txt.split('\n');out+='<ul>';for(var j=0;j<items.length;j++){if(items[j].trim()){out+='<li>'+escH(items[j])+'</li>'}}out+='</ul>'}else if(ty==='kutipan'){out+='<blockquote><p>'+escH(txt).replace(/\n/g,'<br>')+'</p></blockquote>'}else if(ty==='gambar'){var u=safeU(b.querySelector('.blockUrl').value);var alt=b.querySelector('.blockAlt').value;if(u){out+='<figure><img src="'+escH(u)+'" alt="'+escH(alt)+'" /></figure>'}}else if(ty==='video'){var vu=safeU(b.querySelector('.blockUrl').value);var po=safeU(b.querySelector('.blockPoster').value);if(vu){out+='<video controls preload="metadata" src="'+escH(vu)+'"'+(po?' poster="'+escH(po)+'"':'')+'></video>'}}else if(ty==='audio'){var au=safeU(b.querySelector('.blockUrl').value);if(au){out+='<audio controls preload="metadata" src="'+escH(au)+'"></audio>'}}}return out}document.getElementById('postForm').addEventListener('submit',function(){var dt=document.getElementById('publishAt');if(dt&&dt.value){document.getElementById('publishAtIso').value=new Date(dt.value).toISOString()}if(edMode==='html'){document.getElementById('bodyText').value=document.getElementById('htmlBody').value}else if(edMode==='blocks'){document.getElementById('bodyText').value=collectBlocks()}});</script></div>`;
-        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3><form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div>${editorCard}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
+        const editorCardHtml = editorCard(csrfField);
+        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3><form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div>${editorCardHtml}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
         return html(await renderPage(env, 'Admin', content));
       }
     }
@@ -900,7 +433,7 @@ async function handleFetch(request, env) {
         return redirect('/admin');
       }
       if (path === '/admin/settings') {
-        const siteTitle = String(form.get('site_title') || '').trim().slice(0, 100) || 'Hozin King';
+        const siteTitle = String(form.get('site_title') || '').trim().slice(0, 100) || 'WorkerCMS';
         const theme = String(form.get('theme') || 'terang');
         if (themes[theme]) {
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('site_title', ?)`).bind(siteTitle).run();

@@ -1,4 +1,4 @@
-// Uji CMS Hozin tanpa Cloudflare: mock D1 sederhana untuk pola SQL yang dipakai worker.js.
+// Uji WorkerCMS tanpa Cloudflare: mock D1 sederhana untuk pola SQL yang dipakai worker.js.
 // Jalankan: node test.mjs  (harus keluar semua OK (kini 18+ cek, termasuk CSRF & rate-limit))
 import worker from './worker.js';
 import { themes } from './themes.js';
@@ -129,7 +129,7 @@ function assert(cond, label) { console.log((cond ? 'OK  ' : 'GAGAL ') + label); 
 
 // 1. Beranda menampilkan post sambutan
 let r = await call('GET', '/'); let t = await r.text();
-assert(t.includes('Selamat Datang di CMS Hozin'), 'beranda: post sambutan tampil');
+assert(t.includes('Selamat Datang di WorkerCMS'), 'beranda: post sambutan tampil');
 assert(t.includes('menit baca'), 'beranda: plugin waktu baca aktif');
 assert(t.includes('id="copyr"') && t.includes('id="uptime"') && t.includes('2024-01-01'), 'beranda: footer copyright + uptime dipertahankan');
 
@@ -174,7 +174,7 @@ r = await call('POST', '/admin/comments/approve', { csrf, id: String(commentId) 
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('Komentar uji'), 'komentar disetujui tampil');
 
 // 5. Ganti tema ke gelap + nonaktifkan plugin share, cek halaman berubah
-r = await call('POST', '/admin/settings', { csrf, site_title: 'Hozin King', theme: 'gelap' }, cookie);
+r = await call('POST', '/admin/settings', { csrf, site_title: 'WorkerCMS', theme: 'gelap' }, cookie);
 r = await call('GET', '/'); t = await r.text(); assert(t.includes('#05070d'), 'tema gelap terpakai (identitas situs lama, bukan slate generik)');
 r = await call('POST', '/admin/plugins/toggle', { csrf, id: 'share', enabled: '0' }, cookie);
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Bagikan:'), 'plugin share nonaktif hilang dari post');
@@ -245,7 +245,7 @@ async function callDown(method, path) {
   return worker.fetch(req, downEnv);
 }
 r = await callDown('GET', '/'); t = await r.text();
-assert(r.status === 503 && t.includes('Under Maintenance') && t.includes('currently under maintenance') && !t.includes('Selamat Datang di CMS Hozin') && !t.includes('D1') && !t.includes('kuota'), 'failsafe beranda: halaman pemeliharaan Inggris, tanpa detail teknis');
+assert(r.status === 503 && t.includes('Under Maintenance') && t.includes('currently under maintenance') && !t.includes('Selamat Datang di WorkerCMS') && !t.includes('D1') && !t.includes('kuota'), 'failsafe beranda: halaman pemeliharaan Inggris, tanpa detail teknis');
 r = await callDown('GET', '/admin'); t = await r.text();
 assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1') && !t.includes('kuota') && !t.includes('pukul 07:00'), 'failsafe admin: halaman pemeliharaan Inggris, tanpa detail teknis');
 r = await callDown('GET', '/p/post-uji'); t = await r.text();
@@ -253,10 +253,10 @@ assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1'),
 
 // 10. Tema v2 ala WordPress: 4 tema, responsif lintas platform
 assert(Object.keys(themes).join(',') === 'terang,gelap,majalah,minimal', 'tema: 4 tema tersedia (terang, gelap, majalah, minimal)');
-assert(themes.gelap.render({ siteTitle: 'Hozin King', pageTitle: 'X', content: '' }).includes('#05070d'), 'tema gelap: identitas situs lama dipertahankan');
-assert(themes.majalah.render({ siteTitle: 'Hozin King', pageTitle: 'X', content: '' }).includes('Georgia'), 'tema majalah: font serif berbeda dari terang/gelap');
-assert(themes.minimal.render({ siteTitle: 'Hozin King', pageTitle: 'X', content: '' }).includes('border-radius:8px'), 'tema minimal: radius kartu berbeda');
-const terangHtml = themes.terang.render({ siteTitle: 'Hozin King', pageTitle: 'X', content: '' });
+assert(themes.gelap.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('#05070d'), 'tema gelap: identitas default dipertahankan');
+assert(themes.majalah.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('Georgia'), 'tema majalah: font serif berbeda dari terang/gelap');
+assert(themes.minimal.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('border-radius:8px'), 'tema minimal: radius kartu berbeda');
+const terangHtml = themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' });
 assert(terangHtml.includes('width=device-width') && terangHtml.includes('@media (max-width:600px)') && terangHtml.includes('min-height:44px'), 'tema responsif: viewport + breakpoint HP + target sentuh 44px');
 
 // 11. Editor post: HTML disanitasi, teks di-escape, header keamanan, honeypot, rate-limit komentar
