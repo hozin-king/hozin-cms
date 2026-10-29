@@ -5,7 +5,7 @@ Web posting + komentar + tema + plugin, tanpa PHP/MySQL. Dibuat untuk
 PHP **tidak** bisa dipakai di sini, plugin/tema di sini adalah modul JS
 khusus CMS ini (lihat `plugins.js` dan `themes.js`).
 
-## Fitur v1 (teruji lokal, `node test.mjs` 13/13 OK)
+## Fitur v1 (teruji lokal, `node test.mjs` 18 cek OK)
 
 - **Post:** buat dari panel admin, tampil di beranda dan halaman `/p/<slug>`.
 - **Komentar:** pengunjung kirim komentar -> status `pending`, admin setujui
@@ -17,6 +17,24 @@ khusus CMS ini (lihat `plugins.js` dan `themes.js`).
 - **Admin:** `/admin`, login pakai password = secret `ADMIN_TOKEN` di Worker.
   Sesi cookie HMAC 7 hari. Admin bisa: ubah judul situs & tema, buat/hapus
   post, setujui/hapus komentar, aktif/nonaktifkan plugin.
+- **Footer dipertahankan dari situs lama:** copyright `© 2024–tahun berjalan`
+  HozinKing dan uptime server sejak `2024-01-01 WIB` (klik untuk ganti mode
+  rincian / total jam, update tiap detik) — ada di semua halaman CMS.
+
+## Proteksi super-super-admin (29 Okt 2026)
+
+- **Satu admin saja:** hanya pemilik dengan `ADMIN_TOKEN`. Tidak ada akun
+  editor, penulis, atau pendaftar publik. Tidak ada endpoint publik untuk
+  membuat post — post hanya lewat `/admin/*` dengan sesi + CSRF.
+- **Rate-limit login:** 5x gagal dari satu IP dalam 15 menit -> 429.
+- **CSRF:** semua aksi admin POST wajib token CSRF terikat sesi (HMAC).
+  Aksi tanpa CSRF ditolak 403 (diuji).
+- **Header keamanan:** `nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy`, CSP di semua respons HTML.
+- **Token:** `ADMIN_TOKEN` harus acak >=32 karakter, hanya di secret Worker,
+  jangan di repo, jangan dibagikan, ganti segera bila bocor. Bila token
+  bocor, semua sesi lama tidak otomatis mati — ganti token dan sesi lama
+  jadi tidak valid karena HMAC memakai token baru.
 
 ## File
 

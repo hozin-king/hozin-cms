@@ -1,8 +1,16 @@
 // CMS Hozin — Worker Cloudflare (satu Worker, D1, tanpa build step selain esbuild untuk deploy).
 // Fitur v1: post (buat/edit/hapus dari admin), komentar (moderasi: pending -> admin setujui),
 // tema (Terang/Gelap, ganti dari admin), plugin (aktif/nonaktif dari admin, lihat plugins.js).
-// Keamanan: konten user di-escape (judul, isi post, nama & teks komentar) — tidak ada HTML mentah user.
-// Admin: login pakai ADMIN_TOKEN (secret di Worker, BUKAN di kode ini) -> cookie sesi HMAC 7 hari.
+// KEAMANAN SUPER-SUPER-ADMIN (perintah pemilik 29 Okt 2026):
+// - HANYA SATU admin: pemilik dengan ADMIN_TOKEN. TIDAK ADA akun editor, penulis, atau
+//   pendaftar publik. TIDAK ADA endpoint publik untuk membuat post — post hanya lewat
+//   POST /admin/* dengan sesi admin + token CSRF. Pengunjung hanya bisa kirim komentar,
+//   dan komentar itu pun pending sampai admin setujui.
+// - Login di-rate-limit: 5x gagal dari satu IP dalam 15 menit -> diblokir sementara (429).
+// - Semua aksi admin POST wajib membawa token CSRF yang terikat sesi (HMAC).
+// - Header keamanan di semua respons HTML. Konten user di-escape — tidak ada HTML mentah user.
+// Admin: login pakai ADMIN_TOKEN (secret di Worker, BUKAN di kode ini, buat acak >=32 karakter,
+//   jangan dibagikan, ganti segera bila bocor) -> cookie sesi HMAC 7 hari (HttpOnly, Secure, SameSite=Lax).
 // Deploy: esbuild worker.js --bundle --format=esm, upload dengan binding D1 bernama DB + secret ADMIN_TOKEN.
 // Catatan deploy root: Worker ini MENGGANTIKAN isi root bila di-route ke hozinking.my.id.
 // Situs Tools yang sekarang ada di root harus dipindah ke subdomain dulu bila root mau jadi CMS ini.
@@ -22,7 +30,14 @@ function slugify(title) {
   return String(title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'post';
 }
 function html(body, status = 200, headers = {}) {
-  return new Response(body, { status, headers: { 'content-type': 'text/html; charset=utf-8', ...headers } });
+  return new Response(body, { status, headers: {
+    'content-type': 'text/html; charset=utf-8',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'strict-origin-when-cross-origin',
+    'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
+    ...headers,
+  } });
 }
 function redirect(location, headers = {}) {
   return new Response(null, { status: 303, headers: { location, ...headers } });
@@ -47,6 +62,17 @@ async function isAdmin(request, env) {
   if (!exp || !sig || Number(exp) < Date.now()) return false;
   return sig === await hmacHex(env.ADMIN_TOKEN, exp);
 }
+function sessionExp(request) {
+  const cookie = parseCookies(request).cms_session || '';
+  const [exp] = cookie.split('.');
+  return exp || '';
+}
+async function csrfToken(env, exp) {
+  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'csrf:' + exp) : '';
+}
+function clientIp(request) {
+  return request.headers.get('cf-connecting-ip') || (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+}
 async function ensureSchema(env) {
   if (!schemaReady) {
     schemaReady = (async () => {
@@ -55,6 +81,7 @@ async function ensureSchema(env) {
         env.DB.prepare(`CREATE TABLE IF NOT EXISTS cms_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, post_id TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL)`),
         env.DB.prepare(`CREATE TABLE IF NOT EXISTS cms_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`),
         env.DB.prepare(`CREATE TABLE IF NOT EXISTS cms_plugins (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1)`),
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS cms_login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, created_at TEXT NOT NULL)`),
       ]);
       await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('site_title', 'Hozin King')`).run();
       await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`).run();
@@ -138,18 +165,31 @@ export default {
       }
     }
 
-    // ---- Admin: login ----
+    // ---- Admin: login (rate-limit 5 gagal / IP / 15 menit) ----
     if (path === '/admin/login' && request.method === 'POST') {
       const form = await request.formData();
+      const ip = clientIp(request);
+      const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      const fails = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_login_attempts WHERE ip = ? AND created_at > ?`).bind(ip, since).first();
+      if (fails && Number(fails.n) >= 5) {
+        return html(await renderPage(env, 'Admin', '<div class="card"><p>Terlalu banyak percobaan login. Coba lagi 15 menit.</p></div>'), 429);
+      }
       if (env.ADMIN_TOKEN && String(form.get('password') || '') === env.ADMIN_TOKEN) {
+        await env.DB.prepare(`DELETE FROM cms_login_attempts WHERE ip = ?`).bind(ip).run();
         const exp = String(Date.now() + SESSION_TTL_MS);
         const sig = await hmacHex(env.ADMIN_TOKEN, exp);
-        return redirect('/admin', { 'set-cookie': `cms_session=${exp}.${sig}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}` });
+        return redirect('/admin', { 'set-cookie': `cms_session=${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}` });
       }
+      await env.DB.prepare(`INSERT INTO cms_login_attempts (ip, created_at) VALUES (?, ?)`).bind(ip, new Date().toISOString()).run();
       return html(await renderPage(env, 'Admin', '<div class="card"><p>Password salah.</p><p><a href="/admin">Kembali</a></p></div>'), 403);
     }
     if (path === '/admin/logout' && request.method === 'POST') {
-      return redirect('/admin', { 'set-cookie': 'cms_session=; Path=/; HttpOnly; Max-Age=0' });
+      if (!admin) return redirect('/admin');
+      const form = await request.formData();
+      if (String(form.get('csrf') || '') !== await csrfToken(env, sessionExp(request))) {
+        return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid.</p></div>'), 403);
+      }
+      return redirect('/admin', { 'set-cookie': 'cms_session=; Path=/; HttpOnly; Secure; Max-Age=0' });
     }
 
     // ---- Admin: dashboard (butuh login) ----
@@ -164,18 +204,23 @@ export default {
         const siteTitle = await getSetting(env, 'site_title', 'Hozin King');
         const pluginRows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
         const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
-        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(p.status)})<form method="post" action="/admin/posts/delete" style="display:inline"><input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('');
-        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/admin/comments/approve" style="display:inline"><input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/admin/comments/delete" style="display:inline"><input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('');
+        const csrf = await csrfToken(env, sessionExp(request));
+        const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
+        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(p.status)})<form method="post" action="/admin/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('');
+        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/admin/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/admin/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('');
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
-        const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/admin/plugins/toggle"><input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
-        const content = `<h2>Dashboard Admin</h2><form method="post" action="/admin/logout"><button type="submit">Keluar</button></form><div class="card"><h3>Pengaturan</h3><form method="post" action="/admin/settings"><label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Post Baru</h3><form method="post" action="/admin/posts"><label>Judul</label><input name="title" required><label>Kategori</label><input name="category" value="Umum"><label>Isi</label><textarea name="body" required></textarea><button type="submit">Terbitkan</button></form></div><h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Plugin</h3>${pluginForms}`;
+        const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/admin/plugins/toggle">${csrfField}<input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
+        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain, tidak ada pendaftar publik.</p><form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form><div class="card"><h3>Pengaturan</h3><form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Post Baru</h3><form method="post" action="/admin/posts">${csrfField}<label>Judul</label><input name="title" required><label>Kategori</label><input name="category" value="Umum"><label>Isi</label><textarea name="body" required></textarea><button type="submit">Terbitkan</button></form></div><h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Plugin</h3>${pluginForms}`;
         return html(await renderPage(env, 'Admin', content));
       }
     }
 
-    // ---- Admin: aksi (butuh login) ----
+    // ---- Admin: aksi (butuh login + CSRF) ----
     if (admin && request.method === 'POST') {
       const form = await request.formData();
+      if (String(form.get('csrf') || '') !== await csrfToken(env, sessionExp(request))) {
+        return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid. Muat ulang dashboard lalu coba lagi.</p></div>'), 403);
+      }
       if (path === '/admin/settings') {
         const siteTitle = String(form.get('site_title') || '').trim().slice(0, 100) || 'Hozin King';
         const theme = String(form.get('theme') || 'terang');

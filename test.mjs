@@ -1,5 +1,5 @@
 // Uji CMS Hozin tanpa Cloudflare: mock D1 sederhana untuk pola SQL yang dipakai worker.js.
-// Jalankan: node test.mjs  (harus keluar semua OK)
+// Jalankan: node test.mjs  (harus keluar semua OK (kini 18+ cek, termasuk CSRF & rate-limit))
 import worker from './worker.js';
 
 class Stmt {
@@ -11,7 +11,7 @@ class Stmt {
 }
 class MockDB {
   constructor() {
-    this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0;
+    this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = [];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { for (const s of stmts) await s.run(); }
@@ -23,6 +23,9 @@ class MockDB {
     if (s.startsWith('INSERT OR IGNORE INTO cms_plugins')) { if (!this.plugins.has(a[0])) this.plugins.set(a[0], 1); return []; }
     if (s.startsWith('INSERT INTO cms_posts')) { this.posts.push({ id: a[0], slug: a[1], title: a[2], body: a[3], category: a[4], status: 'published', created_at: a[5], updated_at: a[6] }); return []; }
     if (s.startsWith('INSERT INTO cms_comments')) { this.comments.push({ id: ++this.commentSeq, post_id: a[0], name: a[1], text: a[2], status: 'pending', created_at: a[3] }); return []; }
+    if (s.startsWith('INSERT INTO cms_login_attempts')) { this.attempts.push({ ip: a[0], created_at: a[1] }); return []; }
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cms_login_attempts')) return [{ n: this.attempts.filter(x => x.ip === a[0] && x.created_at > a[1]).length }];
+    if (s.startsWith('DELETE FROM cms_login_attempts')) { this.attempts = this.attempts.filter(x => x.ip !== a[0]); return []; }
     if (s === 'SELECT COUNT(*) AS n FROM cms_posts') return [{ n: this.posts.length }];
     if (s.startsWith('SELECT value FROM cms_settings')) return this.settings.has(a[0]) ? [{ value: this.settings.get(a[0]) }] : [];
     if (s.startsWith('SELECT * FROM cms_plugins') || s.startsWith('SELECT id, enabled FROM cms_plugins')) return [...this.plugins.entries()].map(([id, enabled]) => ({ id, enabled }));
@@ -62,9 +65,19 @@ r = await call('POST', '/admin/login', { password: 'salah' }); assert(r.status =
 r = await call('POST', '/admin/login', { password: 'test-admin-token' });
 const cookie = (r.headers.get('set-cookie') || '').split(';')[0];
 assert(cookie.startsWith('cms_session='), 'login benar memberi cookie sesi');
+// Ambil token CSRF dari dashboard admin, semua aksi admin wajib pakai token ini
+r = await call('GET', '/admin', null, cookie); t = await r.text();
+const csrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+assert(csrf.length > 10, 'dashboard memberi token CSRF');
+assert(t.includes('Super-Super-Admin'), 'dashboard menandai peran super-super-admin');
+// Aksi admin tanpa CSRF harus ditolak
+r = await call('POST', '/admin/posts', { title: 'Post Jahat', category: 'X', body: 'x' }, cookie); assert(r.status === 403, 'aksi admin tanpa CSRF ditolak');
+// Rate-limit login: 5x salah -> percobaan ke-6 diblokir 429
+for (let i = 0; i < 5; i++) await call('POST', '/admin/login', { password: 'salah' });
+r = await call('POST', '/admin/login', { password: 'salah' }); assert(r.status === 429, 'login ke-6 setelah 5 gagal diblokir 429');
 
 // 3. Admin buat post baru
-r = await call('POST', '/admin/posts', { title: 'Post Uji', category: 'Tekno', body: 'Isi post uji kedua.' }, cookie);
+r = await call('POST', '/admin/posts', { csrf, title: 'Post Uji', category: 'Tekno', body: 'Isi post uji kedua.' }, cookie);
 assert(r.status === 303, 'admin buat post redirect');
 r = await call('GET', '/'); t = await r.text(); assert(t.includes('Post Uji'), 'post baru tampil di beranda');
 
@@ -72,19 +85,19 @@ r = await call('GET', '/'); t = await r.text(); assert(t.includes('Post Uji'), '
 r = await call('POST', '/p/post-uji/comment', { name: 'Budi', text: 'Komentar uji' }); assert(r.status === 303, 'kirim komentar redirect');
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Komentar uji'), 'komentar pending belum tampil');
 const commentId = env.DB.comments[0].id;
-r = await call('POST', '/admin/comments/approve', { id: String(commentId) }, cookie); assert(r.status === 303, 'admin setujui komentar');
+r = await call('POST', '/admin/comments/approve', { csrf, id: String(commentId) }, cookie); assert(r.status === 303, 'admin setujui komentar');
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('Komentar uji'), 'komentar disetujui tampil');
 
 // 5. Ganti tema ke gelap + nonaktifkan plugin share, cek halaman berubah
-r = await call('POST', '/admin/settings', { site_title: 'Hozin King', theme: 'gelap' }, cookie);
+r = await call('POST', '/admin/settings', { csrf, site_title: 'Hozin King', theme: 'gelap' }, cookie);
 r = await call('GET', '/'); t = await r.text(); assert(t.includes('#0f172a'), 'tema gelap terpakai');
-r = await call('POST', '/admin/plugins/toggle', { id: 'share', enabled: '0' }, cookie);
+r = await call('POST', '/admin/plugins/toggle', { csrf, id: 'share', enabled: '0' }, cookie);
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Bagikan:'), 'plugin share nonaktif hilang dari post');
 
 // 6. XSS: komentar berisi tag script harus di-escape, bukan dieksekusi
 await call('POST', '/p/post-uji/comment', { name: 'X', text: '<script>alert(1)</script>' });
 const cid2 = env.DB.comments[env.DB.comments.length - 1].id;
-await call('POST', '/admin/comments/approve', { id: String(cid2) }, cookie);
+await call('POST', '/admin/comments/approve', { csrf, id: String(cid2) }, cookie);
 r = await call('GET', '/p/post-uji'); t = await r.text();
 assert(!t.includes('<script>alert(1)</script>') && t.includes('&lt;script&gt;'), 'komentar jahat di-escape');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
