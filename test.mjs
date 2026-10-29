@@ -18,6 +18,8 @@ class MockDB {
   exec(sql, a, mode) {
     const s = sql.replace(/\s+/g, ' ').trim();
     if (s.startsWith('CREATE TABLE')) return [];
+    if (s.startsWith('PRAGMA table_info(cms_posts)')) return [{ name: 'id' }, { name: 'slug' }, { name: 'title' }, { name: 'body' }, { name: 'category' }, { name: 'status' }, { name: 'created_at' }, { name: 'updated_at' }];
+    if (s.startsWith('ALTER TABLE cms_posts')) return [];
     if (s.startsWith('INSERT OR IGNORE INTO cms_settings')) {
       // SQL worker memakai kunci literal di VALUES, bukan bind: ('theme', 'terang')
       const m = s.match(/VALUES \('([^']+)', '([^']+)'\)/);
