@@ -15,14 +15,22 @@
 //   ke tabel cms_backup_* di stopwatch. Satu-satunya sumber kebenaran tetap
 //   DB utama; salinan di stopwatch tidak pernah ditulis dari admin.
 // Admin: login pakai ADMIN_TOKEN (secret di Worker, BUKAN di kode ini, buat acak >=32 karakter,
-//   jangan dibagikan, ganti segera bila bocor) -> cookie sesi HMAC 7 hari (HttpOnly, Secure, SameSite=Lax).
+//   jangan dibagikan, ganti segera bila bocor) -> sistem token ala video login:
+//   token AKSES stateless HMAC 1 jam + token REFRESH opaque di D1 (hash SHA-256 saja
+//   yang disimpan, token mentah tidak pernah disimpan) yang DIPUTAR tiap dipakai.
+//   Tanpa "ingat saya": refresh 1 hari; dengan "ingat saya": refresh 30 hari.
+//   Refresh lama yang sudah diputar lalu dipakai lagi = tanda pencurian -> semua
+//   sesi dicabut. "Keluar dari Semua Perangkat" mencabut semua refresh token.
+//   Sesi HMAC 7 hari lama TIDAK lagi berlaku sejak sistem ini aktif: login ulang sekali.
 // Deploy: esbuild worker.js --bundle --format=esm, upload dengan binding D1 bernama DB + secret ADMIN_TOKEN.
 // Catatan deploy root: Worker ini MENGGANTIKAN isi root bila di-route ke hozinking.my.id.
 // Situs Tools yang sekarang ada di root harus dipindah ke subdomain dulu bila root mau jadi CMS ini.
 import { themes } from './themes.js';
 import { pluginDefs } from './plugins.js';
 
-const SESSION_TTL_MS = 7 * 24 * 3600 * 1000;
+const ACCESS_TTL_MS = 60 * 60 * 1000;
+const REFRESH_TTL_MS = 24 * 3600 * 1000;
+const REFRESH_REMEMBER_TTL_MS = 30 * 24 * 3600 * 1000;
 let schemaReady = null;
 
 function esc(s) {
@@ -62,18 +70,115 @@ function parseCookies(request) {
 }
 async function isAdmin(request, env) {
   if (!env.ADMIN_TOKEN) return false;
-  const cookie = parseCookies(request).cms_session || '';
+  const cookie = parseCookies(request).cms_access || '';
   const [exp, sig] = cookie.split('.');
   if (!exp || !sig || Number(exp) < Date.now()) return false;
-  return sig === await hmacHex(env.ADMIN_TOKEN, exp);
+  return sig === await hmacHex(env.ADMIN_TOKEN, 'access:' + exp);
 }
 function sessionExp(request) {
-  const cookie = parseCookies(request).cms_session || '';
+  const cookie = parseCookies(request).cms_access || '';
   const [exp] = cookie.split('.');
   return exp || '';
 }
-async function csrfToken(env, exp) {
-  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'csrf:' + exp) : '';
+// CSRF sengaja TIDAK diikat ke masa berlaku token akses: token akses diputar
+// tiap jam, dan form dashboard yang sudah dimuat harus tetap sah setelah
+// rotasi. Karena hanya ada satu admin, token CSRF tetap yang hanya diketahui
+// admin yang login sudah cukup melawan pemalsuan lintas situs.
+async function csrfToken(env) {
+  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'csrf') : '';
+}
+function b64url(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+}
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function randomHex(n) {
+  return [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function accessCookie(env, exp) {
+  return hmacHex(env.ADMIN_TOKEN, 'access:' + exp).then(sig =>
+    `cms_access=${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ACCESS_TTL_MS / 1000)}`);
+}
+async function issueTokens(env, request, remember) {
+  const now = Date.now();
+  const exp = String(now + ACCESS_TTL_MS);
+  const access = await accessCookie(env, exp);
+  const raw = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const hash = await sha256Hex(raw);
+  const id = randomHex(12);
+  const ttl = remember ? REFRESH_REMEMBER_TTL_MS : REFRESH_TTL_MS;
+  const iso = new Date(now).toISOString();
+  const expires = new Date(now + ttl).toISOString();
+  const device = (request.headers.get('user-agent') || '').slice(0, 80);
+  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(id, hash, device, clientIp(request), iso, iso, expires, remember ? 1 : 0).run();
+  const refresh = `cms_refresh=${raw}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
+  return [access, refresh];
+}
+async function getRefreshRow(request, env) {
+  const raw = parseCookies(request).cms_refresh || '';
+  if (!raw) return null;
+  const hash = await sha256Hex(raw);
+  return await env.DB.prepare(`SELECT * FROM cms_refresh_tokens WHERE token_hash = ?`).bind(hash).first();
+}
+async function revokeAllRefresh(env) {
+  await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE revoked = 0`).run();
+}
+function setCookieInHeader(header, name, value) {
+  const parts = (header || '').split(';').map(p => p.trim()).filter(p => p && !p.startsWith(name + '='));
+  parts.push(`${name}=${value}`);
+  return parts.join('; ');
+}
+// Putar refresh token. Kembalikan {request, cookies} bila berhasil, null bila
+// refresh tidak sah/kedaluwarsa/dicabut. Error D1 dilempar ke fallback 503,
+// bukan ditelan, supaya kegagalan database terlihat jelas, bukan login palsu.
+async function tryRefresh(request, env) {
+  const raw = parseCookies(request).cms_refresh || '';
+  if (!raw || !env.ADMIN_TOKEN) return null;
+  const row = await getRefreshRow(request, env);
+  if (!row) return null;
+  if (row.revoked) {
+    // Refresh yang sudah diputar lalu dipakai lagi = token dicuri (kasus di
+    // video: token bocor dipakai penyerang). Cabut semua sesi, paksa login ulang.
+    if (row.replaced_by) await revokeAllRefresh(env);
+    return null;
+  }
+  if (String(row.expires_at) <= new Date().toISOString()) {
+    await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(row.id).run();
+    return null;
+  }
+  const now = Date.now();
+  const newRaw = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const newHash = await sha256Hex(newRaw);
+  const newId = randomHex(12);
+  const ttl = row.remember ? REFRESH_REMEMBER_TTL_MS : REFRESH_TTL_MS;
+  const iso = new Date(now).toISOString();
+  const expires = new Date(now + ttl).toISOString();
+  await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1, replaced_by = ? WHERE id = ?`).bind(newId, row.id).run();
+  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(newId, newHash, row.device || '', row.ip || '', iso, iso, expires, row.remember ? 1 : 0).run();
+  const access = await accessCookie(env, String(now + ACCESS_TTL_MS));
+  const refresh = `cms_refresh=${newRaw}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
+  const headers = new Headers(request.headers);
+  let cookieHeader = request.headers.get('cookie') || '';
+  cookieHeader = setCookieInHeader(cookieHeader, 'cms_access', access.split(';')[0].split('=')[1]);
+  cookieHeader = setCookieInHeader(cookieHeader, 'cms_refresh', newRaw);
+  headers.set('cookie', cookieHeader);
+  return { request: new Request(request, { headers }), cookies: [access, refresh] };
+}
+function redirectWithCookies(location, cookies) {
+  const headers = new Headers({ location });
+  for (const c of cookies) headers.append('set-cookie', c);
+  return new Response(null, { status: 303, headers });
+}
+function clearAuthCookies() {
+  return [
+    'cms_access=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
+    'cms_refresh=; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
+    'cms_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
+  ];
 }
 function clientIp(request) {
   return request.headers.get('cf-connecting-ip') || (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
@@ -91,6 +196,7 @@ async function ensureSchema(env) {
         `CREATE TABLE IF NOT EXISTS cms_plugins (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1)`,
         `CREATE TABLE IF NOT EXISTS cms_login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, created_at TEXT NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS cms_backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, status TEXT NOT NULL, posts INTEGER NOT NULL DEFAULT 0, comments INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '')`,
+        `CREATE TABLE IF NOT EXISTS cms_refresh_tokens (id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, device TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_used_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, replaced_by TEXT NOT NULL DEFAULT '', remember INTEGER NOT NULL DEFAULT 0)`,
       ];
       for (const sql of ddl) await env.DB.prepare(sql).run();
       // Migrasi pertahanan: CREATE IF NOT EXISTS tidak memperbaiki tabel yang
@@ -194,7 +300,27 @@ export default {
   // ini hanya gagal baca, bukan gagal tulis.
   async fetch(request, env) {
     try {
-      return await handleFetch(request, env);
+      // Perpanjang sesi admin secara transparan: bila token akses sudah
+      // kedaluwarsa tapi refresh masih sah, putar refresh dan teruskan request
+      // dengan cookie baru. Login/logout dikecualikan karena mereka sendiri
+      // yang mengelola token (rotasi di sini akan menimpa cookie hapus/login).
+      // Jalur publik tidak disentuh supaya tidak membakar tulis D1 sia-sia.
+      let req = request;
+      let refreshedCookies = [];
+      const u0 = new URL(request.url);
+      if (u0.pathname.startsWith('/admin') && u0.pathname !== '/admin/login' && u0.pathname !== '/admin/logout') {
+        if (!(await isAdmin(request, env))) {
+          const r = await tryRefresh(request, env);
+          if (r) { req = r.request; refreshedCookies = r.cookies; }
+        }
+      }
+      let res = await handleFetch(req, env);
+      if (refreshedCookies.length) {
+        const h = new Headers(res.headers);
+        for (const c of refreshedCookies) h.append('set-cookie', c);
+        res = new Response(res.body, { status: res.status, headers: h });
+      }
+      return res;
     } catch (e) {
       const theme = themes.terang;
       const u = new URL(request.url);
@@ -265,27 +391,30 @@ async function handleFetch(request, env) {
       }
       if (env.ADMIN_TOKEN && String(form.get('password') || '') === env.ADMIN_TOKEN) {
         await env.DB.prepare(`DELETE FROM cms_login_attempts WHERE ip = ?`).bind(ip).run();
-        const exp = String(Date.now() + SESSION_TTL_MS);
-        const sig = await hmacHex(env.ADMIN_TOKEN, exp);
-        return redirect('/admin', { 'set-cookie': `cms_session=${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}` });
+        const remember = form.get('remember') === '1';
+        const cookies = await issueTokens(env, request, remember);
+        return redirectWithCookies('/admin', [...cookies, 'cms_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0']);
       }
       await env.DB.prepare(`INSERT INTO cms_login_attempts (ip, created_at) VALUES (?, ?)`).bind(ip, new Date().toISOString()).run();
       return html(await renderPage(env, 'Admin', '<div class="card"><p>Password salah.</p><p><a href="/admin">Kembali</a></p></div>'), 403);
     }
     if (path === '/admin/logout' && request.method === 'POST') {
-      if (!admin) return redirect('/admin');
       const form = await request.formData();
-      if (String(form.get('csrf') || '') !== await csrfToken(env, sessionExp(request))) {
+      if (String(form.get('csrf') || '') !== await csrfToken(env)) {
         return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid.</p></div>'), 403);
       }
-      return redirect('/admin', { 'set-cookie': 'cms_session=; Path=/; HttpOnly; Secure; Max-Age=0' });
+      // Logout tidak digate admin: token akses bisa saja sudah kedaluwarsa
+      // saat tombol ditekan; yang dicabut adalah refresh perangkat ini.
+      const row = await getRefreshRow(request, env);
+      if (row) await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(row.id).run();
+      return redirectWithCookies('/admin', clearAuthCookies());
     }
 
     // ---- Admin: dashboard (butuh login) ----
     if (path === '/admin') {
       if (request.method === 'GET') {
         if (!admin) {
-          return html(await renderPage(env, 'Admin', '<div class="card"><h2>Login Admin</h2><form method="post" action="/admin/login"><label>Password admin</label><input type="password" name="password" required><button type="submit">Masuk</button></form></div>'));
+          return html(await renderPage(env, 'Admin', '<div class="card"><h2>Login Admin</h2><form method="post" action="/admin/login"><label>Password admin</label><input type="password" name="password" required><label><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini (refresh 30 hari, tanpa ini 1 hari)</label><p>Token akses berlaku 1 jam dan diperpanjang otomatis selama refresh masih sah.</p><button type="submit">Masuk</button></form></div>'));
         }
         const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all();
         const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
@@ -293,7 +422,7 @@ async function handleFetch(request, env) {
         const siteTitle = await getSetting(env, 'site_title', 'Hozin King');
         const pluginRows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
         const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
-        const csrf = await csrfToken(env, sessionExp(request));
+        const csrf = await csrfToken(env);
         const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
         const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(p.status)})<form method="post" action="/admin/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('');
         const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/admin/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/admin/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('');
@@ -302,7 +431,12 @@ async function handleFetch(request, env) {
         const backupRuns = await env.DB.prepare(`SELECT * FROM cms_backup_runs ORDER BY created_at DESC LIMIT 10`).all();
         const backupRows = (backupRuns.results || []).map(r => `<div class="card"><b>${esc(r.status)}</b> · ${esc(r.created_at)} · ${r.posts} post, ${r.comments} komentar${r.error ? `<p>Error: ${esc(r.error)}</p>` : ''}</div>`).join('') || '<p>Belum ada backup.</p>';
         const backupCard = `<div class="card"><h3>Backup ke Stopwatch</h3><p>Database stopwatch khusus dipakai sebagai tempat backup CMS. Salinan tidak pernah ditulis dari jalur lain — hanya tombol ini yang menulis ke sana.</p><form method="post" action="/admin/backup">${csrfField}<button type="submit">Buat Backup Sekarang</button></form><h4>Riwayat Backup</h4>${backupRows}</div>`;
-        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain, tidak ada pendaftar publik.</p><form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}<div class="card"><h3>Pengaturan</h3><form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Post Baru</h3><form method="post" action="/admin/posts">${csrfField}<label>Judul</label><input name="title" required><label>Kategori</label><input name="category" value="Umum"><label>Isi</label><textarea name="body" required></textarea><button type="submit">Terbitkan</button></form></div><h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Plugin</h3>${pluginForms}`;
+        const nowIso = new Date().toISOString();
+        const sessionRows = await env.DB.prepare(`SELECT id, device, ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens WHERE revoked = 0 AND expires_at > ? ORDER BY last_used_at DESC`).bind(nowIso).all();
+        const currentRefresh = await getRefreshRow(request, env);
+        const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/admin/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
+        const sessionsCard = `<div class="card"><h3>Sesi & Perangkat</h3><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/admin/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
+        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain, tidak ada pendaftar publik.</p><form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3><form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Post Baru</h3><form method="post" action="/admin/posts">${csrfField}<label>Judul</label><input name="title" required><label>Kategori</label><input name="category" value="Umum"><label>Isi</label><textarea name="body" required></textarea><button type="submit">Terbitkan</button></form></div><h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Plugin</h3>${pluginForms}`;
         return html(await renderPage(env, 'Admin', content));
       }
     }
@@ -310,7 +444,7 @@ async function handleFetch(request, env) {
     // ---- Admin: aksi (butuh login + CSRF) ----
     if (admin && request.method === 'POST') {
       const form = await request.formData();
-      if (String(form.get('csrf') || '') !== await csrfToken(env, sessionExp(request))) {
+      if (String(form.get('csrf') || '') !== await csrfToken(env)) {
         return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid. Muat ulang dashboard lalu coba lagi.</p></div>'), 403);
       }
       if (path === '/admin/backup') {
@@ -321,6 +455,17 @@ async function handleFetch(request, env) {
         } catch (e) {
           await env.DB.prepare(`INSERT INTO cms_backup_runs (created_at, status, posts, comments, error) VALUES (?, 'GAGAL', 0, 0, ?)`).bind(now, String(e && e.message ? e.message : e).slice(0, 300)).run();
         }
+        return redirect('/admin');
+      }
+      if (path === '/admin/logout-all') {
+        await revokeAllRefresh(env);
+        return redirectWithCookies('/admin', clearAuthCookies());
+      }
+      if (path === '/admin/sessions/revoke') {
+        const id = String(form.get('id') || '');
+        const current = await getRefreshRow(request, env);
+        await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(id).run();
+        if (current && current.id === id) return redirectWithCookies('/admin', clearAuthCookies());
         return redirect('/admin');
       }
       if (path === '/admin/settings') {

@@ -11,7 +11,7 @@ class Stmt {
 }
 class MockDB {
   constructor() {
-    this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = [];
+    this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = []; this.refreshTokens = [];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { for (const s of stmts) await s.run(); }
@@ -38,6 +38,12 @@ class MockDB {
     if (s.startsWith('INSERT INTO cms_login_attempts')) { this.attempts.push({ ip: a[0], created_at: a[1] }); return []; }
     if (s.startsWith('SELECT COUNT(*) AS n FROM cms_login_attempts')) return [{ n: this.attempts.filter(x => x.ip === a[0] && x.created_at > a[1]).length }];
     if (s.startsWith('DELETE FROM cms_login_attempts')) { this.attempts = this.attempts.filter(x => x.ip !== a[0]); return []; }
+    if (s.startsWith('INSERT INTO cms_refresh_tokens')) { this.refreshTokens.push({ id: a[0], token_hash: a[1], device: a[2], ip: a[3], created_at: a[4], last_used_at: a[5], expires_at: a[6], revoked: 0, replaced_by: '', remember: a[7] }); return []; }
+    if (s.startsWith('SELECT * FROM cms_refresh_tokens WHERE token_hash')) return this.refreshTokens.filter(x => x.token_hash === a[0]);
+    if (s.startsWith('SELECT id, device, ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens')) return this.refreshTokens.filter(x => x.revoked === 0 && x.expires_at > a[0]).sort((x, y) => y.last_used_at.localeCompare(x.last_used_at));
+    if (s.startsWith('UPDATE cms_refresh_tokens SET revoked = 1, replaced_by = ? WHERE id = ?')) { const rr = this.refreshTokens.find(x => x.id === a[1]); if (rr) { rr.revoked = 1; rr.replaced_by = a[0]; } return []; }
+    if (s.startsWith('UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?')) { const rr = this.refreshTokens.find(x => x.id === a[0]); if (rr) rr.revoked = 1; return []; }
+    if (s.startsWith('UPDATE cms_refresh_tokens SET revoked = 1 WHERE revoked = 0')) { this.refreshTokens.forEach(x => x.revoked = 1); return []; }
     if (s.startsWith('INSERT INTO cms_backup_runs')) {
       const status = (s.match(/'(BERHASIL|GAGAL)'/) || [])[1] || 'GAGAL';
       this.backupRuns.push(status === 'BERHASIL'
@@ -88,11 +94,14 @@ assert(t.includes('Selamat Datang di CMS Hozin'), 'beranda: post sambutan tampil
 assert(t.includes('menit baca'), 'beranda: plugin waktu baca aktif');
 assert(t.includes('id="copyr"') && t.includes('id="uptime"') && t.includes('2024-01-01'), 'beranda: footer copyright + uptime dipertahankan');
 
-// 2. Login admin (salah -> 403, benar -> cookie sesi)
+// 2. Login admin (salah -> 403, benar -> token akses + refresh)
+function cookiesOf(res) { const list = res.headers.getSetCookie ? res.headers.getSetCookie() : [(res.headers.get('set-cookie') || '')]; return list.map(c => c.split(';')[0]).filter(Boolean); }
+function cookieHeader(list) { return list.join('; '); }
 r = await call('POST', '/admin/login', { password: 'salah' }); assert(r.status === 403, 'login salah ditolak');
-r = await call('POST', '/admin/login', { password: 'test-admin-token' });
-const cookie = (r.headers.get('set-cookie') || '').split(';')[0];
-assert(cookie.startsWith('cms_session='), 'login benar memberi cookie sesi');
+r = await call('POST', '/admin/login', { password: 'test-admin-token', remember: '1' });
+let cookie = cookieHeader(cookiesOf(r));
+assert(cookie.includes('cms_access=') && cookie.includes('cms_refresh='), 'login benar memberi token akses + refresh');
+assert(env.DB.refreshTokens.length === 1 && env.DB.refreshTokens[0].remember === 1, 'login ingat saya menyimpan refresh 30 hari');
 // Ambil token CSRF dari dashboard admin, semua aksi admin wajib pakai token ini
 r = await call('GET', '/admin', null, cookie); t = await r.text();
 const csrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
@@ -140,4 +149,41 @@ r = await call('POST', '/admin/backup', { csrf }, cookie); assert(r.status === 3
 r = await call('GET', '/admin', null, cookie); t = await r.text();
 assert(t.includes('GAGAL'), 'riwayat backup GAGAL tampil di dashboard');
 env.BACKUP_DB = savedBak;
+
+// 8. Sistem token: refresh memutar, pakai ulang mencabut semua, logout-all
+// Catatan desain (sama seperti di video): token akses stateless tetap sah
+// sampai kedaluwarsa (maks 1 jam) meski refresh dicabut; yang dicabut
+// seketika adalah kemampuan memperpanjang sesi. Jadi cek pasca-logout
+// memakai cookie refresh saja, bukan akses yang masih hidup.
+const refreshOnly = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
+r = await call('GET', '/admin', null, refreshOnly); t = await r.text();
+assert(t.includes('Dashboard Admin'), 'refresh saja bisa masuk dashboard (akses diperpanjang otomatis)');
+assert(cookiesOf(r).some(c => c.startsWith('cms_access=')), 'refresh memutar memberi token akses baru');
+assert(env.DB.refreshTokens.some(x => x.revoked === 1 && x.replaced_by), 'refresh lama dicabut + ditandai pengganti');
+// Pakai ulang refresh lama -> tanda pencurian -> semua sesi dicabut
+r = await call('GET', '/admin', null, refreshOnly); t = await r.text();
+assert(!t.includes('Dashboard Admin') && t.includes('Login Admin'), 'refresh lama yang dipakai ulang ditolak');
+assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'pakai ulang refresh mencabut semua sesi');
+// Login ulang + daftar sesi + logout-all
+// (Simulasi lewat 15 menit: rate-limit dari tes sebelumnya harus sudah lewat.)
+env.DB.attempts = [];
+r = await call('POST', '/admin/login', { password: 'test-admin-token' });
+cookie = cookieHeader(cookiesOf(r));
+const refreshOnly2 = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
+r = await call('GET', '/admin', null, cookie); t = await r.text();
+assert(t.includes('Sesi & Perangkat'), 'dashboard menampilkan daftar sesi & perangkat');
+const csrf2 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+r = await call('POST', '/admin/logout-all', { csrf: csrf2 }, cookie); assert(r.status === 303, 'logout semua perangkat redirect');
+assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'logout semua mencabut semua refresh');
+r = await call('GET', '/admin', null, refreshOnly2); t = await r.text();
+assert(!t.includes('Dashboard Admin'), 'setelah logout semua, refresh lama tidak bisa memperpanjang sesi');
+// Logout satu perangkat
+r = await call('POST', '/admin/login', { password: 'test-admin-token' });
+cookie = cookieHeader(cookiesOf(r));
+const refreshOnly3 = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
+r = await call('GET', '/admin', null, cookie); t = await r.text();
+const csrf3 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+r = await call('POST', '/admin/logout', { csrf: csrf3 }, cookie); assert(r.status === 303, 'logout satu perangkat redirect');
+r = await call('GET', '/admin', null, refreshOnly3); t = await r.text();
+assert(!t.includes('Dashboard Admin'), 'setelah logout, refresh perangkat itu tidak bisa memperpanjang sesi');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
