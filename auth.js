@@ -43,7 +43,7 @@ export async function issueTokens(env, request, remember) {
   const expires = new Date(now + ttl).toISOString();
   const device = (request.headers.get('user-agent') || '').slice(0, 80);
   await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(id, hash, device, clientIp(request), iso, iso, expires, remember ? 1 : 0).run();
-  const refresh = `cms_refresh=${raw}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
+  const refresh = `cms_refresh=${raw}; Path=/kendali; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
   return [access, refresh];
 }
 export async function getRefreshRow(request, env) {
@@ -88,7 +88,7 @@ export async function tryRefresh(request, env) {
   await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1, replaced_by = ? WHERE id = ?`).bind(newId, row.id).run();
   await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(newId, newHash, row.device || '', row.ip || '', iso, iso, expires, row.remember ? 1 : 0).run();
   const access = await accessCookie(env, String(now + ACCESS_TTL_MS));
-  const refresh = `cms_refresh=${newRaw}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
+  const refresh = `cms_refresh=${newRaw}; Path=/kendali; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
   const headers = new Headers(request.headers);
   let cookieHeader = request.headers.get('cookie') || '';
   cookieHeader = setCookieInHeader(cookieHeader, 'cms_access', access.split(';')[0].split('=')[1]);
@@ -104,7 +104,7 @@ export function redirectWithCookies(location, cookies) {
 export function clearAuthCookies() {
   return [
     'cms_access=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
-    'cms_refresh=; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
+    'cms_refresh=; Path=/kendali; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
     'cms_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
   ];
 }

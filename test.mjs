@@ -134,27 +134,38 @@ assert(t.includes('Selamat Datang di WorkerCMS'), 'beranda: post sambutan tampil
 assert(t.includes('menit baca'), 'beranda: plugin waktu baca aktif');
 assert(t.includes('id="copyr"') && t.includes('id="uptime"') && t.includes('2024-01-01'), 'beranda: footer copyright + uptime dipertahankan');
 
-// 2. Login admin (salah -> 403, benar -> token akses + refresh)
+// 2. Login terpadu di form biasa /akun: nama 'admin' + token admin
+// (salah -> 403 generik, benar -> token akses + refresh + dashboard super-admin)
 function cookiesOf(res) { const list = res.headers.getSetCookie ? res.headers.getSetCookie() : [(res.headers.get('set-cookie') || '')]; return list.map(c => c.split(';')[0]).filter(Boolean); }
 function cookieHeader(list) { return list.join('; '); }
-r = await call('POST', '/admin/login', { password: 'salah' }); assert(r.status === 403, 'login salah ditolak');
-r = await call('POST', '/admin/login', { password: 'test-admin-token', remember: '1' });
+r = await call('POST', '/akun/login', { username: 'admin', password: 'salah' }); assert(r.status === 403, 'login admin salah ditolak (pesan generik)');
+r = await call('POST', '/akun/login', { username: 'admin', password: 'test-admin-token', remember: '1' });
 let cookie = cookieHeader(cookiesOf(r));
-assert(cookie.includes('cms_access=') && cookie.includes('cms_refresh='), 'login benar memberi token akses + refresh');
-assert(env.DB.refreshTokens.length === 1 && env.DB.refreshTokens[0].remember === 1, 'login ingat saya menyimpan refresh 30 hari');
+assert(cookie.includes('cms_access=') && cookie.includes('cms_refresh='), 'login admin benar memberi token akses + refresh');
+assert(env.DB.refreshTokens.length === 1 && env.DB.refreshTokens[0].remember === 1, 'login admin ingat saya menyimpan refresh 30 hari');
+assert((r.headers.get('location') || '') === '/kendali', 'login admin dialihkan ke dashboard /kendali');
+// Header publik tidak lagi menonjolkan Admin, tapi Akun
+r = await call('GET', '/'); t = await r.text();
+assert(t.includes('href="/akun"') && !t.includes('href="/kendali"') && !t.includes('href="/admin"'), 'header: link Akun tampil, link Admin/Kendali tidak tampil');
+// Jalur /admin lama dialihkan ke form biasa /akun
+r = await call('GET', '/admin'); assert(r.status === 303 && (r.headers.get('location') || '') === '/akun', '/admin lama dialihkan ke /akun');
+// Nama 'admin' tidak bisa didaftarkan sebagai komentator
+r = await call('POST', '/akun/daftar', { username: 'admin', password: 'password123' }); assert(r.status === 409, 'daftar nama admin ditolak');
 // Ambil token CSRF dari dashboard admin, semua aksi admin wajib pakai token ini
-r = await call('GET', '/admin', null, cookie); t = await r.text();
+r = await call('GET', '/kendali', null, cookie); t = await r.text();
 const csrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 assert(csrf.length > 10, 'dashboard memberi token CSRF');
 assert(t.includes('Super-Super-Admin'), 'dashboard menandai peran super-super-admin');
 // Aksi admin tanpa CSRF harus ditolak
-r = await call('POST', '/admin/posts', { title: 'Post Jahat', category: 'X', body: 'x' }, cookie); assert(r.status === 403, 'aksi admin tanpa CSRF ditolak');
-// Rate-limit login: 5x salah -> percobaan ke-6 diblokir 429
-for (let i = 0; i < 5; i++) await call('POST', '/admin/login', { password: 'salah' });
-r = await call('POST', '/admin/login', { password: 'salah' }); assert(r.status === 429, 'login ke-6 setelah 5 gagal diblokir 429');
+r = await call('POST', '/kendali/posts', { title: 'Post Jahat', category: 'X', body: 'x' }, cookie); assert(r.status === 403, 'aksi admin tanpa CSRF ditolak');
+// Rate-limit login admin: 5x salah -> percobaan ke-6 tetap ditolak 403 generik
+env.DB.attempts = [];
+for (let i = 0; i < 5; i++) await call('POST', '/akun/login', { username: 'admin', password: 'salah' });
+r = await call('POST', '/akun/login', { username: 'admin', password: 'salah' }); assert(r.status === 403, 'login admin ke-6 setelah 5 gagal tetap ditolak');
+env.DB.attempts = [];
 
 // 3. Admin buat post baru
-r = await call('POST', '/admin/posts', { csrf, title: 'Post Uji', category: 'Tekno', body: 'Isi post uji kedua.' }, cookie);
+r = await call('POST', '/kendali/posts', { csrf, title: 'Post Uji', category: 'Tekno', body: 'Isi post uji kedua.' }, cookie);
 assert(r.status === 303, 'admin buat post redirect');
 r = await call('GET', '/'); t = await r.text(); assert(t.includes('Post Uji'), 'post baru tampil di beranda');
 
@@ -171,31 +182,31 @@ assert(userCsrf.length > 10, 'halaman post memberi CSRF komentator');
 r = await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: 'Komentar uji' }, userCookie); assert(r.status === 303, 'kirim komentar redirect');
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Komentar uji'), 'komentar pending belum tampil');
 const commentId = env.DB.comments[0].id;
-r = await call('POST', '/admin/comments/approve', { csrf, id: String(commentId) }, cookie); assert(r.status === 303, 'admin setujui komentar');
+r = await call('POST', '/kendali/comments/approve', { csrf, id: String(commentId) }, cookie); assert(r.status === 303, 'admin setujui komentar');
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('Komentar uji'), 'komentar disetujui tampil');
 
 // 5. Ganti tema ke gelap + nonaktifkan plugin share, cek halaman berubah
-r = await call('POST', '/admin/settings', { csrf, site_title: 'WorkerCMS', theme: 'gelap' }, cookie);
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', theme: 'gelap' }, cookie);
 r = await call('GET', '/'); t = await r.text(); assert(t.includes('#05070d'), 'tema gelap terpakai (identitas situs lama, bukan slate generik)');
-r = await call('POST', '/admin/plugins/toggle', { csrf, id: 'share', enabled: '0' }, cookie);
+r = await call('POST', '/kendali/plugins/toggle', { csrf, id: 'share', enabled: '0' }, cookie);
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Bagikan:'), 'plugin share nonaktif hilang dari post');
 
 // 6. XSS: komentar berisi tag script harus di-escape, bukan dieksekusi
 await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: '<script>alert(1)</script>' }, userCookie);
 const cid2 = env.DB.comments[env.DB.comments.length - 1].id;
-await call('POST', '/admin/comments/approve', { csrf, id: String(cid2) }, cookie);
+await call('POST', '/kendali/comments/approve', { csrf, id: String(cid2) }, cookie);
 r = await call('GET', '/p/post-uji'); t = await r.text();
 assert(!t.includes('<script>alert(1)</script>') && t.includes('&lt;script&gt;'), 'komentar jahat di-escape');
 
 // 7. Backup ke stopwatch: tombol admin -> salinan di BACKUP_DB + riwayat BERHASIL tampil
-r = await call('POST', '/admin/backup', { csrf }, cookie); assert(r.status === 303, 'tombol backup redirect');
-r = await call('GET', '/admin', null, cookie); t = await r.text();
+r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status === 303, 'tombol backup redirect');
+r = await call('GET', '/kendali', null, cookie); t = await r.text();
 assert(t.includes('Backup ke Stopwatch') && t.includes('BERHASIL'), 'riwayat backup BERHASIL tampil di dashboard');
 assert(env.BACKUP_DB.backupPosts >= 2, 'backup menyalin post ke stopwatch');
 // Backup tanpa BACKUP_DB -> dicatat GAGAL, bukan crash
 const savedBak = env.BACKUP_DB; delete env.BACKUP_DB;
-r = await call('POST', '/admin/backup', { csrf }, cookie); assert(r.status === 303, 'backup gagal tetap redirect');
-r = await call('GET', '/admin', null, cookie); t = await r.text();
+r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status === 303, 'backup gagal tetap redirect');
+r = await call('GET', '/kendali', null, cookie); t = await r.text();
 assert(t.includes('GAGAL'), 'riwayat backup GAGAL tampil di dashboard');
 env.BACKUP_DB = savedBak;
 
@@ -205,36 +216,36 @@ env.BACKUP_DB = savedBak;
 // seketika adalah kemampuan memperpanjang sesi. Jadi cek pasca-logout
 // memakai cookie refresh saja, bukan akses yang masih hidup.
 const refreshOnly = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
-r = await call('GET', '/admin', null, refreshOnly); t = await r.text();
+r = await call('GET', '/kendali', null, refreshOnly); t = await r.text();
 assert(t.includes('Dashboard Admin'), 'refresh saja bisa masuk dashboard (akses diperpanjang otomatis)');
 assert(cookiesOf(r).some(c => c.startsWith('cms_access=')), 'refresh memutar memberi token akses baru');
 assert(env.DB.refreshTokens.some(x => x.revoked === 1 && x.replaced_by), 'refresh lama dicabut + ditandai pengganti');
 // Pakai ulang refresh lama -> tanda pencurian -> semua sesi dicabut
-r = await call('GET', '/admin', null, refreshOnly); t = await r.text();
-assert(!t.includes('Dashboard Admin') && t.includes('Login Admin'), 'refresh lama yang dipakai ulang ditolak');
+r = await call('GET', '/kendali', null, refreshOnly); t = await r.text();
+assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'refresh lama yang dipakai ulang dialihkan ke /akun');
 assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'pakai ulang refresh mencabut semua sesi');
 // Login ulang + daftar sesi + logout-all
 // (Simulasi lewat 15 menit: rate-limit dari tes sebelumnya harus sudah lewat.)
 env.DB.attempts = [];
-r = await call('POST', '/admin/login', { password: 'test-admin-token' });
+r = await call('POST', '/akun/login', { username: 'admin', password: 'test-admin-token' });
 cookie = cookieHeader(cookiesOf(r));
 const refreshOnly2 = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
-r = await call('GET', '/admin', null, cookie); t = await r.text();
+r = await call('GET', '/kendali', null, cookie); t = await r.text();
 assert(t.includes('Sesi & Perangkat'), 'dashboard menampilkan daftar sesi & perangkat');
 const csrf2 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
-r = await call('POST', '/admin/logout-all', { csrf: csrf2 }, cookie); assert(r.status === 303, 'logout semua perangkat redirect');
+r = await call('POST', '/kendali/logout-all', { csrf: csrf2 }, cookie); assert(r.status === 303, 'logout semua perangkat redirect');
 assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'logout semua mencabut semua refresh');
-r = await call('GET', '/admin', null, refreshOnly2); t = await r.text();
-assert(!t.includes('Dashboard Admin'), 'setelah logout semua, refresh lama tidak bisa memperpanjang sesi');
+r = await call('GET', '/kendali', null, refreshOnly2); t = await r.text();
+assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'setelah logout semua, refresh lama dialihkan ke /akun');
 // Logout satu perangkat
-r = await call('POST', '/admin/login', { password: 'test-admin-token' });
+r = await call('POST', '/akun/login', { username: 'admin', password: 'test-admin-token' });
 cookie = cookieHeader(cookiesOf(r));
 const refreshOnly3 = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
-r = await call('GET', '/admin', null, cookie); t = await r.text();
+r = await call('GET', '/kendali', null, cookie); t = await r.text();
 const csrf3 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
-r = await call('POST', '/admin/logout', { csrf: csrf3 }, cookie); assert(r.status === 303, 'logout satu perangkat redirect');
-r = await call('GET', '/admin', null, refreshOnly3); t = await r.text();
-assert(!t.includes('Dashboard Admin'), 'setelah logout, refresh perangkat itu tidak bisa memperpanjang sesi');
+r = await call('POST', '/kendali/logout', { csrf: csrf3 }, cookie); assert(r.status === 303, 'logout satu perangkat redirect');
+r = await call('GET', '/kendali', null, refreshOnly3); t = await r.text();
+assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'setelah logout, refresh perangkat itu dialihkan ke /akun');
 // 9. Failsafe = halaman Pemeliharaan berbahasa Inggris untuk SELURUH situs
 // saat database hilang/error (perintah pemilik 29 Okt 2026 20:44 WIB;
 // sebelumnya 20:42-20:43: tanpa detail teknis di situs, bentuk pemeliharaan).
@@ -247,8 +258,10 @@ async function callDown(method, path) {
 }
 r = await callDown('GET', '/'); t = await r.text();
 assert(r.status === 503 && t.includes('Under Maintenance') && t.includes('currently under maintenance') && !t.includes('Selamat Datang di WorkerCMS') && !t.includes('D1') && !t.includes('kuota'), 'failsafe beranda: halaman pemeliharaan Inggris, tanpa detail teknis');
-r = await callDown('GET', '/admin'); t = await r.text();
-assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1') && !t.includes('kuota') && !t.includes('pukul 07:00'), 'failsafe admin: halaman pemeliharaan Inggris, tanpa detail teknis');
+r = await callDown('GET', '/kendali'); t = await r.text();
+// Dashboard tanpa sesi tidak butuh DB (token akses stateless), jadi saat
+// DB mati pun ia tetap dialihkan ke form biasa /akun, bukan 503.
+assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'failsafe kendali tanpa sesi: dialihkan ke /akun, bukan halaman admin');
 r = await callDown('GET', '/p/post-uji'); t = await r.text();
 assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1'), 'failsafe halaman lain: halaman pemeliharaan Inggris, tanpa detail teknis');
 
@@ -261,10 +274,10 @@ const terangHtml = themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'X'
 assert(terangHtml.includes('width=device-width') && terangHtml.includes('@media (max-width:600px)') && terangHtml.includes('min-height:44px'), 'tema responsif: viewport + breakpoint HP + target sentuh 44px');
 
 // 11. Editor post: HTML disanitasi, teks di-escape, header keamanan, honeypot, rate-limit komentar
-r = await call('POST', '/admin/posts', { csrf, title: 'Post HTML', category: 'Tekno', body: '<script>alert(1)</script><p>Halo <b>Dunia</b></p><a href="javascript:alert(1)">x</a><img src="https://x.test/a.png" onerror="alert(1)"><video controls src="https://x.test/v.mp4"></video>', body_mode: 'html' }, cookie);
+r = await call('POST', '/kendali/posts', { csrf, title: 'Post HTML', category: 'Tekno', body: '<script>alert(1)</script><p>Halo <b>Dunia</b></p><a href="javascript:alert(1)">x</a><img src="https://x.test/a.png" onerror="alert(1)"><video controls src="https://x.test/v.mp4"></video>', body_mode: 'html' }, cookie);
 r = await call('GET', '/p/post-html'); t = await r.text();
 assert(t.includes('<p>Halo <b>Dunia</b></p>') && t.includes('<video') && !t.includes('<script>alert(1)') && !t.includes('javascript:') && !t.includes('onerror'), 'mode HTML: tag aman lolos, script/javascript/onerror dibuang');
-r = await call('POST', '/admin/posts', { csrf, title: 'Post Teks', category: 'Tekno', body: 'Ada <b>tebal</b> palsu.' }, cookie);
+r = await call('POST', '/kendali/posts', { csrf, title: 'Post Teks', category: 'Tekno', body: 'Ada <b>tebal</b> palsu.' }, cookie);
 r = await call('GET', '/p/post-teks'); t = await r.text();
 assert(t.includes('&lt;b&gt;') && !t.includes('Ada <b>tebal</b>'), 'mode teks: HTML di-escape');
 r = await call('GET', '/'); assert((r.headers.get('content-security-policy') || '').includes("object-src 'none'") && (r.headers.get('permissions-policy') || '').includes('camera=()'), 'header keamanan: CSP object-src none + permissions-policy');
@@ -277,17 +290,17 @@ await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: 'Bot', website
 assert(env.DB.comments.length === beforeHoney, 'honeypot: komentar bot tidak tersimpan');
 
 // 12. Visibilitas: terjadwal / private / link saja / password (isi tidak dimuat sebelum kunci dibuka) + view mata
-r = await call('POST', '/admin/posts', { csrf, title: 'Post Jadwal', category: 'Tekno', body: 'Belum terbit.', publish_at_iso: '2099-01-01T00:00:00.000Z' }, cookie);
+r = await call('POST', '/kendali/posts', { csrf, title: 'Post Jadwal', category: 'Tekno', body: 'Belum terbit.', publish_at_iso: '2099-01-01T00:00:00.000Z' }, cookie);
 r = await call('GET', '/'); t = await r.text(); assert(!t.includes('Post Jadwal'), 'terjadwal: tidak di beranda sebelum waktunya');
 r = await call('GET', '/p/post-jadwal'); assert(r.status === 404, 'terjadwal: pengunjung dapat 404');
 r = await call('GET', '/p/post-jadwal', null, cookie); t = await r.text(); assert(t.includes('Belum terbit.') && t.includes('Terjadwal'), 'terjadwal: admin bisa pratinjau');
-r = await call('POST', '/admin/posts', { csrf, title: 'Post Private', category: 'Tekno', body: 'Rahasia admin.', visibility: 'private' }, cookie);
+r = await call('POST', '/kendali/posts', { csrf, title: 'Post Private', category: 'Tekno', body: 'Rahasia admin.', visibility: 'private' }, cookie);
 r = await call('GET', '/p/post-private'); assert(r.status === 404, 'private: pengunjung dapat 404');
 r = await call('GET', '/p/post-private', null, cookie); t = await r.text(); assert(t.includes('Rahasia admin.'), 'private: admin bisa buka');
-r = await call('POST', '/admin/posts', { csrf, title: 'Post Link', category: 'Tekno', body: 'Hanya lewat link.', visibility: 'unlisted' }, cookie);
+r = await call('POST', '/kendali/posts', { csrf, title: 'Post Link', category: 'Tekno', body: 'Hanya lewat link.', visibility: 'unlisted' }, cookie);
 r = await call('GET', '/'); t = await r.text(); assert(!t.includes('Post Link'), 'link saja: tidak di beranda');
 r = await call('GET', '/p/post-link'); t = await r.text(); assert(t.includes('Hanya lewat link.'), 'link saja: bisa dibuka lewat link langsung');
-r = await call('POST', '/admin/posts', { csrf, title: 'Post Kunci', category: 'Tekno', body: 'Isi sangat rahasia 12345.', visibility: 'password', post_password: 'rahasia123' }, cookie);
+r = await call('POST', '/kendali/posts', { csrf, title: 'Post Kunci', category: 'Tekno', body: 'Isi sangat rahasia 12345.', visibility: 'password', post_password: 'rahasia123' }, cookie);
 r = await call('GET', '/p/post-kunci'); t = await r.text();
 assert(t.includes('Post Terkunci') && !t.includes('Isi sangat rahasia 12345') && !t.includes('Post Kunci'), 'password: sebelum kunci dibuka, judul + isi TIDAK dimuat sama sekali');
 r = await call('POST', '/p/post-kunci/unlock', { password: 'salah1234' }); assert(r.status === 403, 'password salah ditolak');
@@ -306,7 +319,7 @@ env.DB.rateLimits = new Map();
 r = await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: 'Balasan untuk Budi', parent_id: String(commentId) }, userCookie); assert(r.status === 303, 'balasan komentar redirect');
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Balasan untuk Budi'), 'balasan pending belum tampil');
 const replyId = env.DB.comments[env.DB.comments.length - 1].id;
-await call('POST', '/admin/comments/approve', { csrf, id: String(replyId) }, cookie);
+await call('POST', '/kendali/comments/approve', { csrf, id: String(replyId) }, cookie);
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('Balasan untuk Budi'), 'balasan disetujui tampil di bawah induknya');
 r = await call('POST', '/p/post-uji/comment/vote', { csrf: userCsrf, comment_id: String(commentId), vote: '1' }, userCookie); assert(r.status === 303, 'like redirect');
 r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('👍 1'), 'like terhitung');

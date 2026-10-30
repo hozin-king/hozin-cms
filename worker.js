@@ -7,7 +7,7 @@
 // KEAMANAN SATU ADMIN:
 // - HANYA SATU admin: pemilik dengan ADMIN_TOKEN. TIDAK ADA akun editor, penulis, atau
 //   pendaftar publik. TIDAK ADA endpoint publik untuk membuat post — post hanya lewat
-//   POST /admin/* dengan sesi admin + token CSRF. Pengunjung hanya bisa kirim komentar,
+//   POST /kendali/* dengan sesi admin + token CSRF. Pengunjung hanya bisa kirim komentar,
 //   dan komentar itu pun pending sampai admin setujui.
 // - Login di-rate-limit: 5x gagal dari satu IP dalam 15 menit -> diblokir sementara (429).
 // - Semua aksi admin POST wajib membawa token CSRF yang terikat sesi (HMAC).
@@ -50,7 +50,7 @@ export default {
       let req = request;
       let refreshedCookies = [];
       const u0 = new URL(request.url);
-      if (u0.pathname.startsWith('/admin') && u0.pathname !== '/admin/login' && u0.pathname !== '/admin/logout') {
+      if (u0.pathname.startsWith('/kendali') && u0.pathname !== '/kendali/login' && u0.pathname !== '/kendali/logout') {
         if (!(await isAdmin(request, env))) {
           const r = await tryRefresh(request, env);
           if (r) { req = r.request; refreshedCookies = r.cookies; }
@@ -63,7 +63,7 @@ export default {
         res = new Response(res.body, { status: res.status, headers: h });
       }
       // Halaman admin tidak boleh di-cache browser / proxy (data sensitif).
-      if (u0.pathname.startsWith('/admin') || u0.pathname.startsWith('/akun')) {
+      if (u0.pathname.startsWith('/kendali') || u0.pathname.startsWith('/akun')) {
         const h = new Headers(res.headers);
         h.set('cache-control', 'no-store');
         res = new Response(res.body, { status: res.status, headers: h });
@@ -287,13 +287,13 @@ async function handleFetch(request, env) {
     // ---- Akun komentator (BUKAN akun admin — hanya bisa komentar + vote) ----
     if (path === '/akun' && request.method === 'GET') {
       if (admin) {
-        return html(await renderPage(env, 'Akun', '<div class="card"><p>Kamu login sebagai Admin. Admin tidak perlu akun komentator.</p><p><a href="/admin">Ke dashboard admin</a></p></div>'));
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Kamu login sebagai Admin. Admin tidak perlu akun komentator.</p><p><a href="/kendali">Ke dashboard admin</a></p></div>'));
       }
       if (commenter) {
         return html(await renderPage(env, 'Akun', `<div class="card"><h2>Akun Saya</h2><p>Login sebagai <b>${esc(commenter.username)}</b>.</p><form method="post" action="/akun/logout"><button type="submit">Keluar</button></form></div>`));
       }
       const pesan = url.searchParams.get('pesan') === 'login' ? '<div class="card"><p>Login dulu atau buat akun untuk berkomentar.</p></div>' : '';
-      const content = `${pesan}<div class="card"><h2>Login</h2><form method="post" action="/akun/login"><label>Nama pengguna</label><input name="username" maxlength="20" required><label>Password</label><input type="password" name="password" required><button type="submit">Masuk</button></form></div><div class="card"><h2>Buat Akun</h2><p>Akun hanya untuk berkomentar dan like/dislike. Bukan akun admin, tidak bisa membuat post atau membuka dashboard.</p><form method="post" action="/akun/daftar"><label>Nama pengguna (huruf kecil, angka, garis bawah, 3–20 karakter)</label><input name="username" maxlength="20" required><label>Password (minimal 8 karakter)</label><input type="password" name="password" required><button type="submit">Daftar</button></form></div>`;
+      const content = `${pesan}<div class="card"><h2>Login</h2><form method="post" action="/akun/login"><label>Nama pengguna</label><input name="username" maxlength="20" required><label>Password</label><input type="password" name="password" required><label><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini</label><button type="submit">Masuk</button></form></div><div class="card"><h2>Buat Akun</h2><p>Akun hanya untuk berkomentar dan like/dislike. Bukan akun admin, tidak bisa membuat post atau membuka dashboard.</p><form method="post" action="/akun/daftar"><label>Nama pengguna (huruf kecil, angka, garis bawah, 3–20 karakter)</label><input name="username" maxlength="20" required><label>Password (minimal 8 karakter)</label><input type="password" name="password" required><button type="submit">Daftar</button></form></div>`;
       return html(await renderPage(env, 'Akun', content));
     }
     if (path === '/akun/daftar' && request.method === 'POST') {
@@ -306,6 +306,13 @@ async function handleFetch(request, env) {
       const password = String(form.get('password') || '');
       if (!/^[a-z0-9_]{3,20}$/.test(username) || password.length < 8) {
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password tidak valid. Nama: 3–20 karakter (huruf kecil, angka, _). Password: minimal 8 karakter.</p><p><a href="/akun">Kembali</a></p></div>'), 400);
+      }
+      // Nama 'admin' dicadangkan untuk deteksi admin di form login biasa:
+      // tidak boleh didaftarkan sebagai akun komentator, supaya tidak ada
+      // akun komentator yang menyamar jadi admin. Pesan disamakan dengan
+      // nama sudah dipakai, supaya tidak bocor mana nama yang dicadangkan.
+      if (username === 'admin') {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna sudah dipakai.</p><p><a href="/akun">Kembali</a></p></div>'), 409);
       }
       const clash = await env.DB.prepare(`SELECT id FROM cms_users WHERE username = ?`).bind(username).first();
       if (clash) {
@@ -322,12 +329,36 @@ async function handleFetch(request, env) {
     }
     if (path === '/akun/login' && request.method === 'POST') {
       const ip = clientIp(request);
-      if (!(await checkRateLimit(env, 'akun:' + ip, 5, 15 * 60 * 1000))) {
-        return html(await renderPage(env, 'Akun', '<div class="card"><p>Terlalu banyak percobaan. Coba lagi 15 menit.</p></div>'), 429);
-      }
       const form = await request.formData();
       const username = String(form.get('username') || '').trim().toLowerCase();
       const password = String(form.get('password') || '');
+      // Login terpadu (perintah pemilik 30 Okt 2026): form ini tampak biasa
+      // untuk semua orang, tapi bila nama 'admin' + token admin cocok,
+      // sesi langsung naik jadi super-super-admin dan dialihkan ke
+      // dashboard /kendali, dengan tampilan dan akses penuh admin.
+      // Keamanan TIDAK turun: token admin tetap secret Worker, rate-limit
+      // gagal admin 5/IP/15 menit tetap jalan, dan pesan gagal disamakan
+      // dengan gagal komentator supaya tidak bocor akun mana yang admin.
+      // Jalur admin TIDAK memakai rate-limit akun, supaya login komentator
+      // yang sah tidak ikut memblokir login admin dari IP yang sama.
+      if (username === 'admin') {
+        const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+        const fails = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_login_attempts WHERE ip = ? AND created_at > ?`).bind(ip, since).first();
+        if (fails && Number(fails.n) >= 5) {
+          return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
+        }
+        if (env.ADMIN_TOKEN && password === env.ADMIN_TOKEN) {
+          await env.DB.prepare(`DELETE FROM cms_login_attempts WHERE ip = ?`).bind(ip).run();
+          const remember = form.get('remember') === '1';
+          const cookies = await issueTokens(env, request, remember);
+          return redirectWithCookies('/kendali', [...cookies, 'cms_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0']);
+        }
+        await env.DB.prepare(`INSERT INTO cms_login_attempts (ip, created_at) VALUES (?, ?)`).bind(ip, new Date().toISOString()).run();
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
+      }
+      if (!(await checkRateLimit(env, 'akun:' + ip, 5, 15 * 60 * 1000))) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Terlalu banyak percobaan. Coba lagi 15 menit.</p></div>'), 429);
+      }
       const user = await env.DB.prepare(`SELECT * FROM cms_users WHERE username = ?`).bind(username).first();
       const ok = user && await verifyPassword(password, user.salt, user.password_hash);
       if (!ok) {
@@ -344,25 +375,9 @@ async function handleFetch(request, env) {
       return new Response(null, { status: 303, headers });
     }
 
-    // ---- Admin: login (rate-limit 5 gagal / IP / 15 menit) ----
-    if (path === '/admin/login' && request.method === 'POST') {
-      const form = await request.formData();
-      const ip = clientIp(request);
-      const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-      const fails = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_login_attempts WHERE ip = ? AND created_at > ?`).bind(ip, since).first();
-      if (fails && Number(fails.n) >= 5) {
-        return html(await renderPage(env, 'Admin', '<div class="card"><p>Terlalu banyak percobaan login. Coba lagi 15 menit.</p></div>'), 429);
-      }
-      if (env.ADMIN_TOKEN && String(form.get('password') || '') === env.ADMIN_TOKEN) {
-        await env.DB.prepare(`DELETE FROM cms_login_attempts WHERE ip = ?`).bind(ip).run();
-        const remember = form.get('remember') === '1';
-        const cookies = await issueTokens(env, request, remember);
-        return redirectWithCookies('/admin', [...cookies, 'cms_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0']);
-      }
-      await env.DB.prepare(`INSERT INTO cms_login_attempts (ip, created_at) VALUES (?, ?)`).bind(ip, new Date().toISOString()).run();
-      return html(await renderPage(env, 'Admin', '<div class="card"><p>Password salah.</p><p><a href="/admin">Kembali</a></p></div>'), 403);
-    }
-    if (path === '/admin/logout' && request.method === 'POST') {
+    // ---- Admin: logout (login admin sudah pindah ke form biasa /akun/login,
+    // jadi tidak ada lagi form login admin terpisah di /kendali/login) ----
+    if (path === '/kendali/logout' && request.method === 'POST') {
       const form = await request.formData();
       if (String(form.get('csrf') || '') !== await csrfToken(env)) {
         return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid.</p></div>'), 403);
@@ -371,21 +386,23 @@ async function handleFetch(request, env) {
       // saat tombol ditekan; yang dicabut adalah refresh perangkat ini.
       const row = await getRefreshRow(request, env);
       if (row) await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(row.id).run();
-      return redirectWithCookies('/admin', clearAuthCookies());
+      return redirectWithCookies('/kendali', clearAuthCookies());
     }
 
     // ---- Admin: dashboard (butuh login) ----
-    if (path === '/admin') {
+    if (path === '/kendali') {
       if (request.method === 'GET') {
         if (!admin) {
-          return html(await renderPage(env, 'Admin', '<div class="card"><h2>Login Admin</h2><form method="post" action="/admin/login"><label>Password admin</label><input type="password" name="password" required><label><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini (refresh 30 hari, tanpa ini 1 hari)</label><p>Token akses berlaku 1 jam dan diperpanjang otomatis selama refresh masih sah.</p><button type="submit">Masuk</button></form></div>'));
+          // Tanpa sesi admin, dashboard tidak menampilkan form admin sama
+          // sekali — pengunjung dialihkan ke form login biasa /akun.
+          return redirect('/akun?pesan=login');
         }
         // Percepat semuanya: semua query dashboard yang independen jalan
         // barengan (Promise.all), bukan satu per satu. Ini penyebab utama
         // halaman admin terasa loading lama / blank di 30 Okt 2026: HTML
         // server-rendered baru dikirim setelah SEMUA query selesai, jadi
         // browser tidak menampilkan apa-apa sampai query terakhir kembali.
-        // Keamanan tidak berubah: /admin tetap no-store, CSRF tetap wajib.
+        // Keamanan tidak berubah: /kendali tetap no-store, CSRF tetap wajib.
         const dashNowIso = new Date().toISOString();
         const envTitle = envSiteTitle(env);
         const [posts, comments, themeId, siteTitleDb, pluginRows, users, backupRuns, sessionRows, currentRefresh, csrf] = await Promise.all([
@@ -403,18 +420,18 @@ async function handleFetch(request, env) {
         const siteTitle = envTitle || siteTitleDb;
         const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
         const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
-        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · 👁 ${Number(p.views) || 0} · ${esc(p.body_mode || 'text')})<form method="post" action="/admin/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('');
-        const userRows = (users.results || []).map(u => `<div class="card"><b>${esc(u.username)}</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}<form method="post" action="/admin/users/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(u.id)}"><button type="submit">Hapus Akun</button></form></div>`).join('') || '<p>Belum ada akun komentator.</p>';
+        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · 👁 ${Number(p.views) || 0} · ${esc(p.body_mode || 'text')})<form method="post" action="/kendali/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('');
+        const userRows = (users.results || []).map(u => `<div class="card"><b>${esc(u.username)}</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}<form method="post" action="/kendali/users/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(u.id)}"><button type="submit">Hapus Akun</button></form></div>`).join('') || '<p>Belum ada akun komentator.</p>';
         const postError = new URL(request.url).searchParams.get('error') === 'password' ? '<div class="card"><p>Password post minimal 8 karakter, post tidak dibuat.</p></div>' : '';
-        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/admin/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/admin/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('');
+        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/kendali/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/kendali/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('');
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
-        const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/admin/plugins/toggle">${csrfField}<input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
+        const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/kendali/plugins/toggle">${csrfField}<input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
         const backupRows = (backupRuns.results || []).map(r => `<div class="card"><b>${esc(r.status)}</b> · ${esc(r.created_at)} · ${r.posts} post, ${r.comments} komentar${r.error ? `<p>Error: ${esc(r.error)}</p>` : ''}</div>`).join('') || '<p>Belum ada backup.</p>';
-        const backupCard = `<div class="card"><h3>Backup ke Stopwatch</h3><p>Database stopwatch khusus dipakai sebagai tempat backup CMS. Salinan tidak pernah ditulis dari jalur lain — hanya tombol ini yang menulis ke sana.</p><form method="post" action="/admin/backup">${csrfField}<button type="submit">Buat Backup Sekarang</button></form><h4>Riwayat Backup</h4>${backupRows}</div>`;
-        const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/admin/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
-        const sessionsCard = `<div class="card"><h3>Sesi & Perangkat</h3><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/admin/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
+        const backupCard = `<div class="card"><h3>Backup ke Stopwatch</h3><p>Database stopwatch khusus dipakai sebagai tempat backup CMS. Salinan tidak pernah ditulis dari jalur lain — hanya tombol ini yang menulis ke sana.</p><form method="post" action="/kendali/backup">${csrfField}<button type="submit">Buat Backup Sekarang</button></form><h4>Riwayat Backup</h4>${backupRows}</div>`;
+        const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/kendali/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
+        const sessionsCard = `<div class="card"><h3>Sesi & Perangkat</h3><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/kendali/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
         const editorCardHtml = editorCard(csrfField);
-        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3>${envSiteTitle(env) ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div>${editorCardHtml}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
+        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3>${envSiteTitle(env) ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div>${editorCardHtml}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
         // Pakai tema + judul yang sudah diambil di atas, jangan query D1 lagi di renderPage.
         return html(await renderPage(env, 'Admin', content, { siteTitle, themeId }));
       }
@@ -426,7 +443,7 @@ async function handleFetch(request, env) {
       if (String(form.get('csrf') || '') !== await csrfToken(env)) {
         return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid. Muat ulang dashboard lalu coba lagi.</p></div>'), 403);
       }
-      if (path === '/admin/backup') {
+      if (path === '/kendali/backup') {
         const now = new Date().toISOString();
         try {
           const counts = await doBackup(env);
@@ -434,29 +451,29 @@ async function handleFetch(request, env) {
         } catch (e) {
           await env.DB.prepare(`INSERT INTO cms_backup_runs (created_at, status, posts, comments, error) VALUES (?, 'GAGAL', 0, 0, ?)`).bind(now, String(e && e.message ? e.message : e).slice(0, 300)).run();
         }
-        return redirect('/admin');
+        return redirect('/kendali');
       }
-      if (path === '/admin/logout-all') {
+      if (path === '/kendali/logout-all') {
         await revokeAllRefresh(env);
-        return redirectWithCookies('/admin', clearAuthCookies());
+        return redirectWithCookies('/kendali', clearAuthCookies());
       }
-      if (path === '/admin/sessions/revoke') {
+      if (path === '/kendali/sessions/revoke') {
         const id = String(form.get('id') || '');
         const current = await getRefreshRow(request, env);
         await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(id).run();
-        if (current && current.id === id) return redirectWithCookies('/admin', clearAuthCookies());
-        return redirect('/admin');
+        if (current && current.id === id) return redirectWithCookies('/kendali', clearAuthCookies());
+        return redirect('/kendali');
       }
-      if (path === '/admin/settings') {
+      if (path === '/kendali/settings') {
         const siteTitle = String(form.get('site_title') || '').trim().slice(0, 100) || 'WorkerCMS';
         const theme = String(form.get('theme') || 'terang');
         if (themes[theme]) {
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('site_title', ?)`).bind(siteTitle).run();
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('theme', ?)`).bind(theme).run();
         }
-        return redirect('/admin');
+        return redirect('/kendali');
       }
-      if (path === '/admin/posts') {
+      if (path === '/kendali/posts') {
         const title = String(form.get('title') || '').trim().slice(0, 200);
         let body = String(form.get('body') || '').trim();
         const category = String(form.get('category') || 'Umum').trim().slice(0, 80) || 'Umum';
@@ -474,7 +491,7 @@ async function handleFetch(request, env) {
         let pwSalt = '';
         if (visibility === 'password') {
           const pw = String(form.get('post_password') || '');
-          if (pw.length < 8) return redirect('/admin?error=password');
+          if (pw.length < 8) return redirect('/kendali?error=password');
           pwSalt = randomHex(16);
           pwHash = await hashPassword(pw, pwSalt);
         }
@@ -487,13 +504,13 @@ async function handleFetch(request, env) {
           if (clash) slug = slug + '-' + Date.now().toString(36).slice(-4);
           await env.DB.prepare(`INSERT INTO cms_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views) VALUES (?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?, 0)`).bind(id, slug, title, body, category, now, now, bodyMode, visibility, publishAt, pwHash, pwSalt).run();
         }
-        return redirect('/admin');
+        return redirect('/kendali');
       }
-      if (path === '/admin/users/delete') {
+      if (path === '/kendali/users/delete') {
         await env.DB.prepare(`DELETE FROM cms_users WHERE id = ?`).bind(String(form.get('id') || '')).run();
-        return redirect('/admin');
+        return redirect('/kendali');
       }
-      if (path === '/admin/posts/delete') {
+      if (path === '/kendali/posts/delete') {
         const postId = String(form.get('id') || '');
         const cmts = await env.DB.prepare(`SELECT id FROM cms_comments WHERE post_id = ?`).bind(postId).all();
         for (const cm of (cmts.results || [])) {
@@ -501,28 +518,33 @@ async function handleFetch(request, env) {
         }
         await env.DB.prepare(`DELETE FROM cms_comments WHERE post_id = ?`).bind(postId).run();
         await env.DB.prepare(`DELETE FROM cms_posts WHERE id = ?`).bind(postId).run();
-        return redirect('/admin');
+        return redirect('/kendali');
       }
-      if (path === '/admin/comments/approve') {
+      if (path === '/kendali/comments/approve') {
         await env.DB.prepare(`UPDATE cms_comments SET status = 'approved' WHERE id = ?`).bind(Number(form.get('id'))).run();
-        return redirect('/admin');
+        return redirect('/kendali');
       }
-      if (path === '/admin/comments/delete') {
+      if (path === '/kendali/comments/delete') {
         const cid = Number(form.get('id'));
         await env.DB.prepare(`DELETE FROM cms_comment_votes WHERE comment_id = ?`).bind(cid).run();
         await env.DB.prepare(`DELETE FROM cms_comments WHERE id = ?`).bind(cid).run();
-        return redirect('/admin');
+        return redirect('/kendali');
       }
-      if (path === '/admin/plugins/toggle') {
+      if (path === '/kendali/plugins/toggle') {
         const id = String(form.get('id') || '');
         if (pluginDefs.some(p => p.id === id)) {
           await env.DB.prepare(`UPDATE cms_plugins SET enabled = ? WHERE id = ?`).bind(Number(form.get('enabled')) ? 1 : 0, id).run();
         }
-        return redirect('/admin');
+        return redirect('/kendali');
       }
     }
-    if (path.startsWith('/admin')) {
-      return html(await renderPage(env, 'Admin', '<div class="card"><p>Butuh login admin.</p><p><a href="/admin">Ke login</a></p></div>'), 403);
+    // Jalur /admin lama sudah pensiun: siapa pun yang menebak /admin atau
+    // /admin/* dialihkan ke form login biasa /akun, bukan ke form admin.
+    if (path === '/admin' || path.startsWith('/admin/')) {
+      return redirect('/akun');
+    }
+    if (path.startsWith('/kendali')) {
+      return redirect('/akun?pesan=login');
     }
     return html(await renderPage(env, 'Tidak ditemukan', '<div class="card"><p>Halaman tidak ditemukan.</p></div>'), 404);
 }
