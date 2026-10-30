@@ -46,6 +46,37 @@ function adminNav(current) {
 // di pendaftaran supaya tidak ada komentator yang menyamar jadi admin.
 const ADMIN_EMAIL = 'muchammadhozin@gmail.com';
 
+// Kunci ImgBB ganda (perintah pemilik 30 Okt 2026): array JSON di settings
+// 'imgbb_api_keys', masing-masing {k, ok, fail, fail_reason}. Status di halaman
+// Pengaturan BUKAN ping live — status dari upload terakhir: hijau = upload
+// terakhir dengan kunci itu berhasil, merah = gagal terakhir, abu = belum
+// pernah dicoba. Upload memilih kunci secara acak, kalau gagal otomatis
+// coba kunci lain, jadi satu kunci mati tidak langsung menggagalkan upload.
+async function getImgbbKeys(env) {
+  const raw = await getSetting(env, 'imgbb_api_keys', '');
+  if (raw) {
+    try {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) return arr.filter(e => e && typeof e.k === 'string' && e.k);
+    } catch (e) {}
+  }
+  const old = await getSetting(env, 'imgbb_api_key', '');
+  return old ? [{ k: old, ok: '', fail: '', fail_reason: '' }] : [];
+}
+async function saveImgbbKeys(env, arr) {
+  await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('imgbb_api_keys', ?)`).bind(JSON.stringify(arr)).run();
+}
+function maskKey(k) {
+  const t = String(k || '');
+  if (t.length <= 8) return t.slice(0, 2) + '****';
+  return t.slice(0, 4) + '****' + t.slice(-4);
+}
+function keyDot(e) {
+  if (e.fail && (!e.ok || String(e.fail) > String(e.ok))) return '🔴';
+  if (e.ok) return '🟢';
+  return '⚪';
+}
+
 export default {
   // Fallback anti-1101 (insiden 29 Okt 2026 20:28 WIB): bila D1 tidak bisa
   // diakses — mis. kuota baca harian gratis habis — JANGAN lempar exception
@@ -269,7 +300,7 @@ async function handleFetch(request, env) {
         const canReply = Boolean(admin || commenter);
         const csrfForComment = admin ? await csrfToken(env) : (commenter ? await userCsrf(env, commenter.id) : '');
         const maskDirty = plugins.some(p => p.id === 'filter-kotor');
-        const commentHtml = renderCommentsTree(comments.results || [], votes, myVotes, csrfForComment, canReply, slug, maskDirty);
+        const commentHtml = renderCommentsTree(comments.results || [], votes, myVotes, csrfForComment, canReply, slug, maskDirty, { isAdmin: Boolean(admin), username: commenter ? commenter.username : null });
         const commentForm = canReply
           ? `<form method="post" action="/post/${esc(slug)}/comment"><input type="hidden" name="csrf" value="${csrfForComment}"><label>Komentar sebagai ${admin ? 'Admin' : esc(commenter.username)}</label><textarea name="text" maxlength="2000" required></textarea><button type="submit">Kirim Komentar</button></form>`
           : `<div class="card"><p>Untuk berkomentar, login dulu atau buat akun.</p><p><a href="/akun">Login / Daftar Akun</a></p></div>`;
@@ -368,6 +399,38 @@ async function handleFetch(request, env) {
           await env.DB.prepare(`INSERT INTO cms_comment_votes (comment_id, user_key, vote) VALUES (?, ?, ?)`).bind(commentId, myKey, vote).run();
         }
       }
+      return redirect(`/post/${slug}`);
+    }
+
+    // ---- Edit komentar (admin: komentar mana pun, tetap tampil; komentator:
+    // hanya komentar sendiri, kembali pending + cek blokir ulang, supaya edit
+    // tidak jadi jalan pintas spam. Pin tidak berubah oleh edit.) ----
+    const editMatch = path.match(/^\/(?:p|post)\/([A-Za-z0-9-]+)\/comment\/edit$/);
+    if (editMatch && request.method === 'POST') {
+      const slug = editMatch[1];
+      if (!admin && !commenter) return redirect('/akun?pesan=login');
+      const meta = await env.DB.prepare(`SELECT id, slug, visibility, publish_at FROM cms_posts WHERE slug = ?`).bind(slug).first();
+      if (!meta) return redirect('/');
+      const form = await request.formData();
+      const csrfNeed = admin ? await csrfToken(env) : await userCsrf(env, commenter.id);
+      if (String(form.get('csrf') || '') !== csrfNeed) {
+        return html(await renderPage(env, 'Komentar', '<div class="card"><p>Token tidak valid.</p></div>'), 403);
+      }
+      const commentId = Number(form.get('comment_id') || 0);
+      const comment = commentId ? await env.DB.prepare(`SELECT * FROM cms_comments WHERE id = ?`).bind(commentId).first() : null;
+      if (!comment || String(comment.post_id) !== String(meta.id)) return redirect(`/post/${slug}`);
+      if (!admin && comment.name !== commenter.username) return redirect(`/post/${slug}`);
+      const text = String(form.get('text') || '').trim().slice(0, 2000);
+      if (!text) return redirect(`/post/${slug}`);
+      if (!admin) {
+        const blockIds = new Set((await getEnabledPlugins(env)).map(pp => pp.id));
+        if (blockIds.has('blokir-link') && hasLink(text)) return html(await renderPage(env, 'Komentar', '<div class="card"><p>Edit ditolak: link tidak diizinkan di komentar.</p></div>'), 403);
+        if (blockIds.has('blokir-kotor') && hasDirtyWord(text)) return html(await renderPage(env, 'Komentar', '<div class="card"><p>Edit ditolak: mengandung kata tidak pantas.</p></div>'), 403);
+        if (blockIds.has('blokir-judol') && hasJudol(text)) return html(await renderPage(env, 'Komentar', '<div class="card"><p>Edit ditolak: konten judi online tidak diizinkan.</p></div>'), 403);
+        await env.DB.prepare(`UPDATE cms_comments SET text = ?, status = 'pending' WHERE id = ?`).bind(text, commentId).run();
+        return redirect(`/post/${slug}?komentar=menunggu`);
+      }
+      await env.DB.prepare(`UPDATE cms_comments SET text = ? WHERE id = ?`).bind(text, commentId).run();
       return redirect(`/post/${slug}`);
     }
 
@@ -516,7 +579,7 @@ async function handleFetch(request, env) {
       }
       if (path === '/kendali/comments') {
         const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
-        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/kendali/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/kendali/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('') || '<p>Belum ada komentar.</p>';
+        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]${Number(c.pinned) === 1 ? ' 📌 Disematkan' : ''}<p>${esc(c.text)}</p><form method="post" action="/kendali/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/kendali/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form>${c.status === 'approved' && !c.parent_id ? (Number(c.pinned) === 1 ? ` <form method="post" action="/kendali/comments/unpin" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Lepas Sematan</button></form>` : ` <form method="post" action="/kendali/comments/pin" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Sematkan</button></form>`) : ''}<details><summary>Edit komentar (admin)</summary><form method="post" action="/kendali/comments/update">${csrfField}<input type="hidden" name="id" value="${c.id}"><textarea name="text" maxlength="2000" required>${esc(c.text)}</textarea><button type="submit">Simpan Edit</button></form></details></div>`).join('') || '<p>Belum ada komentar.</p>';
         const content = `<h2>Komentar</h2>${nav}${commentRows}`;
         return html(await renderPage(env, 'Komentar', content));
       }
@@ -529,15 +592,15 @@ async function handleFetch(request, env) {
       if (path === '/kendali/plugins') {
         const pluginRows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
         const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
-        const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/kendali/plugins/toggle">${csrfField}<input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
-        const content = `<h2>Plugin</h2>${nav}${pluginForms}`;
+        const pluginToggles = pluginDefs.map(pd => `<div class="card"><label style="display:flex;align-items:center;gap:12px;cursor:pointer"><span style="flex:1"><b>${esc(pd.name)}</b> — ${esc(pd.description)}</span><span class="tgl"><input type="checkbox" name="plugin_${pd.id}" value="1" ${pMap.get(pd.id) !== 0 ? 'checked' : ''} class="plugin-toggle" data-plugin="${pd.id}"><span class="tgl-track"><span class="tgl-knob"></span></span></span></label></div>`).join('');
+        const content = `<h2>Plugin</h2>${nav}<style>.tgl input{position:absolute;opacity:0;width:0;height:0}.tgl-track{display:inline-block;width:52px;height:28px;border-radius:14px;background:#64748b;position:relative;flex:none;transition:background .2s}.tgl-knob{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:left .2s}.tgl input:checked + .tgl-track{background:#22c55e}.tgl input:checked + .tgl-track .tgl-knob{left:27px}</style><form method="post" action="/kendali/plugins/save">${csrfField}${pluginToggles}<p id="pluginDirty" style="display:none">Ada perubahan belum disimpan.</p><button type="submit" id="pluginSaveBtn" disabled>Simpan Plugin</button></form><script>(function(){var boxes=document.querySelectorAll('.plugin-toggle');var init={};boxes.forEach(function(b){init[b.dataset.plugin]=b.checked});function check(){var dirty=false;boxes.forEach(function(b){if(b.checked!==init[b.dataset.plugin])dirty=true});document.getElementById('pluginSaveBtn').disabled=!dirty;document.getElementById('pluginDirty').style.display=dirty?'block':'none'}boxes.forEach(function(b){b.addEventListener('change',check)});})();<\/script>`;
         return html(await renderPage(env, 'Plugin', content));
       }
       if (path === '/kendali/super') {
         const [siteTitleS, themeS, imgbbS, adsenseS, usersN, postsN, pluginsS, pcbActive, pcbMsg] = await Promise.all([
           getSetting(env, 'site_title', 'WorkerCMS'),
           getSetting(env, 'theme', 'terang'),
-          getSetting(env, 'imgbb_api_key', ''),
+          getImgbbKeys(env).then(a => a.length),
           getSetting(env, 'adsense_client', ''),
           env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all(),
           env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all(),
@@ -552,12 +615,12 @@ async function handleFetch(request, env) {
           const on = pluginsS.some(pp => pp.id === pd.id);
           return `<p>${esc(pd.name)}: <b>${on ? 'Aktif' : 'Nonaktif'}</b> <form method="post" action="/kendali/plugins/toggle" style="display:inline">${csrfField}<input type="hidden" name="id" value="${pd.id}"><input type="hidden" name="enabled" value="${on ? '0' : '1'}"><input type="hidden" name="return_to" value="/kendali/super"><button type="submit">${on ? 'Nonaktifkan' : 'Aktifkan'}</button></form></p>`;
         }).join('');
-        const content = `<h2>Super Panel</h2>${nav}<div class="card"><h3>Situs</h3><p>Judul: <b>${esc(envSiteTitle(env) || siteTitleS)}</b> · Tema: ${esc(themeS)} · ImgBB: ${imgbbS ? 'sudah diset' : 'belum diset'} · AdSense: ${adsenseS ? 'sudah diset' : 'belum diset'}</p><form method="post" action="/kendali/settings">${csrfField}<input type="hidden" name="return_to" value="/kendali/super"><label>Judul situs</label><input name="site_title" value="${esc(envSiteTitle(env) || siteTitleS)}"><label>Tema</label><select name="theme">${Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeS ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select><button type="submit">Simpan Judul & Tema</button></form><p><a href="/kendali/settings">Pengaturan lengkap (foto profil, iklan, AdSense, kunci ImgBB)</a></p></div><div class="card"><h3>Komentar & Keamanan</h3><p>${pendingCount} komentar menunggu · ${(usersN.results || []).length} akun komentator · ${(postsN.results || []).length} post · <a href="/kendali/comments">Moderasi Komentar</a> · <a href="/kendali/users">Akun</a></p>${pluginList}<p><a href="/kendali/plugins">Semua plugin</a> · <a href="/kendali/backup">Backup</a> · <a href="/kendali/sessions">Sesi</a></p></div><div class="card"><h3>Event PC Builder (game)</h3><p>Status: <b>${pcbActive === '1' ? 'Aktif — game memberi diskon 10%' : 'Nonaktif — game tidak memberi diskon'}</b></p><p>Game v1.0.3 hanya membaca on/off diskon dari endpoint ini; pesan kustom di bawah hanya catatan admin, belum tampil di game.</p><form method="post" action="/kendali/super/pcbuilder">${csrfField}<label>Event aktif?</label><select name="pcbuilder_active"><option value="1" ${pcbActive === '1' ? 'selected' : ''}>Aktif (diskon 10%)</option><option value="0" ${pcbActive !== '1' ? 'selected' : ''}>Nonaktif</option></select><label>Pesan event (catatan admin, maks 200 karakter)</label><input name="pcbuilder_message" value="${esc(pcbMsg)}" placeholder="mis. Event akhir pekan"><button type="submit">Simpan Event PC Builder</button></form><p>Endpoint game: <code>/api/pcbuilder-events</code></p></div>`;
+        const content = `<h2>Super Panel</h2>${nav}<div class="card"><h3>Situs</h3><p>Judul: <b>${esc(envSiteTitle(env) || siteTitleS)}</b> · Tema: ${esc(themeS)} · ImgBB: ${imgbbS} kunci · AdSense: ${adsenseS ? 'sudah diset' : 'belum diset'}</p><form method="post" action="/kendali/settings">${csrfField}<input type="hidden" name="return_to" value="/kendali/super"><label>Judul situs</label><input name="site_title" value="${esc(envSiteTitle(env) || siteTitleS)}"><label>Tema</label><select name="theme">${Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeS ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select><button type="submit">Simpan Judul & Tema</button></form><p><a href="/kendali/settings">Pengaturan lengkap (foto profil, iklan, AdSense, kunci ImgBB)</a></p></div><div class="card"><h3>Komentar & Keamanan</h3><p>${pendingCount} komentar menunggu · ${(usersN.results || []).length} akun komentator · ${(postsN.results || []).length} post · <a href="/kendali/comments">Moderasi Komentar</a> · <a href="/kendali/users">Akun</a></p>${pluginList}<p><a href="/kendali/plugins">Semua plugin</a> · <a href="/kendali/backup">Backup</a> · <a href="/kendali/sessions">Sesi</a></p></div><div class="card"><h3>Event PC Builder (game)</h3><p>Status: <b>${pcbActive === '1' ? 'Aktif — game memberi diskon 10%' : 'Nonaktif — game tidak memberi diskon'}</b></p><p>Game v1.0.3 hanya membaca on/off diskon dari endpoint ini; pesan kustom di bawah hanya catatan admin, belum tampil di game.</p><form method="post" action="/kendali/super/pcbuilder">${csrfField}<label>Event aktif?</label><select name="pcbuilder_active"><option value="1" ${pcbActive === '1' ? 'selected' : ''}>Aktif (diskon 10%)</option><option value="0" ${pcbActive !== '1' ? 'selected' : ''}>Nonaktif</option></select><label>Pesan event (catatan admin, maks 200 karakter)</label><input name="pcbuilder_message" value="${esc(pcbMsg)}" placeholder="mis. Event akhir pekan"><button type="submit">Simpan Event PC Builder</button></form><p>Endpoint game: <code>/api/pcbuilder-events</code></p></div>`;
         return html(await renderPage(env, 'Super Panel', content));
       }
       if (path === '/kendali/settings') {
         const envTitle = envSiteTitle(env);
-        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText, adsenseClient, adsenseSlot, imgbbKey] = await Promise.all([
+        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText, adsenseClient, adsenseSlot, imgbbKeys] = await Promise.all([
           getSetting(env, 'theme', 'terang'),
           envTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
           getSetting(env, 'site_avatar', ''),
@@ -566,11 +629,11 @@ async function handleFetch(request, env) {
           getSetting(env, 'ad_text', ''),
           getSetting(env, 'adsense_client', ''),
           getSetting(env, 'adsense_slot', ''),
-          getSetting(env, 'imgbb_api_key', ''),
+          getImgbbKeys(env),
         ]);
         const siteTitle = envTitle || siteTitleDb;
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
-        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><h4>Upload Gambar via ImgBB</h4><p>Status: ${imgbbKey ? '<b>sudah diset</b>' : 'belum diset'}. Kunci ini hanya dipakai server untuk upload ke ImgBB, tidak pernah tampil di halaman publik. Kosongkan kolom ini bila tidak mau mengubah kunci yang sudah ada.</p><label>ImgBB: kunci API (dari imgbb.com, menu API)</label><input type="password" name="imgbb_api_key" placeholder="kosong = pakai kunci lama"><button type="submit">Simpan Pengaturan</button></form></div>`;
+        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Upload Gambar via ImgBB — banyak kunci</h3><p>Upload memilih satu kunci secara acak, kalau gagal otomatis coba kunci lain. Status di bawah dari upload terakhir, bukan ping live: 🟢 = upload terakhir berhasil, 🔴 = gagal terakhir, ⚪ = belum pernah dicoba. Kunci tidak pernah tampil penuh, hanya 4 karakter awal + akhir.</p>${imgbbKeys.length ? imgbbKeys.map((e, i) => `<p>${keyDot(e)} Kunci ${i + 1}: ${esc(maskKey(e.k))}${e.ok ? ` · terakhir berhasil ${esc(String(e.ok).slice(0, 16))}` : ''}${e.fail ? ` · terakhir gagal ${esc(String(e.fail).slice(0, 16))}${e.fail_reason ? ` (${esc(e.fail_reason)})` : ''}` : ''} <form method="post" action="/kendali/imgbb/delete" style="display:inline">${csrfField}<input type="hidden" name="index" value="${i}"><button type="submit">Hapus</button></form></p>`).join('') : '<p>Belum ada kunci ImgBB.</p>'}<form method="post" action="/kendali/imgbb/add">${csrfField}<label>Tambah kunci API ImgBB baru (dari imgbb.com, menu API)</label><input type="password" name="new_key" autocomplete="new-password" placeholder="tempel kunci baru di sini"><button type="submit">Tambah Kunci</button></form></div>`;
         return html(await renderPage(env, 'Pengaturan', content, { siteTitle, themeId }));
       }
       if (path === '/kendali/sessions') {
@@ -626,8 +689,8 @@ async function handleFetch(request, env) {
         const json = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
         const ip = clientIp(request);
         if (!(await checkRateLimit(env, 'upload:' + ip, 20, 60 * 60 * 1000))) return json({ ok: false, error: 'Terlalu banyak upload. Coba lagi nanti.' }, 429);
-        const key = await getSetting(env, 'imgbb_api_key', '');
-        if (!key) return json({ ok: false, error: 'Kunci API ImgBB belum diset di Pengaturan.' }, 400);
+        const keys = await getImgbbKeys(env);
+        if (!keys.length) return json({ ok: false, error: 'Kunci API ImgBB belum diset di Pengaturan.' }, 400);
         const file = form.get('image');
         const isFile = file && typeof file === 'object' && typeof file.size === 'number';
         if (!isFile || !file.size) return json({ ok: false, error: 'Pilih file gambar dulu.' }, 400);
@@ -635,17 +698,70 @@ async function handleFetch(request, env) {
         const ftype = String(file.type || '').toLowerCase();
         const fname = String(file.name || '').toLowerCase();
         if (!(ftype.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp|bmp)$/.test(fname))) return json({ ok: false, error: 'File harus gambar (JPG/PNG/GIF/WebP).' }, 400);
-        try {
-          const fd = new FormData();
-          fd.append('image', file);
-          const up = await fetch('https://api.imgbb.com/1/upload?key=' + encodeURIComponent(key), { method: 'POST', body: fd });
-          const data = await up.json().catch(() => null);
-          const imgUrl = data && data.success && data.data && (data.data.display_url || data.data.url);
-          if (!imgUrl) return json({ ok: false, error: 'ImgBB menolak upload.' }, 502);
-          return json({ ok: true, url: imgUrl }, 200);
-        } catch (e) {
-          return json({ ok: false, error: 'Gagal menghubungi ImgBB.' }, 502);
+        // Pilih acak, coba satu per satu sampai ada yang berhasil.
+        const order = keys.map((_, i) => i);
+        for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+        for (const idx of order) {
+          const entry = keys[idx];
+          try {
+            const fd = new FormData();
+            fd.append('image', file);
+            const up = await fetch('https://api.imgbb.com/1/upload?key=' + encodeURIComponent(entry.k), { method: 'POST', body: fd });
+            const data = await up.json().catch(() => null);
+            const imgUrl = data && data.success && data.data && (data.data.display_url || data.data.url);
+            if (imgUrl) {
+              entry.ok = new Date().toISOString(); entry.fail = ''; entry.fail_reason = '';
+              await saveImgbbKeys(env, keys);
+              return json({ ok: true, url: imgUrl }, 200);
+            }
+            entry.fail = new Date().toISOString(); entry.fail_reason = 'ImgBB menolak (status ' + up.status + ')';
+          } catch (e) {
+            entry.fail = new Date().toISOString(); entry.fail_reason = 'gagal menghubungi ImgBB';
+          }
+          await saveImgbbKeys(env, keys);
         }
+        return json({ ok: false, error: 'Semua kunci ImgBB gagal (' + keys.length + ' kunci dicoba).' }, 502);
+      }
+      if (path === '/kendali/comments/update') {
+        const cid = Number(form.get('id') || 0);
+        const text = String(form.get('text') || '').trim().slice(0, 2000);
+        if (cid && text) await env.DB.prepare(`UPDATE cms_comments SET text = ? WHERE id = ?`).bind(text, cid).run();
+        return redirect('/kendali/comments');
+      }
+      if (path === '/kendali/comments/pin') {
+        const cid = Number(form.get('id') || 0);
+        const comment = cid ? await env.DB.prepare(`SELECT * FROM cms_comments WHERE id = ?`).bind(cid).first() : null;
+        if (comment && comment.status === 'approved' && !comment.parent_id) {
+          await env.DB.prepare(`UPDATE cms_comments SET pinned = 0 WHERE post_id = ? AND id != ?`).bind(comment.post_id, cid).run();
+          await env.DB.prepare(`UPDATE cms_comments SET pinned = 1 WHERE id = ?`).bind(cid).run();
+        }
+        return redirect('/kendali/comments');
+      }
+      if (path === '/kendali/comments/unpin') {
+        const cid = Number(form.get('id') || 0);
+        if (cid) await env.DB.prepare(`UPDATE cms_comments SET pinned = 0 WHERE id = ?`).bind(cid).run();
+        return redirect('/kendali/comments');
+      }
+      if (path === '/kendali/plugins/save') {
+        for (const pd of pluginDefs) {
+          const on = form.get('plugin_' + pd.id) !== null ? 1 : 0;
+          await env.DB.prepare(`UPDATE cms_plugins SET enabled = ? WHERE id = ?`).bind(on, pd.id).run();
+        }
+        return redirect('/kendali/plugins');
+      }
+      if (path === '/kendali/imgbb/add') {
+        const nk = String(form.get('new_key') || '').trim();
+        if (/^[A-Za-z0-9]{10,64}$/.test(nk)) {
+          const arr = await getImgbbKeys(env);
+          if (!arr.some(e => e.k === nk)) { arr.push({ k: nk, ok: '', fail: '', fail_reason: '' }); await saveImgbbKeys(env, arr); }
+        }
+        return redirect('/kendali/settings');
+      }
+      if (path === '/kendali/imgbb/delete') {
+        const idx = Number(form.get('index') || -1);
+        const arr = await getImgbbKeys(env);
+        if (idx >= 0 && idx < arr.length) { arr.splice(idx, 1); await saveImgbbKeys(env, arr); }
+        return redirect('/kendali/settings');
       }
       if (path === '/kendali/super/pcbuilder') {
         const active = String(form.get('pcbuilder_active') || '0') === '1' ? '1' : '0';
@@ -692,8 +808,7 @@ async function handleFetch(request, env) {
         const adsenseClient = /^ca-pub-\d+$/.test(adsenseClientRaw) ? adsenseClientRaw : '';
         const adsenseSlotRaw = String(form.get('adsense_slot') || '').trim();
         const adsenseSlot = /^\d+$/.test(adsenseSlotRaw) ? adsenseSlotRaw : '';
-        const imgbbRaw = String(form.get('imgbb_api_key') || '').trim();
-        const imgbbValid = /^[A-Za-z0-9]{10,64}$/.test(imgbbRaw);
+
         if (themes[theme]) {
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('site_title', ?)`).bind(siteTitle).run();
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('theme', ?)`).bind(theme).run();
@@ -704,9 +819,6 @@ async function handleFetch(request, env) {
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_text', ?)`).bind(adText).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_client', ?)`).bind(adsenseClient).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_slot', ?)`).bind(adsenseSlot).run();
-        if (imgbbValid) {
-          await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('imgbb_api_key', ?)`).bind(imgbbRaw).run();
-        }
         const retS = String(form.get('return_to') || '');
         return redirect(retS.startsWith('/kendali/') ? retS : '/kendali/settings');
       }

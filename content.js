@@ -69,7 +69,7 @@ export function postCard(post, plugins, isAdmin = false) {
 
 // Pohon komentar: balasan menempel di bawah induknya, indent dibatasi
 // supaya tidak bergeser terlalu jauh di layar HP.
-export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply, postSlug, maskDirty = false) {
+export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply, postSlug, maskDirty = false, viewer = {}) {
   const byParent = new Map();
   for (const c of comments) {
     const key = c.parent_id ? String(c.parent_id) : 'root';
@@ -88,7 +88,15 @@ export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply
       : `<span>👍 ${v.like} · 👎 ${v.dislike}</span>`;
     const kids = (byParent.get(String(c.id)) || []).map(k => renderOne(k, depth + 1)).join('');
     const displayText = maskDirty ? maskDirtyWords(c.text) : c.text;
-    return `<div class="card" style="margin-left:${indent}px"><p><b>${esc(c.name)}</b></p><p>${esc(displayText)}</p><p>${voteForms}</p>${replyForm}${kids}</div>`;
+    const pinLabel = Number(c.pinned) === 1 ? '<p><b>📌 Disematkan</b></p>' : '';
+    // Edit di halaman post hanya untuk pemilik komentar (komentator).
+    // Admin edit lewat /kendali/comments, supaya halaman post yang dibuka
+    // admin tidak ikut menampilkan teks asli yang sedang disensor filter.
+    const canEdit = !viewer.isAdmin && viewer.username && c.name === viewer.username;
+    const editForm = canEdit
+      ? `<details><summary>Edit komentar</summary><form method="post" action="/post/${esc(postSlug)}/comment/edit"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><textarea name="text" maxlength="2000" required>${esc(c.text)}</textarea><button type="submit">Simpan Edit</button></form>'<p>Komentar yang diedit kembali menunggu persetujuan admin.</p>'</details>`
+      : '';
+    return `<div class="card" style="margin-left:${indent}px">${pinLabel}<p><b>${esc(c.name)}</b></p><p>${esc(displayText)}</p><p>${voteForms}</p>${editForm}${replyForm}${kids}</div>`;
   };
   // Komentar yang induknya sudah dihapus diperlakukan sebagai komentar utama,
   // supaya tidak hilang diam-diam.
@@ -96,5 +104,7 @@ export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply
   for (const c of comments) {
     if (c.parent_id && !comments.some(p => p.id === c.parent_id) && !roots.includes(c)) roots.push(c);
   }
+  // Disematkan dulu (ala YouTube: 1 per post, paling atas), lalu terlama dulu.
+  roots.sort((a, b) => (Number(b.pinned || 0) - Number(a.pinned || 0)) || String(a.created_at || '').localeCompare(String(b.created_at || '')));
   return roots.map(c => renderOne(c, 0)).join('') || '<p>Belum ada komentar.</p>';
 }
