@@ -111,8 +111,11 @@ async function handleFetch(request, env) {
 
     // ---- Publik: beranda (hanya post publik yang sudah terbit) ----
     if (request.method === 'GET' && path === '/') {
-      const rows = await env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(nowIso).all();
-      const plugins = await getEnabledPlugins(env);
+      // Percepat: dua query independen ini jalan barengan, bukan berurutan.
+      const [rows, plugins] = await Promise.all([
+        env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(nowIso).all(),
+        getEnabledPlugins(env),
+      ]);
       const posts = rows.results || [];
       const content = posts.length
         ? posts.map(p => postCard(p, plugins)).join('')
@@ -175,25 +178,26 @@ async function handleFetch(request, env) {
             viewCookie = viewName + '=1; Path=/; Max-Age=86400';
           }
         }
-        const plugins = await getEnabledPlugins(env);
-        const comments = await env.DB.prepare(`SELECT * FROM cms_comments WHERE post_id = ? AND status = 'approved' ORDER BY created_at ASC`).bind(post.id).all();
-        const rel = await env.DB.prepare(`SELECT * FROM cms_posts WHERE category = ? AND status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(post.category, nowIso).all();
+        // Percepat: query independen detail post jalan barengan, bukan berurutan.
+        const myKey = admin ? 'admin' : (commenter ? 'u:' + commenter.id : null);
+        const [plugins, comments, rel, voteRows, myRows] = await Promise.all([
+          getEnabledPlugins(env),
+          env.DB.prepare(`SELECT * FROM cms_comments WHERE post_id = ? AND status = 'approved' ORDER BY created_at ASC`).bind(post.id).all(),
+          env.DB.prepare(`SELECT * FROM cms_posts WHERE category = ? AND status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(post.category, nowIso).all(),
+          env.DB.prepare(`SELECT comment_id, vote, COUNT(*) AS n FROM cms_comment_votes GROUP BY comment_id, vote`).all(),
+          myKey ? env.DB.prepare(`SELECT comment_id, vote FROM cms_comment_votes WHERE user_key = ?`).bind(myKey).all() : Promise.resolve({ results: [] }),
+        ]);
         const metaHtml = plugins.map(p => p.postMeta ? p.postMeta(post) : '').join('');
         const footers = plugins.map(p => p.postFooter ? p.postFooter(post, { related: rel.results || [], baseUrl: url.origin }) : '').join('');
         const notice = url.searchParams.get('komentar') === 'menunggu' ? '<div class="card"><p>Komentar dikirim, menunggu persetujuan admin.</p></div>' : '';
-        const voteRows = await env.DB.prepare(`SELECT comment_id, vote, COUNT(*) AS n FROM cms_comment_votes GROUP BY comment_id, vote`).all();
         const votes = new Map();
         for (const vr of (voteRows.results || [])) {
           const cur = votes.get(vr.comment_id) || { like: 0, dislike: 0 };
           if (Number(vr.vote) === 1) cur.like = Number(vr.n); else cur.dislike = Number(vr.n);
           votes.set(vr.comment_id, cur);
         }
-        const myKey = admin ? 'admin' : (commenter ? 'u:' + commenter.id : null);
         const myVotes = new Map();
-        if (myKey) {
-          const myRows = await env.DB.prepare(`SELECT comment_id, vote FROM cms_comment_votes WHERE user_key = ?`).bind(myKey).all();
-          for (const mr of (myRows.results || [])) myVotes.set(mr.comment_id, Number(mr.vote));
-        }
+        for (const mr of (myRows.results || [])) myVotes.set(mr.comment_id, Number(mr.vote));
         const canReply = Boolean(admin || commenter);
         const csrfForComment = admin ? await csrfToken(env) : (commenter ? await userCsrf(env, commenter.id) : '');
         const commentHtml = renderCommentsTree(comments.results || [], votes, myVotes, csrfForComment, canReply, slug);
@@ -376,32 +380,43 @@ async function handleFetch(request, env) {
         if (!admin) {
           return html(await renderPage(env, 'Admin', '<div class="card"><h2>Login Admin</h2><form method="post" action="/admin/login"><label>Password admin</label><input type="password" name="password" required><label><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini (refresh 30 hari, tanpa ini 1 hari)</label><p>Token akses berlaku 1 jam dan diperpanjang otomatis selama refresh masih sah.</p><button type="submit">Masuk</button></form></div>'));
         }
-        const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all();
-        const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
-        const themeId = await getSetting(env, 'theme', 'terang');
-        const siteTitle = envSiteTitle(env) || await getSetting(env, 'site_title', 'WorkerCMS');
-        const pluginRows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
+        // Percepat semuanya: semua query dashboard yang independen jalan
+        // barengan (Promise.all), bukan satu per satu. Ini penyebab utama
+        // halaman admin terasa loading lama / blank di 30 Okt 2026: HTML
+        // server-rendered baru dikirim setelah SEMUA query selesai, jadi
+        // browser tidak menampilkan apa-apa sampai query terakhir kembali.
+        // Keamanan tidak berubah: /admin tetap no-store, CSRF tetap wajib.
+        const dashNowIso = new Date().toISOString();
+        const envTitle = envSiteTitle(env);
+        const [posts, comments, themeId, siteTitleDb, pluginRows, users, backupRuns, sessionRows, currentRefresh, csrf] = await Promise.all([
+          env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all(),
+          env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all(),
+          getSetting(env, 'theme', 'terang'),
+          envTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
+          env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all(),
+          env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all(),
+          env.DB.prepare(`SELECT * FROM cms_backup_runs ORDER BY created_at DESC LIMIT 10`).all(),
+          env.DB.prepare(`SELECT id, device, ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens WHERE revoked = 0 AND expires_at > ? ORDER BY last_used_at DESC`).bind(dashNowIso).all(),
+          getRefreshRow(request, env),
+          csrfToken(env),
+        ]);
+        const siteTitle = envTitle || siteTitleDb;
         const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
-        const csrf = await csrfToken(env);
         const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
         const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · 👁 ${Number(p.views) || 0} · ${esc(p.body_mode || 'text')})<form method="post" action="/admin/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('');
-        const users = await env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all();
         const userRows = (users.results || []).map(u => `<div class="card"><b>${esc(u.username)}</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}<form method="post" action="/admin/users/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(u.id)}"><button type="submit">Hapus Akun</button></form></div>`).join('') || '<p>Belum ada akun komentator.</p>';
         const postError = new URL(request.url).searchParams.get('error') === 'password' ? '<div class="card"><p>Password post minimal 8 karakter, post tidak dibuat.</p></div>' : '';
         const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/admin/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/admin/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('');
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
         const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/admin/plugins/toggle">${csrfField}<input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
-        const backupRuns = await env.DB.prepare(`SELECT * FROM cms_backup_runs ORDER BY created_at DESC LIMIT 10`).all();
         const backupRows = (backupRuns.results || []).map(r => `<div class="card"><b>${esc(r.status)}</b> · ${esc(r.created_at)} · ${r.posts} post, ${r.comments} komentar${r.error ? `<p>Error: ${esc(r.error)}</p>` : ''}</div>`).join('') || '<p>Belum ada backup.</p>';
         const backupCard = `<div class="card"><h3>Backup ke Stopwatch</h3><p>Database stopwatch khusus dipakai sebagai tempat backup CMS. Salinan tidak pernah ditulis dari jalur lain — hanya tombol ini yang menulis ke sana.</p><form method="post" action="/admin/backup">${csrfField}<button type="submit">Buat Backup Sekarang</button></form><h4>Riwayat Backup</h4>${backupRows}</div>`;
-        const nowIso = new Date().toISOString();
-        const sessionRows = await env.DB.prepare(`SELECT id, device, ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens WHERE revoked = 0 AND expires_at > ? ORDER BY last_used_at DESC`).bind(nowIso).all();
-        const currentRefresh = await getRefreshRow(request, env);
         const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/admin/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
         const sessionsCard = `<div class="card"><h3>Sesi & Perangkat</h3><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/admin/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
         const editorCardHtml = editorCard(csrfField);
         const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/admin/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3>${envSiteTitle(env) ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/admin/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div>${editorCardHtml}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
-        return html(await renderPage(env, 'Admin', content));
+        // Pakai tema + judul yang sudah diambil di atas, jangan query D1 lagi di renderPage.
+        return html(await renderPage(env, 'Admin', content, { siteTitle, themeId }));
       }
     }
 

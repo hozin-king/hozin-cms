@@ -138,9 +138,20 @@ export function envSiteTitle(env) {
   return v;
 }
 
-export async function renderPage(env, pageTitle, content) {
-  const siteTitle = envSiteTitle(env) || await getSetting(env, 'site_title', 'WorkerCMS');
-  const themeId = await getSetting(env, 'theme', 'terang');
+export async function renderPage(env, pageTitle, content, opts = {}) {
+  // Percepat semuanya: bila pemanggil sudah mengambil judul/tema (dashboard),
+  // jangan query D1 lagi. Bila belum, dua query pengaturan ini jalan barengan.
+  let siteTitle = opts.siteTitle;
+  let themeId = opts.themeId;
+  if (!siteTitle || !themeId) {
+    const envTitle = envSiteTitle(env);
+    const [siteTitleDb, themeDb] = await Promise.all([
+      envTitle || siteTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
+      themeId ? Promise.resolve('') : getSetting(env, 'theme', 'terang'),
+    ]);
+    if (!siteTitle) siteTitle = envTitle || siteTitleDb;
+    if (!themeId) themeId = themeDb;
+  }
   const theme = themes[themeId] || themes.terang;
   return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content });
 }
