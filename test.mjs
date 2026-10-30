@@ -440,4 +440,19 @@ assert(!t.includes('spam.test'), 'tahan link: komentar berlink admin ditahan, ti
 r = await call('POST', '/post/post-uji/comment', { csrf, text: 'x'.repeat(1001) }, cookie); assert(r.status === 303, 'komentar panjang admin redirect');
 r = await call('GET', '/post/post-uji', null, cookie); t = await r.text();
 assert(!t.includes('x'.repeat(100)), 'tahan panjang: komentar >1000 karakter ditahan, tidak tampil');
+// 22. Plugin blokir otomatis (perintah pemilik 30 Okt 2026 12:57)
+env.DB.rateLimits = new Map();
+r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Cek https://spam.test' }, userCookie); assert(r.status === 403, 'blokir link: komentator ditolak 403, tidak disimpan');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'kamu anjing' }, userCookie); assert(r.status === 403, 'blokir kata kotor: komentator ditolak 403');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'slot gacor maxwin togel daftar' }, userCookie); assert(r.status === 403, 'blokir judol: komentator ditolak 403');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'slot RAM laptop saya 16GB' }, userCookie); assert(r.status === 303, 'blokir judol: kata slot saja tidak diblokir');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/post/post-uji/comment', { csrf, text: 'togel' }, cookie); assert(r.status === 303, 'blokir judol: admin dikecualikan, tidak ditolak');
+r = await call('GET', '/post/post-uji', null, cookie); t = await r.text();
+assert(t.includes('togel'), 'blokir judol: komentar admin tetap tampil');
+r = await call('GET', '/kendali/plugins', null, cookie); t = await r.text();
+assert(t.includes('Blokir Komentar Berlink') && t.includes('Blokir Kata Kotor') && t.includes('Blokir Judol Otomatis'), 'plugin blokir: 3 plugin baru tampil di panel');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

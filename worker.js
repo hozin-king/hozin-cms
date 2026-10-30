@@ -31,7 +31,7 @@ import { checkRateLimit } from './security.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye } from './content.js';
 import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle } from './store.js';
 import { editorCard } from './editor.js';
-import { hasLink } from './plugins.js';
+import { hasLink, hasDirtyWord, hasJudol } from './plugins.js';
 const ADSENSE_CSP = "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://pagead2.googlesyndication.com; frame-src https://googleads.g.doubleclick.net https://tpc.googlesyndication.com https://pagead2.googlesyndication.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
 
 
@@ -286,6 +286,21 @@ async function handleFetch(request, env) {
           return html(await renderPage(env, 'Komentar', '<div class="card"><p>Terlalu banyak komentar. Coba lagi beberapa menit.</p></div>'), 429);
         }
         const text = String(form.get('text') || '').trim().slice(0, 2000);
+        // Plugin blokir (komentator saja, admin dikecualikan): ditolak
+        // langsung, tidak disimpan, tidak masuk antrean moderasi. Pesan
+        // penolakan menyebut alasannya, supaya komentator tahu kenapa.
+        if (!admin) {
+          const blockIds = new Set((await getEnabledPlugins(env)).map(p => p.id));
+          if (blockIds.has('blokir-link') && hasLink(text)) {
+            return html(await renderPage(env, 'Komentar', '<div class="card"><p>Komentar ditolak: link tidak diizinkan di komentar.</p></div>'), 403);
+          }
+          if (blockIds.has('blokir-kotor') && hasDirtyWord(text)) {
+            return html(await renderPage(env, 'Komentar', '<div class="card"><p>Komentar ditolak: mengandung kata tidak pantas.</p></div>'), 403);
+          }
+          if (blockIds.has('blokir-judol') && hasJudol(text)) {
+            return html(await renderPage(env, 'Komentar', '<div class="card"><p>Komentar ditolak: konten judi online tidak diizinkan.</p></div>'), 403);
+          }
+        }
         const parentRaw = Number(form.get('parent_id') || 0);
         let parentId = null;
         if (parentRaw) {

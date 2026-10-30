@@ -18,6 +18,20 @@ export function maskDirtyWords(text) {
   }
   return out;
 }
+
+export function hasDirtyWord(text) {
+  const t = String(text || '');
+  return DIRTY_WORDS.some(w => new RegExp('\\b' + w + '\\b', 'i').test(t));
+}
+// Judol: kata/frasa yang hampir selalu judi online, bukan kata umum.
+// 'slot' saja TIDAK diblokir (bisa jadi slot waktu / slot RAM / slot parkir),
+// yang diblokir adalah frasa judolnya: slot gacor, gacor, maxwin, togel, judi, dll.
+export const JUDOL_PATTERNS = ['judol', 'judi online', 'judi slot', 'situs judi', 'situs slot', 'slot gacor', 'gacor', 'maxwin', 'togel', 'bandar togel', 'agen togel', 'prediksi togel', 'bocoran slot', 'pola slot', 'rtp slot', 'link gacor', 'daftar slot', 'mix parlay', 'parlay'];
+export function hasJudol(text) {
+  const t = String(text || '').toLowerCase();
+  return JUDOL_PATTERNS.some(ph => t.includes(ph));
+}
+
 export function hasLink(text) {
   return /(https?:\/\/|www\.)/i.test(String(text || ''));
 }
@@ -67,5 +81,20 @@ export const pluginDefs = [
     id: 'tahan-panjang',
     name: 'Tahan Komentar Panjang',
     description: 'Komentar lebih dari 1000 karakter ditahan untuk moderasi (anti spam panjang).',
+  },
+  {
+    id: 'blokir-link',
+    name: 'Blokir Komentar Berlink',
+    description: 'Menolak langsung komentar komentator yang mengandung link (tidak disimpan, tidak masuk moderasi). Admin dikecualikan. Lebih keras dari Tahan Komentar Berlink.',
+  },
+  {
+    id: 'blokir-kotor',
+    name: 'Blokir Kata Kotor',
+    description: 'Menolak langsung komentar komentator yang mengandung kata kotor (tidak disimpan). Admin dikecualikan. Lebih keras dari Filter Kata Kotor yang hanya menyensor tampilan.',
+  },
+  {
+    id: 'blokir-judol',
+    name: 'Blokir Judol Otomatis',
+    description: 'Menolak langsung komentar komentator yang mengandung kata/frasa judi online (judol, judi, togel, slot gacor, gacor, maxwin, dll). Admin dikecualikan. Kata slot saja tidak diblokir.',
   },
 ];
