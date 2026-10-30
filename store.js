@@ -140,18 +140,24 @@ export function envSiteTitle(env) {
 
 export async function renderPage(env, pageTitle, content, opts = {}) {
   // Percepat semuanya: bila pemanggil sudah mengambil judul/tema (dashboard),
-  // jangan query D1 lagi. Bila belum, dua query pengaturan ini jalan barengan.
+  // jangan query D1 lagi. Bila belum, query pengaturan ini jalan barengan.
   let siteTitle = opts.siteTitle;
   let themeId = opts.themeId;
-  if (!siteTitle || !themeId) {
+  let siteAvatar = opts.siteAvatar;
+  if (!siteTitle || !themeId || siteAvatar === undefined) {
     const envTitle = envSiteTitle(env);
-    const [siteTitleDb, themeDb] = await Promise.all([
+    const [siteTitleDb, themeDb, avatarDb] = await Promise.all([
       envTitle || siteTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
       themeId ? Promise.resolve('') : getSetting(env, 'theme', 'terang'),
+      siteAvatar !== undefined ? Promise.resolve('') : getSetting(env, 'site_avatar', ''),
     ]);
     if (!siteTitle) siteTitle = envTitle || siteTitleDb;
     if (!themeId) themeId = themeDb;
+    if (siteAvatar === undefined) siteAvatar = avatarDb;
   }
+  // Foto profil hanya boleh link https tanpa kutip/spasi, supaya tidak ada
+  // skema aneh atau atribut yang lolos di header.
+  if (typeof siteAvatar !== 'string' || !siteAvatar.startsWith('https://') || /["'<\s]/.test(siteAvatar)) siteAvatar = '';
   const theme = themes[themeId] || themes.terang;
-  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content });
+  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content, siteAvatar });
 }

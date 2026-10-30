@@ -98,10 +98,16 @@ class MockDB {
     if (s.startsWith('SELECT * FROM cms_plugins ORDER')) return [...this.plugins.entries()].map(([id, enabled]) => ({ id, enabled })).sort((x, y) => x.id.localeCompare(y.id));
     if (s.startsWith('SELECT * FROM cms_plugins') || s.startsWith('SELECT id, enabled FROM cms_plugins')) return [...this.plugins.entries()].map(([id, enabled]) => ({ id, enabled }));
     if (s.startsWith('SELECT * FROM cms_posts WHERE status')) {
-      if (s.includes("visibility = 'public'")) return [...this.posts].filter(p => p.status === 'published' && p.visibility === 'public' && String(p.publish_at || p.created_at) <= a[0]).sort((x, y) => String(y.publish_at || y.created_at).localeCompare(String(x.publish_at || x.created_at)));
+      if (s.includes("visibility = 'public'")) {
+        const all = [...this.posts].filter(p => p.status === 'published' && p.visibility === 'public' && String(p.publish_at || p.created_at) <= a[0]).sort((x, y) => String(y.publish_at || y.created_at).localeCompare(String(x.publish_at || x.created_at)));
+        if (s.includes('LIMIT')) return all.slice(Number(a[1]) || 0, (Number(a[1]) || 0) + 11);
+        return all;
+      }
       return [...this.posts].filter(p => p.status === 'published').sort((x, y) => y.created_at.localeCompare(x.created_at));
     }
     if (s.startsWith('SELECT * FROM cms_posts WHERE slug')) return this.posts.filter(p => p.slug === a[0]).map(p => ({ ...p }));
+    if (s.startsWith('SELECT * FROM cms_posts WHERE id')) return this.posts.filter(p => p.id === a[0]).map(p => ({ ...p }));
+    if (s.startsWith('UPDATE cms_posts SET title')) { const pp = this.posts.find(x => x.id === a[9]); if (pp) { pp.title=a[0]; pp.body=a[1]; pp.category=a[2]; pp.updated_at=a[3]; pp.body_mode=a[4]; pp.visibility=a[5]; pp.publish_at=a[6]; pp.post_password_hash=a[7]; pp.post_password_salt=a[8]; } return []; }
     if (s.startsWith('SELECT * FROM cms_posts WHERE category')) {
       if (s.includes("visibility = 'public'")) return [...this.posts].filter(p => p.category === a[0] && p.status === 'published' && p.visibility === 'public' && String(p.publish_at || p.created_at) <= a[1]).sort((x, y) => String(y.publish_at || y.created_at).localeCompare(String(x.publish_at || x.created_at)));
       return [...this.posts].filter(p => p.category === a[0] && p.status === 'published').sort((x, y) => y.created_at.localeCompare(x.created_at));
@@ -336,4 +342,50 @@ assert(t.includes('Hozin King') && !t.includes('>WorkerCMS<') && t.includes('>H<
 const downEnvTitle = { ...downEnv, SITE_TITLE: 'Hozin King' };
 r = await worker.fetch(new Request(base + '/', { method: 'GET' }), downEnvTitle); t = await r.text();
 assert(r.status === 503 && t.includes('Hozin King') && t.includes('>H</text>') && !t.includes('WorkerCMS'), 'maintenance: SITE_TITLE tampil, bukan WorkerCMS, saat D1 mati');
+// 15. Redesign beranda + edit post (perintah pemilik 30 Okt 2026 12:12)
+// Buat post bergambar, cek kartu: sampul, Selengkapnya, FAB hanya admin, Edit hanya admin
+r = await call('POST', '/kendali/posts', { csrf, title: 'Post Sampul Uji', category: 'Tekno', body: '<p>Isi bergambar.</p><img src="https://x.test/cover.png" alt="sampul">', body_mode: 'html' }, cookie);
+assert(r.status === 303, 'post sampul dibuat');
+const sampul = env.DB.posts.find(x => x.title === 'Post Sampul Uji');
+assert(sampul && sampul.slug, 'post sampul tersimpan dengan slug');
+r = await call('GET', '/', null, cookie); t = await r.text();
+assert(t.includes('class="post-cover"') && t.includes('https://x.test/cover.png'), 'kartu beranda: sampul gambar pertama tampil');
+assert(t.includes('Selengkapnya'), 'kartu beranda: tombol Selengkapnya tampil');
+assert(t.includes('id="fabPost"') && t.includes('/kendali#post-baru'), 'beranda admin: FAB posting tampil ke editor');
+assert(t.includes('/kendali/posts/edit?id=' + sampul.id), 'kartu beranda admin: link Edit tampil');
+r = await call('GET', '/'); t = await r.text();
+assert(!t.includes('id="fabPost"') && !t.includes('/kendali/posts/edit'), 'beranda pengunjung: FAB dan Edit tidak tampil');
+// Halaman edit: prefilled + simpan, slug tetap
+r = await call('GET', '/kendali/posts/edit?id=' + sampul.id, null, cookie); t = await r.text();
+assert(t.includes('Edit Post') && t.includes('Post Sampul Uji') && t.includes('Simpan Perubahan'), 'halaman edit: prefilled judul + tombol simpan');
+r = await call('POST', '/kendali/posts/update', { csrf, id: sampul.id, title: 'Post Sampul Diubah', category: 'Tekno', body: 'Isi diubah.', body_mode: 'text', visibility: 'public' }, cookie);
+assert(r.status === 303, 'update post redirect');
+const diubah = env.DB.posts.find(x => x.id === sampul.id);
+assert(diubah.title === 'Post Sampul Diubah' && diubah.slug === sampul.slug, 'update post: judul berubah, slug tetap');
+r = await call('GET', '/p/' + sampul.slug); t = await r.text();
+assert(t.includes('Post Sampul Diubah'), 'post lama tetap dibuka lewat slug lama');
+// Edit tanpa CSRF ditolak
+r = await call('POST', '/kendali/posts/update', { id: sampul.id, title: 'Jahat', body: 'x' }, cookie);
+assert(r.status === 403, 'update post tanpa CSRF ditolak');
+// 16. Foto profil + iklan manual + pagination (perintah pemilik 30 Okt 2026 12:19)
+// Simpan foto + iklan lewat Pengaturan, cek tampil di beranda dan detail
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', theme: 'gelap', site_avatar: 'https://x.test/avatar.png', ad_image: 'https://x.test/banner.png', ad_link: 'https://x.test/promo', ad_text: 'Promo Uji' }, cookie);
+assert(r.status === 303, 'pengaturan foto + iklan tersimpan');
+r = await call('GET', '/'); t = await r.text();
+assert(t.includes('https://x.test/avatar.png'), 'header: foto profil tampil bila diisi');
+assert(t.includes('Iklan') && t.includes('https://x.test/banner.png') && t.includes('https://x.test/promo'), 'beranda: slot iklan tampil bila diisi');
+r = await call('GET', '/p/' + sampul.slug); t = await r.text();
+assert(t.includes('https://x.test/banner.png'), 'detail post: slot iklan tampil di bawah isi');
+// URL aneh dibersihkan, tidak tampil
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', theme: 'gelap', site_avatar: 'javascript:alert(1)', ad_image: '', ad_link: '', ad_text: '' }, cookie);
+r = await call('GET', '/'); t = await r.text();
+assert(!t.includes('javascript:alert(1)') && !t.includes('Iklan'), 'foto + iklan: URL aneh dibersihkan, slot kosong tidak tampil');
+// Pagination: tambah 12 post dummy, halaman 1 hanya 10 terbaru, halaman 2 sisanya
+for (let i = 1; i <= 12; i++) {
+  env.DB.posts.push({ id: 'pg-' + i, slug: 'paginasi-' + i, title: 'Paginasi ' + String(i).padStart(2, '0'), body: 'Isi paginasi ' + i, category: 'Umum', status: 'published', created_at: '2026-01-01T00:' + String(i).padStart(2, '0') + ':00.000Z', updated_at: '2026-01-01T00:00:00.000Z', body_mode: 'text', visibility: 'public', publish_at: '2026-01-01T00:' + String(i).padStart(2, '0') + ':00.000Z', post_password_hash: '', post_password_salt: '', views: 0 });
+}
+r = await call('GET', '/'); t = await r.text();
+assert(t.includes('Paginasi 12') && !t.includes('Paginasi 01') && t.includes('Post lama'), 'pagination halaman 1: 10 terbaru + link Post lama');
+r = await call('GET', '/?page=2'); t = await r.text();
+assert(t.includes('Paginasi 01') && !t.includes('Paginasi 12') && t.includes('Post baru'), 'pagination halaman 2: sisanya + link Post baru');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

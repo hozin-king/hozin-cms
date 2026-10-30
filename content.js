@@ -20,14 +20,33 @@ export function visibilityLabel(post, nowIso) {
   return 'Publik';
 }
 
-export function postCard(post, plugins) {
+// Slot iklan manual (bukan AdSense): hanya tampil bila gambar + link diisi
+// di Pengaturan. Tidak ada script pihak ketiga, jadi tidak memperlambat
+// halaman. Kosong = tidak tampil sama sekali, tidak ada kotak kosong.
+export function adBanner(adImage, adLink, adText) {
+  const img = typeof adImage === 'string' && adImage.startsWith('https://') ? adImage : '';
+  const link = typeof adLink === 'string' && adLink.startsWith('https://') ? adLink : '';
+  if (!img || !link) return '';
+  return `<div class="card" style="text-align:center"><p class="meta">Iklan</p><a href="${esc(link)}" target="_blank" rel="sponsored noopener"><img src="${esc(img)}" alt="${esc(adText || 'Iklan')}" loading="lazy" style="max-width:100%;height:auto;border-radius:12px"></a>${adText ? `<p>${esc(adText)}</p>` : ''}</div>`;
+}
+
+export function postCard(post, plugins, isAdmin = false) {
   const meta = plugins.map(p => p.postMeta ? p.postMeta(post) : '').join('');
   // Cuplikan selalu dari teks polos (tag HTML post dibuang), jadi cuplikan
   // tidak pernah membocorkan markup. Jumlah tayang hanya logo mata + angka,
   // tanpa kata "dilihat" — sesuai permintaan pemilik.
+  // Sampul: gambar pertama di isi post (hanya http/https, di-escape).
+  // Kalau tidak ada gambar, kartu tetap teks saja — tidak ada kotak kosong.
   const plain = stripTags(post.body || '');
   const views = Number(post.views) || 0;
-  return `<article class="card"><h2><a href="/p/${esc(post.slug)}">${esc(post.title)}</a></h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · 👁 ${views}${meta}</p><p>${esc(plain.slice(0, 200))}${plain.length > 200 ? '…' : ''}</p></article>`;
+  const imgMatch = String(post.body || '').match(/<img[^>]+src=["'](https?:[^"'\s>]+)["']/i);
+  const cover = imgMatch
+    ? `<a href="/p/${esc(post.slug)}"><img class="post-cover" src="${esc(imgMatch[1])}" alt="" loading="lazy"></a>`
+    : '';
+  const editLink = isAdmin
+    ? ` · <a href="/kendali/posts/edit?id=${esc(post.id)}">Edit</a>`
+    : '';
+  return `<article class="card">${cover}<h2><a href="/p/${esc(post.slug)}">${esc(post.title)}</a></h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · 👁 ${views}${meta}</p><p>${esc(plain.slice(0, 200))}${plain.length > 200 ? '…' : ''}</p><p><a class="read-more" href="/p/${esc(post.slug)}">Selengkapnya →</a>${editLink}</p></article>`;
 }
 
 // Pohon komentar: balasan menempel di bawah induknya, indent dibatasi

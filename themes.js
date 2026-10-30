@@ -29,12 +29,19 @@ function baseCss(def) {
     `.card h2{margin:0 0 6px;font-weight:800;letter-spacing:-.02em;font-size:clamp(20px,5vw,26px)}.card h2 a{color:${fg};text-decoration:none}.meta{color:${muted};font-size:12px;letter-spacing:.04em;text-transform:uppercase}` +
     `a{color:${accent}}img,video{max-width:100%;height:auto}audio{width:100%}input,textarea,select{width:100%;box-sizing:border-box;padding:10px;margin:6px 0 12px;border:1px solid ${border};border-radius:10px;background:${card};color:${fg};font-size:16px}` +
     `button{padding:10px 16px;border:0;border-radius:10px;background:linear-gradient(135deg,${accent},${accent2});color:#fff;font-weight:700;cursor:pointer}` +
+    `.post-cover{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:12px;display:block;margin-bottom:12px}` +
+    `.read-more{display:inline-block;padding:10px 16px;border-radius:10px;background:linear-gradient(135deg,${accent},${accent2});color:#fff!important;font-weight:700;text-decoration:none}` +
+    `.fab{position:fixed;right:20px;bottom:20px;width:60px;height:60px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:32px;line-height:1;box-shadow:0 10px 28px rgba(0,0,0,.35);z-index:50;transition:transform .25s,opacity .25s;text-decoration:none;color:#fff;background:linear-gradient(135deg,${accent},${accent2})}.fab-hidden{transform:translateY(90px);opacity:0;pointer-events:none}` +
+    `@media (max-width:600px){.fab{right:16px;bottom:16px}}` +
     `footer{width:100%;max-width:${maxWidth}px;margin:0 auto;padding:20px;color:${muted};font-size:13px;margin-top:auto}` +
     `@media (max-width:600px){header{padding:14px 16px}main{padding:14px}.card{padding:14px}button{min-height:44px;padding:12px 18px}}` +
     `@media (min-width:900px){main,footer{max-width:${maxWidth + 40}px}}`;
 }
-function shell(css, def, siteTitle, pageTitle, content) {
+function shell(css, def, siteTitle, pageTitle, content, siteAvatar) {
   const mark = String(siteTitle || 'W').trim().charAt(0).toUpperCase() || 'W';
+  const avatarHtml = siteAvatar
+    ? `<img src="${siteAvatar}" alt="" style="width:30px;height:30px;flex:0 0 30px;margin-right:10px;border-radius:50%;object-fit:cover">`
+    : '';
   const accent = def.accent, accent2 = def.accent2;
   // Logo animasi SVG (bukan Lottie): tanpa JS eksternal, tanpa file JSON,
   // tanpa beban unduhan tambahan — jadi tetap jalan di halaman
@@ -48,7 +55,7 @@ function shell(css, def, siteTitle, pageTitle, content) {
   // header berasal dari siteTitle (judul situs di pengaturan), jadi tema
   // default tetap netral tanpa nama pemilik.
   const footerScript = `<script>(function(){try{var yr=document.getElementById('copyr');if(yr){var y=new Date().getFullYear();yr.textContent=y>2024?('2024–'+y):'2024'}var START=new Date('2024-01-01T00:00:00+07:00').getTime();var el=document.getElementById('uptime'),mode=0;function p2(n){return (n<10?'0':'')+n}function parts(){var f=new Date(START),t=new Date();var y=t.getFullYear()-f.getFullYear(),mo=t.getMonth()-f.getMonth(),d=t.getDate()-f.getDate(),h=t.getHours()-f.getHours(),mi=t.getMinutes()-f.getMinutes(),s=t.getSeconds()-f.getSeconds();if(s<0){s+=60;mi--}if(mi<0){mi+=60;h--}if(h<0){h+=24;d--}if(d<0){mo--;d+=new Date(t.getFullYear(),t.getMonth(),0).getDate()}if(mo<0){y--;mo+=12}var w=Math.floor(d/7);d=d%7;return{y:y,mo:mo,w:w,d:d,h:h,mi:mi,s:s}}function render(){if(!el)return;if(mode===0){var p=parts(),o=[];if(p.y>0)o.push(p.y+' thn');if(p.mo>0)o.push(p.mo+' bln');if(p.w>0)o.push(p.w+' mgg');if(p.d>0)o.push(p.d+' hari');o.push(p2(p.h)+':'+p2(p.mi)+':'+p2(p.s));el.textContent='Online '+o.join(' ')}else{var hrs=Math.floor((Date.now()-START)/3600000);el.textContent='Online '+hrs.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g,'.')+' jam'}}if(el){el.addEventListener('click',function(){mode=(mode+1)%2;render()});render();setInterval(render,1000)}}catch(e){}})();<\/script>`;
-  return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${pageTitle} — ${siteTitle}</title><style>${css}</style></head><body><header><a class="brand" href="/"><span class="mark">${markSvg}</span>${siteTitle}</a><nav><a href="/">Beranda</a><a href="/akun">Akun</a></nav></header><main>${content}</main><footer><p>© <span id="copyr">2024–2026</span> ${siteTitle} · <span id="uptime" title="Klik untuk ganti mode tampilan" style="cursor:pointer;border-bottom:1px dotted #5b6b8c">…</span></p></footer>${footerScript}</body></html>`;
+  return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${pageTitle} — ${siteTitle}</title><style>${css}</style></head><body><header><a class="brand" href="/">${avatarHtml || `<span class="mark">${markSvg}</span>`}${siteTitle}</a><nav><a href="/">Beranda</a><a href="/akun">Akun</a></nav></header><main>${content}</main><footer><p>© <span id="copyr">2024–2026</span> ${siteTitle} · <span id="uptime" title="Klik untuk ganti mode tampilan" style="cursor:pointer;border-bottom:1px dotted #5b6b8c">…</span></p></footer>${footerScript}</body></html>`;
 }
 const themeDefs = {
   terang: {
@@ -78,5 +85,5 @@ const themeDefs = {
 };
 export const themes = Object.fromEntries(Object.entries(themeDefs).map(([id, def]) => [id, {
   name: def.name,
-  render: ({ siteTitle, pageTitle, content }) => shell(baseCss(def), def, siteTitle, pageTitle, content),
+  render: ({ siteTitle, pageTitle, content, siteAvatar }) => shell(baseCss(def), def, siteTitle, pageTitle, content, siteAvatar),
 }]));

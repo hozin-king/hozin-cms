@@ -28,7 +28,7 @@ import { pluginDefs } from './plugins.js';
 import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex } from './util.js';
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie } from './auth.js';
 import { checkRateLimit } from './security.js';
-import { isScheduled, visibilityLabel, postCard, renderCommentsTree } from './content.js';
+import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner } from './content.js';
 import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle } from './store.js';
 import { editorCard } from './editor.js';
 
@@ -111,15 +111,32 @@ async function handleFetch(request, env) {
 
     // ---- Publik: beranda (hanya post publik yang sudah terbit) ----
     if (request.method === 'GET' && path === '/') {
-      // Percepat: dua query independen ini jalan barengan, bukan berurutan.
-      const [rows, plugins] = await Promise.all([
-        env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(nowIso).all(),
+      // Anti overload: 10 post per halaman, ambil 11 untuk tahu ada halaman
+      // berikutnya tanpa query COUNT tambahan. Tanpa batas ini, beranda
+      // akan makin berat seiring post bertambah.
+      const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1);
+      const offset = (page - 1) * 10;
+      // Percepat: query independen ini jalan barengan, bukan berurutan.
+      const [rows, plugins, adImage, adLink, adText] = await Promise.all([
+        env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC LIMIT 11 OFFSET ?`).bind(nowIso, offset).all(),
         getEnabledPlugins(env),
+        getSetting(env, 'ad_image', ''),
+        getSetting(env, 'ad_link', ''),
+        getSetting(env, 'ad_text', ''),
       ]);
-      const posts = rows.results || [];
-      const content = posts.length
-        ? posts.map(p => postCard(p, plugins)).join('')
-        : '<div class="card"><p>Belum ada post.</p></div>';
+      const allPosts = rows.results || [];
+      const hasNext = allPosts.length > 10;
+      const posts = allPosts.slice(0, 10);
+      // Tombol melayang posting: hanya admin, kanan bawah. Sembunyi saat
+      // di-scroll, muncul lagi 300 ms setelah scroll berhenti (debounce).
+      // Diklik, langsung ke editor di dashboard (#post-baru).
+      const fab = admin
+        ? `<a href="/kendali#post-baru" class="fab" id="fabPost" aria-label="Buat post">+</a><script>(function(){var f=document.getElementById('fabPost');if(!f)return;var t=null;window.addEventListener('scroll',function(){f.classList.add('fab-hidden');if(t)clearTimeout(t);t=setTimeout(function(){f.classList.remove('fab-hidden')},300)},{passive:true})})();<\/script>`
+        : '';
+      const nav = (page > 1 ? `<p><a href="/?page=${page - 1}">← Post baru</a></p>` : '') + (hasNext ? `<p><a href="/?page=${page + 1}">Post lama →</a></p>` : '');
+      const content = adBanner(adImage, adLink, adText) + (posts.length
+        ? posts.map(p => postCard(p, plugins, admin)).join('')
+        : '<div class="card"><p>Belum ada post.</p></div>') + nav + fab;
       return html(await renderPage(env, 'Beranda', content));
     }
 
@@ -180,12 +197,15 @@ async function handleFetch(request, env) {
         }
         // Percepat: query independen detail post jalan barengan, bukan berurutan.
         const myKey = admin ? 'admin' : (commenter ? 'u:' + commenter.id : null);
-        const [plugins, comments, rel, voteRows, myRows] = await Promise.all([
+        const [plugins, comments, rel, voteRows, myRows, adImage, adLink, adText] = await Promise.all([
           getEnabledPlugins(env),
           env.DB.prepare(`SELECT * FROM cms_comments WHERE post_id = ? AND status = 'approved' ORDER BY created_at ASC`).bind(post.id).all(),
           env.DB.prepare(`SELECT * FROM cms_posts WHERE category = ? AND status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(post.category, nowIso).all(),
           env.DB.prepare(`SELECT comment_id, vote, COUNT(*) AS n FROM cms_comment_votes GROUP BY comment_id, vote`).all(),
           myKey ? env.DB.prepare(`SELECT comment_id, vote FROM cms_comment_votes WHERE user_key = ?`).bind(myKey).all() : Promise.resolve({ results: [] }),
+          getSetting(env, 'ad_image', ''),
+          getSetting(env, 'ad_link', ''),
+          getSetting(env, 'ad_text', ''),
         ]);
         const metaHtml = plugins.map(p => p.postMeta ? p.postMeta(post) : '').join('');
         const footers = plugins.map(p => p.postFooter ? p.postFooter(post, { related: rel.results || [], baseUrl: url.origin }) : '').join('');
@@ -209,7 +229,7 @@ async function handleFetch(request, env) {
           : '';
         const views = Number(post.views) || 0;
         const bodyHtml = post.body_mode === 'html' ? sanitizeHtml(post.body) : para(post.body);
-        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · 👁 ${views}${metaHtml}</p>${bodyHtml}</article>${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
+        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · 👁 ${views}${metaHtml}</p>${bodyHtml}</article>${adBanner(adImage, adLink, adText)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
         const res = html(await renderPage(env, post.title, content));
         if (viewCookie) {
           const h = new Headers(res.headers);
@@ -405,7 +425,7 @@ async function handleFetch(request, env) {
         // Keamanan tidak berubah: /kendali tetap no-store, CSRF tetap wajib.
         const dashNowIso = new Date().toISOString();
         const envTitle = envSiteTitle(env);
-        const [posts, comments, themeId, siteTitleDb, pluginRows, users, backupRuns, sessionRows, currentRefresh, csrf] = await Promise.all([
+        const [posts, comments, themeId, siteTitleDb, pluginRows, users, backupRuns, sessionRows, currentRefresh, csrf, siteAvatar, adImage, adLink, adText] = await Promise.all([
           env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all(),
           env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all(),
           getSetting(env, 'theme', 'terang'),
@@ -416,11 +436,15 @@ async function handleFetch(request, env) {
           env.DB.prepare(`SELECT id, device, ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens WHERE revoked = 0 AND expires_at > ? ORDER BY last_used_at DESC`).bind(dashNowIso).all(),
           getRefreshRow(request, env),
           csrfToken(env),
+          getSetting(env, 'site_avatar', ''),
+          getSetting(env, 'ad_image', ''),
+          getSetting(env, 'ad_link', ''),
+          getSetting(env, 'ad_text', ''),
         ]);
         const siteTitle = envTitle || siteTitleDb;
         const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
         const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
-        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · 👁 ${Number(p.views) || 0} · ${esc(p.body_mode || 'text')})<form method="post" action="/kendali/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('');
+        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · 👁 ${Number(p.views) || 0} · ${esc(p.body_mode || 'text')}) <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a> <form method="post" action="/kendali/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('');
         const userRows = (users.results || []).map(u => `<div class="card"><b>${esc(u.username)}</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}<form method="post" action="/kendali/users/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(u.id)}"><button type="submit">Hapus Akun</button></form></div>`).join('') || '<p>Belum ada akun komentator.</p>';
         const postError = new URL(request.url).searchParams.get('error') === 'password' ? '<div class="card"><p>Password post minimal 8 karakter, post tidak dibuat.</p></div>' : '';
         const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/kendali/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/kendali/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('');
@@ -431,10 +455,21 @@ async function handleFetch(request, env) {
         const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/kendali/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
         const sessionsCard = `<div class="card"><h3>Sesi & Perangkat</h3><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/kendali/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
         const editorCardHtml = editorCard(csrfField);
-        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3>${envSiteTitle(env) ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><button type="submit">Simpan Pengaturan</button></form></div>${editorCardHtml}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
+        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3>${envSiteTitle(env) ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><button type="submit">Simpan Pengaturan</button></form></div>${editorCardHtml}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
         // Pakai tema + judul yang sudah diambil di atas, jangan query D1 lagi di renderPage.
         return html(await renderPage(env, 'Admin', content, { siteTitle, themeId }));
       }
+    }
+
+    // ---- Admin: halaman edit post (prefilled, slug tetap saat disimpan) ----
+    if (admin && request.method === 'GET' && path === '/kendali/posts/edit') {
+      const id = url.searchParams.get('id') || '';
+      const post = id ? await env.DB.prepare(`SELECT * FROM cms_posts WHERE id = ?`).bind(id).first() : null;
+      if (!post) return redirect('/kendali');
+      const csrf = await csrfToken(env);
+      const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
+      const content = `<p><a href="/kendali">← Kembali ke Dashboard</a> · <a href="/p/${esc(post.slug)}">Lihat post</a></p>` + editorCard(csrfField, { post, action: '/kendali/posts/update' });
+      return html(await renderPage(env, 'Edit Post', content));
     }
 
     // ---- Admin: aksi (butuh login + CSRF) ----
@@ -467,10 +502,24 @@ async function handleFetch(request, env) {
       if (path === '/kendali/settings') {
         const siteTitle = String(form.get('site_title') || '').trim().slice(0, 100) || 'WorkerCMS';
         const theme = String(form.get('theme') || 'terang');
+        // Foto profil + iklan: hanya link https yang disimpan, sisanya
+        // dibersihkan jadi kosong supaya tidak ada skema aneh yang tampil.
+        const cleanUrl = v => {
+          const s = String(v || '').trim().slice(0, 500);
+          return s.startsWith('https://') && !/["'<\s]/.test(s) ? s : '';
+        };
+        const siteAvatar = cleanUrl(form.get('site_avatar'));
+        const adImage = cleanUrl(form.get('ad_image'));
+        const adLink = cleanUrl(form.get('ad_link'));
+        const adText = String(form.get('ad_text') || '').trim().slice(0, 100);
         if (themes[theme]) {
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('site_title', ?)`).bind(siteTitle).run();
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('theme', ?)`).bind(theme).run();
         }
+        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('site_avatar', ?)`).bind(siteAvatar).run();
+        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_image', ?)`).bind(adImage).run();
+        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_link', ?)`).bind(adLink).run();
+        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_text', ?)`).bind(adText).run();
         return redirect('/kendali');
       }
       if (path === '/kendali/posts') {
@@ -503,6 +552,46 @@ async function handleFetch(request, env) {
           const clash = await env.DB.prepare(`SELECT id FROM cms_posts WHERE slug = ?`).bind(slug).first();
           if (clash) slug = slug + '-' + Date.now().toString(36).slice(-4);
           await env.DB.prepare(`INSERT INTO cms_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views) VALUES (?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?, 0)`).bind(id, slug, title, body, category, now, now, bodyMode, visibility, publishAt, pwHash, pwSalt).run();
+        }
+        return redirect('/kendali');
+      }
+      if (path === '/kendali/posts/update') {
+        const postId = String(form.get('id') || '');
+        const old = postId ? await env.DB.prepare(`SELECT * FROM cms_posts WHERE id = ?`).bind(postId).first() : null;
+        if (!old) return redirect('/kendali');
+        const title = String(form.get('title') || '').trim().slice(0, 200);
+        let body = String(form.get('body') || '').trim();
+        const category = String(form.get('category') || 'Umum').trim().slice(0, 80) || 'Umum';
+        const bodyMode = String(form.get('body_mode') || 'text') === 'html' ? 'html' : 'text';
+        const visibilityRaw = String(form.get('visibility') || 'public');
+        const visibility = ['public', 'private', 'unlisted', 'password'].includes(visibilityRaw) ? visibilityRaw : 'public';
+        const now = new Date().toISOString();
+        let publishAt = old.publish_at || now;
+        const publishRaw = String(form.get('publish_at_iso') || form.get('publish_at') || '');
+        if (publishRaw) {
+          const d = new Date(publishRaw);
+          if (!isNaN(d.getTime())) publishAt = d.toISOString();
+        }
+        // Password: kosong = pakai lama, isi baru (>=8) = ganti, isi pendek = tolak.
+        // Keluar dari password = hapus hash/salt lama. Slug TIDAK diubah,
+        // supaya link lama ke post ini tidak putus.
+        let pwHash = old.post_password_hash || '';
+        let pwSalt = old.post_password_salt || '';
+        if (visibility === 'password') {
+          const pw = String(form.get('post_password') || '');
+          if (pw) {
+            if (pw.length < 8) return redirect('/kendali?error=password');
+            pwSalt = randomHex(16);
+            pwHash = await hashPassword(pw, pwSalt);
+          }
+        } else {
+          pwHash = '';
+          pwSalt = '';
+        }
+        if (bodyMode === 'html') body = sanitizeHtml(body).slice(0, 100000);
+        else body = body.slice(0, 50000);
+        if (title && body) {
+          await env.DB.prepare(`UPDATE cms_posts SET title = ?, body = ?, category = ?, updated_at = ?, body_mode = ?, visibility = ?, publish_at = ?, post_password_hash = ?, post_password_salt = ? WHERE id = ?`).bind(title, body, category, now, bodyMode, visibility, publishAt, pwHash, pwSalt, postId).run();
         }
         return redirect('/kendali');
       }
