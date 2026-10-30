@@ -144,12 +144,13 @@ assert(t.includes('id="copyr"') && t.includes('id="uptime"') && t.includes('2024
 // (salah -> 403 generik, benar -> token akses + refresh + dashboard super-admin)
 function cookiesOf(res) { const list = res.headers.getSetCookie ? res.headers.getSetCookie() : [(res.headers.get('set-cookie') || '')]; return list.map(c => c.split(';')[0]).filter(Boolean); }
 function cookieHeader(list) { return list.join('; '); }
-r = await call('POST', '/akun/login', { username: 'admin', password: 'salah' }); assert(r.status === 403, 'login admin salah ditolak (pesan generik)');
-r = await call('POST', '/akun/login', { username: 'admin', password: 'test-admin-token', remember: '1' });
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'salah' }); assert(r.status === 403, 'login admin salah ditolak (pesan generik)');
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token', remember: '1' });
 let cookie = cookieHeader(cookiesOf(r));
 assert(cookie.includes('cms_access=') && cookie.includes('cms_refresh='), 'login admin benar memberi token akses + refresh');
 assert(env.DB.refreshTokens.length === 1 && env.DB.refreshTokens[0].remember === 1, 'login admin ingat saya menyimpan refresh 30 hari');
 assert((r.headers.get('location') || '') === '/kendali', 'login admin dialihkan ke dashboard /kendali');
+r = await call('POST', '/akun/login', { username: 'admin', password: 'test-admin-token' }); assert(r.status === 403, 'login admin lama (nama admin) sudah tidak berlaku');
 // Header publik tidak lagi menonjolkan Admin, tapi Akun
 r = await call('GET', '/'); t = await r.text();
 assert(t.includes('href="/akun"') && !t.includes('href="/kendali"') && !t.includes('href="/admin"'), 'header: link Akun tampil, link Admin/Kendali tidak tampil');
@@ -166,8 +167,8 @@ assert(t.includes('Super-Super-Admin'), 'dashboard menandai peran super-super-ad
 r = await call('POST', '/kendali/posts', { title: 'Post Jahat', category: 'X', body: 'x' }, cookie); assert(r.status === 403, 'aksi admin tanpa CSRF ditolak');
 // Rate-limit login admin: 5x salah -> percobaan ke-6 tetap ditolak 403 generik
 env.DB.attempts = [];
-for (let i = 0; i < 5; i++) await call('POST', '/akun/login', { username: 'admin', password: 'salah' });
-r = await call('POST', '/akun/login', { username: 'admin', password: 'salah' }); assert(r.status === 403, 'login admin ke-6 setelah 5 gagal tetap ditolak');
+for (let i = 0; i < 5; i++) await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'salah' });
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'salah' }); assert(r.status === 403, 'login admin ke-6 setelah 5 gagal tetap ditolak');
 env.DB.attempts = [];
 
 // 3. Admin buat post baru
@@ -233,7 +234,7 @@ assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'pakai ulang refresh me
 // Login ulang + daftar sesi + logout-all
 // (Simulasi lewat 15 menit: rate-limit dari tes sebelumnya harus sudah lewat.)
 env.DB.attempts = [];
-r = await call('POST', '/akun/login', { username: 'admin', password: 'test-admin-token' });
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' });
 cookie = cookieHeader(cookiesOf(r));
 const refreshOnly2 = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
 r = await call('GET', '/kendali/sessions', null, cookie); t = await r.text();
@@ -244,7 +245,7 @@ assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'logout semua mencabut 
 r = await call('GET', '/kendali', null, refreshOnly2); t = await r.text();
 assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'setelah logout semua, refresh lama dialihkan ke /akun');
 // Logout satu perangkat
-r = await call('POST', '/akun/login', { username: 'admin', password: 'test-admin-token' });
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' });
 cookie = cookieHeader(cookiesOf(r));
 const refreshOnly3 = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
 r = await call('GET', '/kendali', null, cookie); t = await r.text();
@@ -455,4 +456,14 @@ r = await call('GET', '/post/post-uji', null, cookie); t = await r.text();
 assert(t.includes('togel'), 'blokir judol: komentar admin tetap tampil');
 r = await call('GET', '/kendali/plugins', null, cookie); t = await r.text();
 assert(t.includes('Blokir Komentar Berlink') && t.includes('Blokir Kata Kotor') && t.includes('Blokir Judol Otomatis'), 'plugin blokir: 3 plugin baru tampil di panel');
+// 23. Upload gambar via ImgBB (perintah pemilik 30 Okt 2026 13:04, "tidak ribet")
+r = await call('POST', '/kendali/upload-image', { csrf }, userCookie); assert(r.status === 303, 'upload imgbb: non-admin dialihkan ke /akun');
+r = await call('POST', '/kendali/upload-image', {}, cookie); assert(r.status === 403, 'upload imgbb: admin tanpa CSRF ditolak');
+r = await call('POST', '/kendali/upload-image', { csrf }, cookie); t = await r.text(); assert(r.status === 400 && t.includes('Kunci API ImgBB belum diset'), 'upload imgbb: tanpa kunci di Pengaturan ditolak 400, tidak panggil ImgBB');
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', theme: 'terang', imgbb_api_key: 'testimgbbkey123456' }, cookie); assert(r.status === 303, 'pengaturan: simpan kunci ImgBB redirect');
+r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
+assert(t.includes('sudah diset') && !t.includes('testimgbbkey123456'), 'pengaturan: status ImgBB sudah diset, kunci tidak ditampilkan mentah');
+r = await call('POST', '/kendali/upload-image', { csrf }, cookie); t = await r.text(); assert(r.status === 400 && t.includes('Pilih file gambar dulu'), 'upload imgbb: kunci sudah ada, tanpa file ditolak 400');
+r = await call('GET', '/kendali/posts/new', null, cookie); t = await r.text();
+assert(t.includes('Upload Gambar (ImgBB)') && t.includes('imgbbFile'), 'editor: tombol upload ImgBB tampil di post baru');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

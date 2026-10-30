@@ -40,6 +40,12 @@ function adminNav(current) {
   return '<nav style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-bottom:16px">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' style="font-weight:800;text-decoration:underline"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
+// Nama pengguna admin = email pemilik, PATEN (perintah pemilik 30 Okt 2026).
+// Password tetap ADMIN_TOKEN (secret Worker, bukan password komentator).
+// Nama 'admin' TIDAK lagi bisa login sebagai admin, tapi tetap dicadangkan
+// di pendaftaran supaya tidak ada komentator yang menyamar jadi admin.
+const ADMIN_EMAIL = 'muchammadhozin@gmail.com';
+
 export default {
   // Fallback anti-1101 (insiden 29 Okt 2026 20:28 WIB): bila D1 tidak bisa
   // diakses — mis. kuota baca harian gratis habis — JANGAN lempar exception
@@ -104,7 +110,8 @@ async function handleFetch(request, env) {
     // banjir POST). Batas 200 KB jauh di atas post/komentar normal.
     if (request.method === 'POST') {
       const cl = Number(request.headers.get('content-length') || '0');
-      if (cl > 200000) {
+      const upLimit = path === '/kendali/upload-image' ? 6000000 : 200000;
+      if (cl > upLimit) {
         return html(themes.terang.render({ siteTitle: esc(envSiteTitle(env) || 'WorkerCMS'), pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
       }
     }
@@ -363,7 +370,7 @@ async function handleFetch(request, env) {
       // di tengah, tab Login / Daftar (bukan dua kartu besar bertumpuk),
       // teks penjelasan dipersingkat jadi satu baris, checkbox Ingat saya
       // sebaris dengan labelnya (bukan melayang sendiri seperti sebelumnya).
-      const content = `${pesan}<div class="card" style="max-width:440px;margin:0 auto"><div style="display:flex;gap:8px;margin-bottom:16px"><button type="button" id="tabLoginBtn" style="flex:1">Login</button><button type="button" id="tabDaftarBtn" style="flex:1;background:transparent;border:1px solid;color:inherit">Daftar</button></div><div id="loginForm"><h2 style="margin-top:0">Login</h2><form method="post" action="/akun/login"><label>Nama pengguna</label><input name="username" maxlength="20" required><label>Password</label><input type="password" name="password" required><label class="remember"><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini</label><button type="submit" style="width:100%">Masuk</button></form><p style="text-align:center"><button type="button" id="toDaftarLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Belum punya akun? Daftar</button></p></div><div id="daftarForm" style="display:none"><h2 style="margin-top:0">Buat Akun</h2><p class="meta" style="text-transform:none;letter-spacing:0">Akun hanya untuk berkomentar dan like/dislike, bukan akun admin.</p><form method="post" action="/akun/daftar"><label>Nama pengguna</label><input name="username" maxlength="20" placeholder="huruf kecil, angka, _ , 3–20 karakter" required><label>Password (minimal 8 karakter)</label><input type="password" name="password" required><button type="submit" style="width:100%">Daftar</button></form><p style="text-align:center"><button type="button" id="toLoginLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Sudah punya akun? Login</button></p></div><script>(function(){var lb=document.getElementById('tabLoginBtn'),db=document.getElementById('tabDaftarBtn'),lf=document.getElementById('loginForm'),df=document.getElementById('daftarForm');function showLogin(){lf.style.display='block';df.style.display='none';lb.style.background='';lb.style.border='';lb.style.color='';db.style.background='transparent';db.style.border='1px solid';db.style.color='inherit'}function showDaftar(){lf.style.display='none';df.style.display='block';db.style.background='';db.style.border='';db.style.color='';lb.style.background='transparent';lb.style.border='1px solid';lb.style.color='inherit'}lb.onclick=showLogin;db.onclick=showDaftar;document.getElementById('toDaftarLink').onclick=showDaftar;document.getElementById('toLoginLink').onclick=showLogin;})();<\/script><noscript><style>#daftarForm{display:block!important}</style></noscript></div>`;
+      const content = `${pesan}<div class="card" style="max-width:440px;margin:0 auto"><div style="display:flex;gap:8px;margin-bottom:16px"><button type="button" id="tabLoginBtn" style="flex:1">Login</button><button type="button" id="tabDaftarBtn" style="flex:1;background:transparent;border:1px solid;color:inherit">Daftar</button></div><div id="loginForm"><h2 style="margin-top:0">Login</h2><form method="post" action="/akun/login"><label>Nama pengguna / email</label><input name="username" maxlength="64" required><label>Password</label><input type="password" name="password" required><label class="remember"><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini</label><button type="submit" style="width:100%">Masuk</button></form><p style="text-align:center"><button type="button" id="toDaftarLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Belum punya akun? Daftar</button></p></div><div id="daftarForm" style="display:none"><h2 style="margin-top:0">Buat Akun</h2><p class="meta" style="text-transform:none;letter-spacing:0">Akun hanya untuk berkomentar dan like/dislike, bukan akun admin.</p><form method="post" action="/akun/daftar"><label>Nama pengguna</label><input name="username" maxlength="20" placeholder="huruf kecil, angka, _ , 3–20 karakter" required><label>Password (minimal 8 karakter)</label><input type="password" name="password" required><button type="submit" style="width:100%">Daftar</button></form><p style="text-align:center"><button type="button" id="toLoginLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Sudah punya akun? Login</button></p></div><script>(function(){var lb=document.getElementById('tabLoginBtn'),db=document.getElementById('tabDaftarBtn'),lf=document.getElementById('loginForm'),df=document.getElementById('daftarForm');function showLogin(){lf.style.display='block';df.style.display='none';lb.style.background='';lb.style.border='';lb.style.color='';db.style.background='transparent';db.style.border='1px solid';db.style.color='inherit'}function showDaftar(){lf.style.display='none';df.style.display='block';db.style.background='';db.style.border='';db.style.color='';lb.style.background='transparent';lb.style.border='1px solid';lb.style.color='inherit'}lb.onclick=showLogin;db.onclick=showDaftar;document.getElementById('toDaftarLink').onclick=showDaftar;document.getElementById('toLoginLink').onclick=showLogin;})();<\/script><noscript><style>#daftarForm{display:block!important}</style></noscript></div>`;
       return html(await renderPage(env, 'Akun', content));
     }
     if (path === '/akun/daftar' && request.method === 'POST') {
@@ -377,7 +384,9 @@ async function handleFetch(request, env) {
       if (!/^[a-z0-9_]{3,20}$/.test(username) || password.length < 8) {
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password tidak valid. Nama: 3–20 karakter (huruf kecil, angka, _). Password: minimal 8 karakter.</p><p><a href="/akun">Kembali</a></p></div>'), 400);
       }
-      // Nama 'admin' dicadangkan untuk deteksi admin di form login biasa:
+      // Nama 'admin' dicadangkan: tidak boleh didaftarkan sebagai akun
+      // komentator, supaya tidak ada yang menyamar jadi admin. Email admin
+      // juga tidak bisa didaftarkan (aturan nama 3-20 karakter menolak @/.).
       // tidak boleh didaftarkan sebagai akun komentator, supaya tidak ada
       // akun komentator yang menyamar jadi admin. Pesan disamakan dengan
       // nama sudah dipakai, supaya tidak bocor mana nama yang dicadangkan.
@@ -402,16 +411,17 @@ async function handleFetch(request, env) {
       const form = await request.formData();
       const username = String(form.get('username') || '').trim().toLowerCase();
       const password = String(form.get('password') || '');
-      // Login terpadu (perintah pemilik 30 Okt 2026): form ini tampak biasa
-      // untuk semua orang, tapi bila nama 'admin' + token admin cocok,
-      // sesi langsung naik jadi super-super-admin dan dialihkan ke
-      // dashboard /kendali, dengan tampilan dan akses penuh admin.
+      // Login terpadu (perintah pemilik 30 Okt 2026, diubah 30 Okt 2026):
+      // form ini tampak biasa untuk semua orang, tapi bila EMAIL admin
+      // + token admin cocok, sesi langsung naik jadi super-super-admin
+      // dan dialihkan ke dashboard /kendali, dengan tampilan dan akses
+      // penuh admin. Nama 'admin' lama TIDAK lagi berlaku.
       // Keamanan TIDAK turun: token admin tetap secret Worker, rate-limit
       // gagal admin 5/IP/15 menit tetap jalan, dan pesan gagal disamakan
       // dengan gagal komentator supaya tidak bocor akun mana yang admin.
       // Jalur admin TIDAK memakai rate-limit akun, supaya login komentator
       // yang sah tidak ikut memblokir login admin dari IP yang sama.
-      if (username === 'admin') {
+      if (username === ADMIN_EMAIL) {
         const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
         const fails = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_login_attempts WHERE ip = ? AND created_at > ?`).bind(ip, since).first();
         if (fails && Number(fails.n) >= 5) {
@@ -511,7 +521,7 @@ async function handleFetch(request, env) {
       }
       if (path === '/kendali/settings') {
         const envTitle = envSiteTitle(env);
-        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText, adsenseClient, adsenseSlot] = await Promise.all([
+        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText, adsenseClient, adsenseSlot, imgbbKey] = await Promise.all([
           getSetting(env, 'theme', 'terang'),
           envTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
           getSetting(env, 'site_avatar', ''),
@@ -520,10 +530,11 @@ async function handleFetch(request, env) {
           getSetting(env, 'ad_text', ''),
           getSetting(env, 'adsense_client', ''),
           getSetting(env, 'adsense_slot', ''),
+          getSetting(env, 'imgbb_api_key', ''),
         ]);
         const siteTitle = envTitle || siteTitleDb;
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
-        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><button type="submit">Simpan Pengaturan</button></form></div>`;
+        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><h4>Upload Gambar via ImgBB</h4><p>Status: ${imgbbKey ? '<b>sudah diset</b>' : 'belum diset'}. Kunci ini hanya dipakai server untuk upload ke ImgBB, tidak pernah tampil di halaman publik. Kosongkan kolom ini bila tidak mau mengubah kunci yang sudah ada.</p><label>ImgBB: kunci API (dari imgbb.com, menu API)</label><input type="password" name="imgbb_api_key" placeholder="kosong = pakai kunci lama"><button type="submit">Simpan Pengaturan</button></form></div>`;
         return html(await renderPage(env, 'Pengaturan', content, { siteTitle, themeId }));
       }
       if (path === '/kendali/sessions') {
@@ -571,6 +582,35 @@ async function handleFetch(request, env) {
       if (String(form.get('csrf') || '') !== await csrfToken(env)) {
         return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid. Muat ulang dashboard lalu coba lagi.</p></div>'), 403);
       }
+      if (path === '/kendali/upload-image') {
+        // Upload gambar via ImgBB (perintah pemilik 30 Okt 2026, "tidak ribet"):
+        // admin pilih file di editor -> Worker kirim file ke ImgBB pakai
+        // kunci dari Pengaturan (server-side, tidak pernah ke browser) ->
+        // kembali JSON {url}. Gambar saja, bukan video. Maks 5 MB.
+        const json = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+        const ip = clientIp(request);
+        if (!(await checkRateLimit(env, 'upload:' + ip, 20, 60 * 60 * 1000))) return json({ ok: false, error: 'Terlalu banyak upload. Coba lagi nanti.' }, 429);
+        const key = await getSetting(env, 'imgbb_api_key', '');
+        if (!key) return json({ ok: false, error: 'Kunci API ImgBB belum diset di Pengaturan.' }, 400);
+        const file = form.get('image');
+        const isFile = file && typeof file === 'object' && typeof file.size === 'number';
+        if (!isFile || !file.size) return json({ ok: false, error: 'Pilih file gambar dulu.' }, 400);
+        if (file.size > 5 * 1024 * 1024) return json({ ok: false, error: 'Gambar maksimal 5 MB.' }, 413);
+        const ftype = String(file.type || '').toLowerCase();
+        const fname = String(file.name || '').toLowerCase();
+        if (!(ftype.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp|bmp)$/.test(fname))) return json({ ok: false, error: 'File harus gambar (JPG/PNG/GIF/WebP).' }, 400);
+        try {
+          const fd = new FormData();
+          fd.append('image', file);
+          const up = await fetch('https://api.imgbb.com/1/upload?key=' + encodeURIComponent(key), { method: 'POST', body: fd });
+          const data = await up.json().catch(() => null);
+          const imgUrl = data && data.success && data.data && (data.data.display_url || data.data.url);
+          if (!imgUrl) return json({ ok: false, error: 'ImgBB menolak upload.' }, 502);
+          return json({ ok: true, url: imgUrl }, 200);
+        } catch (e) {
+          return json({ ok: false, error: 'Gagal menghubungi ImgBB.' }, 502);
+        }
+      }
       if (path === '/kendali/backup') {
         const now = new Date().toISOString();
         try {
@@ -609,6 +649,8 @@ async function handleFetch(request, env) {
         const adsenseClient = /^ca-pub-\d+$/.test(adsenseClientRaw) ? adsenseClientRaw : '';
         const adsenseSlotRaw = String(form.get('adsense_slot') || '').trim();
         const adsenseSlot = /^\d+$/.test(adsenseSlotRaw) ? adsenseSlotRaw : '';
+        const imgbbRaw = String(form.get('imgbb_api_key') || '').trim();
+        const imgbbValid = /^[A-Za-z0-9]{10,64}$/.test(imgbbRaw);
         if (themes[theme]) {
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('site_title', ?)`).bind(siteTitle).run();
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('theme', ?)`).bind(theme).run();
@@ -619,6 +661,9 @@ async function handleFetch(request, env) {
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_text', ?)`).bind(adText).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_client', ?)`).bind(adsenseClient).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_slot', ?)`).bind(adsenseSlot).run();
+        if (imgbbValid) {
+          await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('imgbb_api_key', ?)`).bind(imgbbRaw).run();
+        }
         return redirect('/kendali/settings');
       }
       if (path === '/kendali/posts') {
