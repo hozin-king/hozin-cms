@@ -206,14 +206,14 @@ assert(!t.includes('<script>alert(1)</script>') && t.includes('&lt;script&gt;'),
 
 // 7. Backup ke stopwatch: tombol admin -> salinan di BACKUP_DB + riwayat BERHASIL tampil
 r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status === 303, 'tombol backup redirect');
-r = await call('GET', '/kendali', null, cookie); t = await r.text();
-assert(t.includes('Backup ke Stopwatch') && t.includes('BERHASIL'), 'riwayat backup BERHASIL tampil di dashboard');
+r = await call('GET', '/kendali/backup', null, cookie); t = await r.text();
+assert(t.includes('Backup ke Stopwatch') && t.includes('BERHASIL'), 'riwayat backup BERHASIL tampil di halaman Backup');
 assert(env.BACKUP_DB.backupPosts >= 2, 'backup menyalin post ke stopwatch');
 // Backup tanpa BACKUP_DB -> dicatat GAGAL, bukan crash
 const savedBak = env.BACKUP_DB; delete env.BACKUP_DB;
 r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status === 303, 'backup gagal tetap redirect');
-r = await call('GET', '/kendali', null, cookie); t = await r.text();
-assert(t.includes('GAGAL'), 'riwayat backup GAGAL tampil di dashboard');
+r = await call('GET', '/kendali/backup', null, cookie); t = await r.text();
+assert(t.includes('GAGAL'), 'riwayat backup GAGAL tampil di halaman Backup');
 env.BACKUP_DB = savedBak;
 
 // 8. Sistem token: refresh memutar, pakai ulang mencabut semua, logout-all
@@ -236,8 +236,8 @@ env.DB.attempts = [];
 r = await call('POST', '/akun/login', { username: 'admin', password: 'test-admin-token' });
 cookie = cookieHeader(cookiesOf(r));
 const refreshOnly2 = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
-r = await call('GET', '/kendali', null, cookie); t = await r.text();
-assert(t.includes('Sesi & Perangkat'), 'dashboard menampilkan daftar sesi & perangkat');
+r = await call('GET', '/kendali/sessions', null, cookie); t = await r.text();
+assert(t.includes('Sesi & Perangkat'), 'halaman Sesi menampilkan daftar sesi & perangkat');
 const csrf2 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 r = await call('POST', '/kendali/logout-all', { csrf: csrf2 }, cookie); assert(r.status === 303, 'logout semua perangkat redirect');
 assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'logout semua mencabut semua refresh');
@@ -351,7 +351,7 @@ assert(sampul && sampul.slug, 'post sampul tersimpan dengan slug');
 r = await call('GET', '/', null, cookie); t = await r.text();
 assert(t.includes('class="post-cover"') && t.includes('https://x.test/cover.png'), 'kartu beranda: sampul gambar pertama tampil');
 assert(t.includes('Selengkapnya'), 'kartu beranda: tombol Selengkapnya tampil');
-assert(t.includes('id="fabPost"') && t.includes('/kendali#post-baru'), 'beranda admin: FAB posting tampil ke editor');
+assert(t.includes('id="fabPost"') && t.includes('/kendali/posts/new'), 'beranda admin: FAB posting tampil ke halaman Post Baru');
 assert(t.includes('/kendali/posts/edit?id=' + sampul.id), 'kartu beranda admin: link Edit tampil');
 r = await call('GET', '/'); t = await r.text();
 assert(!t.includes('id="fabPost"') && !t.includes('/kendali/posts/edit'), 'beranda pengunjung: FAB dan Edit tidak tampil');
@@ -394,4 +394,16 @@ assert(t.includes('id="tabLoginBtn"') && t.includes('id="tabDaftarBtn"') && t.in
 assert(t.includes('class="remember"') && t.includes('Ingat saya di perangkat ini'), 'halaman akun: checkbox Ingat saya sebaris dengan label');
 assert(!t.includes('tidak bisa membuat post atau membuka dashboard'), 'halaman akun: teks penjelasan panjang dipersingkat');
 assert(t.includes('max-width:440px'), 'halaman akun: kartu sempit di tengah, tidak selebar penuh');
+// 18. Dashboard pisah halaman (perintah pemilik 30 Okt 2026 12:29)
+// /kendali = ringkasan saja, Post Baru = halaman sendiri, bukan kartu di mega page
+r = await call('GET', '/kendali', null, cookie); t = await r.text();
+assert(t.includes('Dashboard Admin') && t.includes('/kendali/posts/new') && !t.includes('Buat Backup Sekarang') && !t.includes('Simpan Pengaturan'), 'dashboard: ringkasan + navigasi saja, tanpa kartu Backup/Pengaturan');
+r = await call('GET', '/kendali/posts/new', null, cookie); t = await r.text();
+assert(t.includes('Post Baru') && t.includes('id="post-baru"') && t.includes('Terbitkan'), 'halaman Post Baru: editor sendiri, bukan di dashboard');
+r = await call('GET', '/kendali/posts', null, cookie); t = await r.text();
+assert(t.includes('<h2>Post</h2>') && t.includes('/kendali/posts/new'), 'halaman Post: daftar + link Post Baru');
+r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
+assert(t.includes('Simpan Pengaturan') && t.includes('Foto profil situs'), 'halaman Pengaturan: form sendiri');
+r = await call('GET', '/kendali/comments', null, cookie); t = await r.text();
+assert(t.includes('<h2>Komentar</h2>'), 'halaman Komentar: sendiri');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

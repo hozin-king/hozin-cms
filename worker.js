@@ -32,6 +32,12 @@ import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner } 
 import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle } from './store.js';
 import { editorCard } from './editor.js';
 
+
+function adminNav(current) {
+  const items = [['/kendali', 'Dashboard'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup']];
+  return '<nav style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-bottom:16px">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' style="font-weight:800;text-decoration:underline"' : '') + '>' + label + '</a>').join('') + '</nav>';
+}
+
 export default {
   // Fallback anti-1101 (insiden 29 Okt 2026 20:28 WIB): bila D1 tidak bisa
   // diakses — mis. kuota baca harian gratis habis — JANGAN lempar exception
@@ -131,7 +137,7 @@ async function handleFetch(request, env) {
       // di-scroll, muncul lagi 300 ms setelah scroll berhenti (debounce).
       // Diklik, langsung ke editor di dashboard (#post-baru).
       const fab = admin
-        ? `<a href="/kendali#post-baru" class="fab" id="fabPost" aria-label="Buat post">+</a><script>(function(){var f=document.getElementById('fabPost');if(!f)return;var t=null;window.addEventListener('scroll',function(){f.classList.add('fab-hidden');if(t)clearTimeout(t);t=setTimeout(function(){f.classList.remove('fab-hidden')},300)},{passive:true})})();<\/script>`
+        ? `<a href="/kendali/posts/new" class="fab" id="fabPost" aria-label="Buat post">+</a><script>(function(){var f=document.getElementById('fabPost');if(!f)return;var t=null;window.addEventListener('scroll',function(){f.classList.add('fab-hidden');if(t)clearTimeout(t);t=setTimeout(function(){f.classList.remove('fab-hidden')},300)},{passive:true})})();<\/script>`
         : '';
       const nav = (page > 1 ? `<p><a href="/?page=${page - 1}">← Post baru</a></p>` : '') + (hasNext ? `<p><a href="/?page=${page + 1}">Post lama →</a></p>` : '');
       const content = adBanner(adImage, adLink, adText) + (posts.length
@@ -413,55 +419,95 @@ async function handleFetch(request, env) {
       return redirectWithCookies('/kendali', clearAuthCookies());
     }
 
-    // ---- Admin: dashboard (butuh login) ----
-    if (path === '/kendali') {
-      if (request.method === 'GET') {
-        if (!admin) {
-          // Tanpa sesi admin, dashboard tidak menampilkan form admin sama
-          // sekali — pengunjung dialihkan ke form login biasa /akun.
-          return redirect('/akun?pesan=login');
-        }
-        // Percepat semuanya: semua query dashboard yang independen jalan
-        // barengan (Promise.all), bukan satu per satu. Ini penyebab utama
-        // halaman admin terasa loading lama / blank di 30 Okt 2026: HTML
-        // server-rendered baru dikirim setelah SEMUA query selesai, jadi
-        // browser tidak menampilkan apa-apa sampai query terakhir kembali.
-        // Keamanan tidak berubah: /kendali tetap no-store, CSRF tetap wajib.
-        const dashNowIso = new Date().toISOString();
-        const envTitle = envSiteTitle(env);
-        const [posts, comments, themeId, siteTitleDb, pluginRows, users, backupRuns, sessionRows, currentRefresh, csrf, siteAvatar, adImage, adLink, adText] = await Promise.all([
+    // ---- Admin: halaman-halaman terpisah (bukan satu halaman mega) ----
+    // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
+    // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
+    // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup')) {
+      const csrf = await csrfToken(env);
+      const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
+      const nav = adminNav(path);
+      if (path === '/kendali') {
+        const [posts, comments, users, pluginRows] = await Promise.all([
           env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all(),
           env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all(),
+          env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all(),
+          env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all(),
+        ]);
+        const pending = (comments.results || []).filter(c => c.status !== 'approved').length;
+        const activePlugins = (pluginRows.results || []).filter(r => Number(r.enabled) === 1).length;
+        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${nav}<div class="card"><p><b>${(posts.results || []).length} Post</b> · <a href="/kendali/posts">Lihat Post</a> · <a href="/kendali/posts/new">Post Baru</a></p><p><b>${pending} Komentar menunggu</b> · <a href="/kendali/comments">Moderasi Komentar</a></p><p><b>${(users.results || []).length} Akun komentator</b> · <a href="/kendali/users">Lihat Akun</a></p><p><b>${activePlugins} Plugin aktif</b> · <a href="/kendali/plugins">Lihat Plugin</a></p></div><form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>`;
+        return html(await renderPage(env, 'Admin', content));
+      }
+      if (path === '/kendali/posts') {
+        const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all();
+        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · 👁 ${Number(p.views) || 0} · ${esc(p.body_mode || 'text')}) <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a> <form method="post" action="/kendali/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('') || '<p>Belum ada post.</p>';
+        const content = `<h2>Post</h2>${nav}<p><a href="/kendali/posts/new">+ Post Baru</a></p>${postRows}`;
+        return html(await renderPage(env, 'Post', content));
+      }
+      if (path === '/kendali/posts/new') {
+        const postError = url.searchParams.get('error') === 'password' ? '<div class="card"><p>Password post minimal 8 karakter, post tidak dibuat.</p></div>' : '';
+        const content = `<h2>Post Baru</h2>${nav}${postError}` + editorCard(csrfField);
+        return html(await renderPage(env, 'Post Baru', content));
+      }
+      if (path === '/kendali/comments') {
+        const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
+        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/kendali/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/kendali/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('') || '<p>Belum ada komentar.</p>';
+        const content = `<h2>Komentar</h2>${nav}${commentRows}`;
+        return html(await renderPage(env, 'Komentar', content));
+      }
+      if (path === '/kendali/users') {
+        const users = await env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all();
+        const userRows = (users.results || []).map(u => `<div class="card"><b>${esc(u.username)}</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}<form method="post" action="/kendali/users/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(u.id)}"><button type="submit">Hapus Akun</button></form></div>`).join('') || '<p>Belum ada akun komentator.</p>';
+        const content = `<h2>Akun Komentator</h2>${nav}${userRows}`;
+        return html(await renderPage(env, 'Akun Komentator', content));
+      }
+      if (path === '/kendali/plugins') {
+        const pluginRows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
+        const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
+        const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/kendali/plugins/toggle">${csrfField}<input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
+        const content = `<h2>Plugin</h2>${nav}${pluginForms}`;
+        return html(await renderPage(env, 'Plugin', content));
+      }
+      if (path === '/kendali/settings') {
+        const envTitle = envSiteTitle(env);
+        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText] = await Promise.all([
           getSetting(env, 'theme', 'terang'),
           envTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
-          env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all(),
-          env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all(),
-          env.DB.prepare(`SELECT * FROM cms_backup_runs ORDER BY created_at DESC LIMIT 10`).all(),
-          env.DB.prepare(`SELECT id, device, ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens WHERE revoked = 0 AND expires_at > ? ORDER BY last_used_at DESC`).bind(dashNowIso).all(),
-          getRefreshRow(request, env),
-          csrfToken(env),
           getSetting(env, 'site_avatar', ''),
           getSetting(env, 'ad_image', ''),
           getSetting(env, 'ad_link', ''),
           getSetting(env, 'ad_text', ''),
         ]);
         const siteTitle = envTitle || siteTitleDb;
-        const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
-        const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
-        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · 👁 ${Number(p.views) || 0} · ${esc(p.body_mode || 'text')}) <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a> <form method="post" action="/kendali/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('');
-        const userRows = (users.results || []).map(u => `<div class="card"><b>${esc(u.username)}</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}<form method="post" action="/kendali/users/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(u.id)}"><button type="submit">Hapus Akun</button></form></div>`).join('') || '<p>Belum ada akun komentator.</p>';
-        const postError = new URL(request.url).searchParams.get('error') === 'password' ? '<div class="card"><p>Password post minimal 8 karakter, post tidak dibuat.</p></div>' : '';
-        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]<p>${esc(c.text)}</p><form method="post" action="/kendali/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/kendali/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form></div>`).join('');
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
-        const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/kendali/plugins/toggle">${csrfField}<input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
-        const backupRows = (backupRuns.results || []).map(r => `<div class="card"><b>${esc(r.status)}</b> · ${esc(r.created_at)} · ${r.posts} post, ${r.comments} komentar${r.error ? `<p>Error: ${esc(r.error)}</p>` : ''}</div>`).join('') || '<p>Belum ada backup.</p>';
-        const backupCard = `<div class="card"><h3>Backup ke Stopwatch</h3><p>Database stopwatch khusus dipakai sebagai tempat backup CMS. Salinan tidak pernah ditulis dari jalur lain — hanya tombol ini yang menulis ke sana.</p><form method="post" action="/kendali/backup">${csrfField}<button type="submit">Buat Backup Sekarang</button></form><h4>Riwayat Backup</h4>${backupRows}</div>`;
+        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><button type="submit">Simpan Pengaturan</button></form></div>`;
+        return html(await renderPage(env, 'Pengaturan', content, { siteTitle, themeId }));
+      }
+      if (path === '/kendali/sessions') {
+        const dashNowIso = new Date().toISOString();
+        const [sessionRows, currentRefresh] = await Promise.all([
+          env.DB.prepare(`SELECT id, device, ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens WHERE revoked = 0 AND expires_at > ? ORDER BY last_used_at DESC`).bind(dashNowIso).all(),
+          getRefreshRow(request, env),
+        ]);
         const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/kendali/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
-        const sessionsCard = `<div class="card"><h3>Sesi & Perangkat</h3><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/kendali/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
-        const editorCardHtml = editorCard(csrfField);
-        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${postError}<form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>${backupCard}${sessionsCard}<div class="card"><h3>Pengaturan</h3>${envSiteTitle(env) ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><button type="submit">Simpan Pengaturan</button></form></div>${editorCardHtml}<h3>Post</h3>${postRows}<h3>Komentar</h3>${commentRows}<h3>Akun Komentator</h3>${userRows}<h3>Plugin</h3>${pluginForms}`;
-        // Pakai tema + judul yang sudah diambil di atas, jangan query D1 lagi di renderPage.
-        return html(await renderPage(env, 'Admin', content, { siteTitle, themeId }));
+        const content = `<h2>Sesi & Perangkat</h2>${nav}<div class="card"><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/kendali/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
+        return html(await renderPage(env, 'Sesi & Perangkat', content));
+      }
+      if (path === '/kendali/backup') {
+        const backupRuns = await env.DB.prepare(`SELECT * FROM cms_backup_runs ORDER BY created_at DESC LIMIT 10`).all();
+        const backupRows = (backupRuns.results || []).map(r => `<div class="card"><b>${esc(r.status)}</b> · ${esc(r.created_at)} · ${r.posts} post, ${r.comments} komentar${r.error ? `<p>Error: ${esc(r.error)}</p>` : ''}</div>`).join('') || '<p>Belum ada backup.</p>';
+        const content = `<h2>Backup</h2>${nav}<div class="card"><h3>Backup ke Stopwatch</h3><p>Database stopwatch khusus dipakai sebagai tempat backup CMS. Salinan tidak pernah ditulis dari jalur lain — hanya tombol ini yang menulis ke sana.</p><form method="post" action="/kendali/backup">${csrfField}<button type="submit">Buat Backup Sekarang</button></form><h4>Riwayat Backup</h4>${backupRows}</div>`;
+        return html(await renderPage(env, 'Backup', content));
+      }
+    }
+    if (path === '/kendali' || path.startsWith('/kendali/')) {
+      if (request.method === 'GET' && !admin) {
+        return redirect('/akun?pesan=login');
+      }
+      // Halaman edit ada di bawah blok ini, jangan dialihkan duluan.
+      if (request.method === 'GET' && admin && path !== '/kendali/posts/edit') {
+        return redirect('/kendali');
       }
     }
 
@@ -469,10 +515,11 @@ async function handleFetch(request, env) {
     if (admin && request.method === 'GET' && path === '/kendali/posts/edit') {
       const id = url.searchParams.get('id') || '';
       const post = id ? await env.DB.prepare(`SELECT * FROM cms_posts WHERE id = ?`).bind(id).first() : null;
-      if (!post) return redirect('/kendali');
+      if (!post) return redirect('/kendali/posts');
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
-      const content = `<p><a href="/kendali">← Kembali ke Dashboard</a> · <a href="/p/${esc(post.slug)}">Lihat post</a></p>` + editorCard(csrfField, { post, action: '/kendali/posts/update' });
+      const editError = url.searchParams.get('error') === 'password' ? '<div class="card"><p>Password post minimal 8 karakter, perubahan tidak disimpan.</p></div>' : '';
+      const content = editError + `<p><a href="/kendali/posts">← Kembali ke Post</a> · <a href="/kendali">Dashboard</a> · <a href="/p/${esc(post.slug)}">Lihat post</a></p>` + editorCard(csrfField, { post, action: '/kendali/posts/update' });
       return html(await renderPage(env, 'Edit Post', content));
     }
 
@@ -490,7 +537,7 @@ async function handleFetch(request, env) {
         } catch (e) {
           await env.DB.prepare(`INSERT INTO cms_backup_runs (created_at, status, posts, comments, error) VALUES (?, 'GAGAL', 0, 0, ?)`).bind(now, String(e && e.message ? e.message : e).slice(0, 300)).run();
         }
-        return redirect('/kendali');
+        return redirect('/kendali/backup');
       }
       if (path === '/kendali/logout-all') {
         await revokeAllRefresh(env);
@@ -501,7 +548,7 @@ async function handleFetch(request, env) {
         const current = await getRefreshRow(request, env);
         await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(id).run();
         if (current && current.id === id) return redirectWithCookies('/kendali', clearAuthCookies());
-        return redirect('/kendali');
+        return redirect('/kendali/sessions');
       }
       if (path === '/kendali/settings') {
         const siteTitle = String(form.get('site_title') || '').trim().slice(0, 100) || 'WorkerCMS';
@@ -524,7 +571,7 @@ async function handleFetch(request, env) {
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_image', ?)`).bind(adImage).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_link', ?)`).bind(adLink).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_text', ?)`).bind(adText).run();
-        return redirect('/kendali');
+        return redirect('/kendali/settings');
       }
       if (path === '/kendali/posts') {
         const title = String(form.get('title') || '').trim().slice(0, 200);
@@ -544,7 +591,7 @@ async function handleFetch(request, env) {
         let pwSalt = '';
         if (visibility === 'password') {
           const pw = String(form.get('post_password') || '');
-          if (pw.length < 8) return redirect('/kendali?error=password');
+          if (pw.length < 8) return redirect('/kendali/posts/new?error=password');
           pwSalt = randomHex(16);
           pwHash = await hashPassword(pw, pwSalt);
         }
@@ -557,12 +604,12 @@ async function handleFetch(request, env) {
           if (clash) slug = slug + '-' + Date.now().toString(36).slice(-4);
           await env.DB.prepare(`INSERT INTO cms_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views) VALUES (?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?, 0)`).bind(id, slug, title, body, category, now, now, bodyMode, visibility, publishAt, pwHash, pwSalt).run();
         }
-        return redirect('/kendali');
+        return redirect('/kendali/posts');
       }
       if (path === '/kendali/posts/update') {
         const postId = String(form.get('id') || '');
         const old = postId ? await env.DB.prepare(`SELECT * FROM cms_posts WHERE id = ?`).bind(postId).first() : null;
-        if (!old) return redirect('/kendali');
+        if (!old) return redirect('/kendali/posts');
         const title = String(form.get('title') || '').trim().slice(0, 200);
         let body = String(form.get('body') || '').trim();
         const category = String(form.get('category') || 'Umum').trim().slice(0, 80) || 'Umum';
@@ -584,7 +631,7 @@ async function handleFetch(request, env) {
         if (visibility === 'password') {
           const pw = String(form.get('post_password') || '');
           if (pw) {
-            if (pw.length < 8) return redirect('/kendali?error=password');
+            if (pw.length < 8) return redirect('/kendali/posts/edit?id=' + postId + '&error=password');
             pwSalt = randomHex(16);
             pwHash = await hashPassword(pw, pwSalt);
           }
@@ -597,11 +644,11 @@ async function handleFetch(request, env) {
         if (title && body) {
           await env.DB.prepare(`UPDATE cms_posts SET title = ?, body = ?, category = ?, updated_at = ?, body_mode = ?, visibility = ?, publish_at = ?, post_password_hash = ?, post_password_salt = ? WHERE id = ?`).bind(title, body, category, now, bodyMode, visibility, publishAt, pwHash, pwSalt, postId).run();
         }
-        return redirect('/kendali');
+        return redirect('/kendali/posts');
       }
       if (path === '/kendali/users/delete') {
         await env.DB.prepare(`DELETE FROM cms_users WHERE id = ?`).bind(String(form.get('id') || '')).run();
-        return redirect('/kendali');
+        return redirect('/kendali/users');
       }
       if (path === '/kendali/posts/delete') {
         const postId = String(form.get('id') || '');
@@ -611,24 +658,24 @@ async function handleFetch(request, env) {
         }
         await env.DB.prepare(`DELETE FROM cms_comments WHERE post_id = ?`).bind(postId).run();
         await env.DB.prepare(`DELETE FROM cms_posts WHERE id = ?`).bind(postId).run();
-        return redirect('/kendali');
+        return redirect('/kendali/posts');
       }
       if (path === '/kendali/comments/approve') {
         await env.DB.prepare(`UPDATE cms_comments SET status = 'approved' WHERE id = ?`).bind(Number(form.get('id'))).run();
-        return redirect('/kendali');
+        return redirect('/kendali/comments');
       }
       if (path === '/kendali/comments/delete') {
         const cid = Number(form.get('id'));
         await env.DB.prepare(`DELETE FROM cms_comment_votes WHERE comment_id = ?`).bind(cid).run();
         await env.DB.prepare(`DELETE FROM cms_comments WHERE id = ?`).bind(cid).run();
-        return redirect('/kendali');
+        return redirect('/kendali/comments');
       }
       if (path === '/kendali/plugins/toggle') {
         const id = String(form.get('id') || '');
         if (pluginDefs.some(p => p.id === id)) {
           await env.DB.prepare(`UPDATE cms_plugins SET enabled = ? WHERE id = ?`).bind(Number(form.get('enabled')) ? 1 : 0, id).run();
         }
-        return redirect('/kendali');
+        return redirect('/kendali/plugins');
       }
     }
     // Jalur /admin lama sudah pensiun: siapa pun yang menebak /admin atau
