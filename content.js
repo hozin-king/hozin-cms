@@ -37,7 +37,7 @@ export function adBanner(adImage, adLink, adText) {
 // (Date.now() % 4000), jadi semua penonton yang jam HP-nya benar (NTP)
 // melihat kedip pada detik yang sama, bukan kedip acak per halaman.
 export function viewEye(views) {
-  return '<span class="view-eye" aria-label="Dilihat"><svg viewBox="0 0 32 24" fill="none" aria-hidden="true"><g class="eye-blink"><path d="M2 12 Q16 3 30 12 Q16 21 2 12 Z" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/><circle cx="16" cy="12" r="5.5" fill="#3b82f6"/><circle cx="16" cy="12" r="2.8" fill="#0b1220"/><circle cx="17.5" cy="10.5" r="1" fill="#ffffff"/></g></svg></span> ' + views;
+  return '<span class="view-eye" aria-label="Dilihat"><svg viewBox="0 0 32 28" fill="none" aria-hidden="true"><g class="eye-blink"><path d="M2 14 Q16 2 30 14 Q16 26 2 14 Z" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/><circle cx="16" cy="14" r="7" fill="#3b82f6"/><circle cx="16" cy="14" r="3.5" fill="#0b1220"/><circle cx="18" cy="11.5" r="1.3" fill="#ffffff"/></g></svg></span> ' + views;
 }
 
 export function postCard(post, plugins, isAdmin = false) {

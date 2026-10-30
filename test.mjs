@@ -410,5 +410,6 @@ assert(t.includes('<h2>Komentar</h2>'), 'halaman Komentar: sendiri');
 // Bukan emoji; SVG + keyframes kedip 4 detik + footer script sinkron fase
 r = await call('GET', '/'); t = await r.text();
 assert(t.includes('class="view-eye"') && t.includes('eyeBlink') && t.includes('Date.now()%4000'), 'mata: SVG animasi kedip sinkron jam dinding, bukan emoji');
+assert(t.includes('viewBox="0 0 32 28"') && t.includes('width:22px'), 'mata: bentuk bulat terbuka, bukan sipit, dan ukuran lebih besar');
 assert(!t.includes('👁'), 'mata: tidak ada emoji mata di halaman mana pun');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
