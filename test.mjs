@@ -466,4 +466,14 @@ assert(t.includes('sudah diset') && !t.includes('testimgbbkey123456'), 'pengatur
 r = await call('POST', '/kendali/upload-image', { csrf }, cookie); t = await r.text(); assert(r.status === 400 && t.includes('Pilih file gambar dulu'), 'upload imgbb: kunci sudah ada, tanpa file ditolak 400');
 r = await call('GET', '/kendali/posts/new', null, cookie); t = await r.text();
 assert(t.includes('Upload Gambar (ImgBB)') && t.includes('imgbbFile'), 'editor: tombol upload ImgBB tampil di post baru');
+// 24. Super Panel untuk semuanya (perintah pemilik 30 Okt 2026 13:11, "untuk semuanya")
+r = await call('GET', '/kendali/super', null, userCookie); assert(r.status === 303, 'super panel: non-admin dialihkan');
+r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('Super Panel') && t.includes('Komentar & Keamanan') && t.includes('Event PC Builder'), 'super panel: admin melihat situs + komentar + PC Builder');
+r = await call('GET', '/api/pcbuilder-events'); t = await r.text();
+assert(r.status === 200 && !t.toLowerCase().includes('discount'), 'pcbuilder events: nonaktif tidak mengandung kata discount (game tidak salah diskon)');
+r = await call('POST', '/kendali/super/pcbuilder', { csrf, pcbuilder_active: '1', pcbuilder_message: 'Event akhir pekan' }, cookie); assert(r.status === 303 && (r.headers.get('location') || '') === '/kendali/super', 'super panel: simpan event PC Builder redirect ke super');
+r = await call('GET', '/api/pcbuilder-events'); t = await r.text();
+assert(t.includes('discount') && t.includes('10'), 'pcbuilder events: aktif mengandung discount 10');
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', theme: 'terang', return_to: '/kendali/super' }, cookie); assert((r.headers.get('location') || '') === '/kendali/super', 'pengaturan: return_to ke super panel jalan');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

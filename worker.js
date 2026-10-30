@@ -36,7 +36,7 @@ const ADSENSE_CSP = "default-src 'self'; img-src 'self' https: data:; media-src 
 
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup']];
   return '<nav style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-bottom:16px">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' style="font-weight:800;text-decoration:underline"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -123,6 +123,20 @@ async function handleFetch(request, env) {
     nowIso = new Date().toISOString();
     const admin = await isAdmin(request, env);
     const commenter = admin ? null : await getCommenter(request, env);
+
+    // ---- Publik: event super admin PC Builder (game v1.0.3) ----
+    // Game hanya cek apakah respons mengandung kata "discount" (case-insensitive).
+    // Jadi saat event NONAKTIF, respons sengaja TIDAK mengandung kata itu sama sekali,
+    // supaya game tidak salah memberi diskon. Saat AKTIF, respons mengandung
+    // "discount":10 dan game memberi diskon 10%. Pesan kustom belum ditampilkan
+    // game v1.0.3 (game hanya tampil teks baku) — pesan di sini hanya catatan admin,
+    // tampilkan pesan kustom di game butuh update APK, bukan panel ini.
+    if (request.method === 'GET' && path === '/api/pcbuilder-events') {
+      const active = await getSetting(env, 'pcbuilder_event_active', '0');
+      const msg = await getSetting(env, 'pcbuilder_event_text', '');
+      const body = active === '1' ? JSON.stringify({ discount: 10, message: msg }) : JSON.stringify({ active: false });
+      return new Response(body, { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+    }
 
     // ---- Publik: beranda (hanya post publik yang sudah terbit) ----
     if (request.method === 'GET' && path === '/') {
@@ -473,7 +487,7 @@ async function handleFetch(request, env) {
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
@@ -518,6 +532,28 @@ async function handleFetch(request, env) {
         const pluginForms = pluginDefs.map(p => `<div class="card"><b>${esc(p.name)}</b> — ${esc(p.description)}<form method="post" action="/kendali/plugins/toggle">${csrfField}<input type="hidden" name="id" value="${p.id}"><input type="hidden" name="enabled" value="${pMap.get(p.id) === 0 ? '1' : '0'}"><button type="submit">${pMap.get(p.id) === 0 ? 'Aktifkan' : 'Nonaktifkan'}</button></form></div>`).join('');
         const content = `<h2>Plugin</h2>${nav}${pluginForms}`;
         return html(await renderPage(env, 'Plugin', content));
+      }
+      if (path === '/kendali/super') {
+        const [siteTitleS, themeS, imgbbS, adsenseS, usersN, postsN, pluginsS, pcbActive, pcbMsg] = await Promise.all([
+          getSetting(env, 'site_title', 'WorkerCMS'),
+          getSetting(env, 'theme', 'terang'),
+          getSetting(env, 'imgbb_api_key', ''),
+          getSetting(env, 'adsense_client', ''),
+          env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all(),
+          env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all(),
+          getEnabledPlugins(env),
+          getSetting(env, 'pcbuilder_event_active', '0'),
+          getSetting(env, 'pcbuilder_event_text', ''),
+        ]);
+        // Hitung pending dari daftar komentar (lebih andal di semua DB daripada COUNT mock)
+        const allCm = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
+        const pendingCount = (allCm.results || []).filter(c => c.status === 'pending').length;
+        const pluginList = pluginDefs.map(pd => {
+          const on = pluginsS.some(pp => pp.id === pd.id);
+          return `<p>${esc(pd.name)}: <b>${on ? 'Aktif' : 'Nonaktif'}</b> <form method="post" action="/kendali/plugins/toggle" style="display:inline">${csrfField}<input type="hidden" name="id" value="${pd.id}"><input type="hidden" name="enabled" value="${on ? '0' : '1'}"><input type="hidden" name="return_to" value="/kendali/super"><button type="submit">${on ? 'Nonaktifkan' : 'Aktifkan'}</button></form></p>`;
+        }).join('');
+        const content = `<h2>Super Panel</h2>${nav}<div class="card"><h3>Situs</h3><p>Judul: <b>${esc(envSiteTitle(env) || siteTitleS)}</b> · Tema: ${esc(themeS)} · ImgBB: ${imgbbS ? 'sudah diset' : 'belum diset'} · AdSense: ${adsenseS ? 'sudah diset' : 'belum diset'}</p><form method="post" action="/kendali/settings">${csrfField}<input type="hidden" name="return_to" value="/kendali/super"><label>Judul situs</label><input name="site_title" value="${esc(envSiteTitle(env) || siteTitleS)}"><label>Tema</label><select name="theme">${Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeS ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select><button type="submit">Simpan Judul & Tema</button></form><p><a href="/kendali/settings">Pengaturan lengkap (foto profil, iklan, AdSense, kunci ImgBB)</a></p></div><div class="card"><h3>Komentar & Keamanan</h3><p>${pendingCount} komentar menunggu · ${(usersN.results || []).length} akun komentator · ${(postsN.results || []).length} post · <a href="/kendali/comments">Moderasi Komentar</a> · <a href="/kendali/users">Akun</a></p>${pluginList}<p><a href="/kendali/plugins">Semua plugin</a> · <a href="/kendali/backup">Backup</a> · <a href="/kendali/sessions">Sesi</a></p></div><div class="card"><h3>Event PC Builder (game)</h3><p>Status: <b>${pcbActive === '1' ? 'Aktif — game memberi diskon 10%' : 'Nonaktif — game tidak memberi diskon'}</b></p><p>Game v1.0.3 hanya membaca on/off diskon dari endpoint ini; pesan kustom di bawah hanya catatan admin, belum tampil di game.</p><form method="post" action="/kendali/super/pcbuilder">${csrfField}<label>Event aktif?</label><select name="pcbuilder_active"><option value="1" ${pcbActive === '1' ? 'selected' : ''}>Aktif (diskon 10%)</option><option value="0" ${pcbActive !== '1' ? 'selected' : ''}>Nonaktif</option></select><label>Pesan event (catatan admin, maks 200 karakter)</label><input name="pcbuilder_message" value="${esc(pcbMsg)}" placeholder="mis. Event akhir pekan"><button type="submit">Simpan Event PC Builder</button></form><p>Endpoint game: <code>/api/pcbuilder-events</code></p></div>`;
+        return html(await renderPage(env, 'Super Panel', content));
       }
       if (path === '/kendali/settings') {
         const envTitle = envSiteTitle(env);
@@ -611,6 +647,13 @@ async function handleFetch(request, env) {
           return json({ ok: false, error: 'Gagal menghubungi ImgBB.' }, 502);
         }
       }
+      if (path === '/kendali/super/pcbuilder') {
+        const active = String(form.get('pcbuilder_active') || '0') === '1' ? '1' : '0';
+        const msg = String(form.get('pcbuilder_message') || '').trim().slice(0, 200);
+        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('pcbuilder_event_active', ?)`).bind(active).run();
+        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('pcbuilder_event_text', ?)`).bind(msg).run();
+        return redirect('/kendali/super');
+      }
       if (path === '/kendali/backup') {
         const now = new Date().toISOString();
         try {
@@ -664,7 +707,8 @@ async function handleFetch(request, env) {
         if (imgbbValid) {
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('imgbb_api_key', ?)`).bind(imgbbRaw).run();
         }
-        return redirect('/kendali/settings');
+        const retS = String(form.get('return_to') || '');
+        return redirect(retS.startsWith('/kendali/') ? retS : '/kendali/settings');
       }
       if (path === '/kendali/posts') {
         const title = String(form.get('title') || '').trim().slice(0, 200);
@@ -768,7 +812,8 @@ async function handleFetch(request, env) {
         if (pluginDefs.some(p => p.id === id)) {
           await env.DB.prepare(`UPDATE cms_plugins SET enabled = ? WHERE id = ?`).bind(Number(form.get('enabled')) ? 1 : 0, id).run();
         }
-        return redirect('/kendali/plugins');
+        const retP = String(form.get('return_to') || '');
+        return redirect(retP.startsWith('/kendali/') ? retP : '/kendali/plugins');
       }
     }
     // Jalur /admin lama sudah pensiun: siapa pun yang menebak /admin atau
