@@ -177,31 +177,31 @@ r = await call('GET', '/'); t = await r.text(); assert(t.includes('Post Uji'), '
 
 // 4. Komentar WAJIB akun: tanpa akun ditolak ke /akun, dengan akun -> pending
 // (tidak tampil), admin setujui -> tampil
-r = await call('POST', '/p/post-uji/comment', { text: 'Komentar anonim' }); assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'komentar tanpa akun dialihkan ke /akun');
+r = await call('POST', '/post/post-uji/comment', { text: 'Komentar anonim' }); assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'komentar tanpa akun dialihkan ke /akun');
 assert(!env.DB.comments.some(c => c.text === 'Komentar anonim'), 'komentar anonim tidak tersimpan');
 r = await call('POST', '/akun/daftar', { username: 'budi', password: 'password123' }); assert(r.status === 303, 'daftar akun komentator redirect');
 let userCookie = cookieHeader(cookiesOf(r));
 assert(userCookie.includes('cms_user='), 'daftar memberi sesi komentator');
-r = await call('GET', '/p/post-uji', null, userCookie); t = await r.text();
+r = await call('GET', '/post/post-uji', null, userCookie); t = await r.text();
 const userCsrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 assert(userCsrf.length > 10, 'halaman post memberi CSRF komentator');
-r = await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: 'Komentar uji' }, userCookie); assert(r.status === 303, 'kirim komentar redirect');
-r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Komentar uji'), 'komentar pending belum tampil');
+r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Komentar uji' }, userCookie); assert(r.status === 303, 'kirim komentar redirect');
+r = await call('GET', '/post/post-uji'); t = await r.text(); assert(!t.includes('Komentar uji'), 'komentar pending belum tampil');
 const commentId = env.DB.comments[0].id;
 r = await call('POST', '/kendali/comments/approve', { csrf, id: String(commentId) }, cookie); assert(r.status === 303, 'admin setujui komentar');
-r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('Komentar uji'), 'komentar disetujui tampil');
+r = await call('GET', '/post/post-uji'); t = await r.text(); assert(t.includes('Komentar uji'), 'komentar disetujui tampil');
 
 // 5. Ganti tema ke gelap + nonaktifkan plugin share, cek halaman berubah
 r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', theme: 'gelap' }, cookie);
 r = await call('GET', '/'); t = await r.text(); assert(t.includes('#05070d'), 'tema gelap terpakai (identitas situs lama, bukan slate generik)');
 r = await call('POST', '/kendali/plugins/toggle', { csrf, id: 'share', enabled: '0' }, cookie);
-r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Bagikan:'), 'plugin share nonaktif hilang dari post');
+r = await call('GET', '/post/post-uji'); t = await r.text(); assert(!t.includes('Bagikan:'), 'plugin share nonaktif hilang dari post');
 
 // 6. XSS: komentar berisi tag script harus di-escape, bukan dieksekusi
-await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: '<script>alert(1)</script>' }, userCookie);
+await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: '<script>alert(1)</script>' }, userCookie);
 const cid2 = env.DB.comments[env.DB.comments.length - 1].id;
 await call('POST', '/kendali/comments/approve', { csrf, id: String(cid2) }, cookie);
-r = await call('GET', '/p/post-uji'); t = await r.text();
+r = await call('GET', '/post/post-uji'); t = await r.text();
 assert(!t.includes('<script>alert(1)</script>') && t.includes('&lt;script&gt;'), 'komentar jahat di-escape');
 
 // 7. Backup ke stopwatch: tombol admin -> salinan di BACKUP_DB + riwayat BERHASIL tampil
@@ -268,7 +268,7 @@ r = await callDown('GET', '/kendali'); t = await r.text();
 // Dashboard tanpa sesi tidak butuh DB (token akses stateless), jadi saat
 // DB mati pun ia tetap dialihkan ke form biasa /akun, bukan 503.
 assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'failsafe kendali tanpa sesi: dialihkan ke /akun, bukan halaman admin');
-r = await callDown('GET', '/p/post-uji'); t = await r.text();
+r = await callDown('GET', '/post/post-uji'); t = await r.text();
 assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1'), 'failsafe halaman lain: halaman pemeliharaan Inggris, tanpa detail teknis');
 
 // 10. Tema v2 ala WordPress: 4 tema, responsif lintas platform
@@ -281,58 +281,58 @@ assert(terangHtml.includes('width=device-width') && terangHtml.includes('@media 
 
 // 11. Editor post: HTML disanitasi, teks di-escape, header keamanan, honeypot, rate-limit komentar
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post HTML', category: 'Tekno', body: '<script>alert(1)</script><p>Halo <b>Dunia</b></p><a href="javascript:alert(1)">x</a><img src="https://x.test/a.png" onerror="alert(1)"><video controls src="https://x.test/v.mp4"></video>', body_mode: 'html' }, cookie);
-r = await call('GET', '/p/post-html'); t = await r.text();
+r = await call('GET', '/post/post-html'); t = await r.text();
 assert(t.includes('<p>Halo <b>Dunia</b></p>') && t.includes('<video') && !t.includes('<script>alert(1)') && !t.includes('javascript:') && !t.includes('onerror'), 'mode HTML: tag aman lolos, script/javascript/onerror dibuang');
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post Teks', category: 'Tekno', body: 'Ada <b>tebal</b> palsu.' }, cookie);
-r = await call('GET', '/p/post-teks'); t = await r.text();
+r = await call('GET', '/post/post-teks'); t = await r.text();
 assert(t.includes('&lt;b&gt;') && !t.includes('Ada <b>tebal</b>'), 'mode teks: HTML di-escape');
 r = await call('GET', '/'); assert((r.headers.get('content-security-policy') || '').includes("object-src 'none'") && (r.headers.get('permissions-policy') || '').includes('camera=()'), 'header keamanan: CSP object-src none + permissions-policy');
 env.DB.rateLimits = new Map();
-for (let i = 0; i < 5; i++) await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: 'Spam ' + i }, userCookie);
-r = await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: 'Spam 5' }, userCookie); assert(r.status === 429, 'komentar ke-6 dalam 10 menit dibatasi 429');
+for (let i = 0; i < 5; i++) await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Spam ' + i }, userCookie);
+r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Spam 5' }, userCookie); assert(r.status === 429, 'komentar ke-6 dalam 10 menit dibatasi 429');
 env.DB.rateLimits = new Map();
 const beforeHoney = env.DB.comments.length;
-await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: 'Bot', website: 'http://spam.test' }, userCookie);
+await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Bot', website: 'http://spam.test' }, userCookie);
 assert(env.DB.comments.length === beforeHoney, 'honeypot: komentar bot tidak tersimpan');
 
 // 12. Visibilitas: terjadwal / private / link saja / password (isi tidak dimuat sebelum kunci dibuka) + view mata
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post Jadwal', category: 'Tekno', body: 'Belum terbit.', publish_at_iso: '2099-01-01T00:00:00.000Z' }, cookie);
 r = await call('GET', '/'); t = await r.text(); assert(!t.includes('Post Jadwal'), 'terjadwal: tidak di beranda sebelum waktunya');
-r = await call('GET', '/p/post-jadwal'); assert(r.status === 404, 'terjadwal: pengunjung dapat 404');
-r = await call('GET', '/p/post-jadwal', null, cookie); t = await r.text(); assert(t.includes('Belum terbit.') && t.includes('Terjadwal'), 'terjadwal: admin bisa pratinjau');
+r = await call('GET', '/post/post-jadwal'); assert(r.status === 404, 'terjadwal: pengunjung dapat 404');
+r = await call('GET', '/post/post-jadwal', null, cookie); t = await r.text(); assert(t.includes('Belum terbit.') && t.includes('Terjadwal'), 'terjadwal: admin bisa pratinjau');
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post Private', category: 'Tekno', body: 'Rahasia admin.', visibility: 'private' }, cookie);
-r = await call('GET', '/p/post-private'); assert(r.status === 404, 'private: pengunjung dapat 404');
-r = await call('GET', '/p/post-private', null, cookie); t = await r.text(); assert(t.includes('Rahasia admin.'), 'private: admin bisa buka');
+r = await call('GET', '/post/post-private'); assert(r.status === 404, 'private: pengunjung dapat 404');
+r = await call('GET', '/post/post-private', null, cookie); t = await r.text(); assert(t.includes('Rahasia admin.'), 'private: admin bisa buka');
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post Link', category: 'Tekno', body: 'Hanya lewat link.', visibility: 'unlisted' }, cookie);
 r = await call('GET', '/'); t = await r.text(); assert(!t.includes('Post Link'), 'link saja: tidak di beranda');
-r = await call('GET', '/p/post-link'); t = await r.text(); assert(t.includes('Hanya lewat link.'), 'link saja: bisa dibuka lewat link langsung');
+r = await call('GET', '/post/post-link'); t = await r.text(); assert(t.includes('Hanya lewat link.'), 'link saja: bisa dibuka lewat link langsung');
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post Kunci', category: 'Tekno', body: 'Isi sangat rahasia 12345.', visibility: 'password', post_password: 'rahasia123' }, cookie);
-r = await call('GET', '/p/post-kunci'); t = await r.text();
+r = await call('GET', '/post/post-kunci'); t = await r.text();
 assert(t.includes('Post Terkunci') && !t.includes('Isi sangat rahasia 12345') && !t.includes('Post Kunci'), 'password: sebelum kunci dibuka, judul + isi TIDAK dimuat sama sekali');
-r = await call('POST', '/p/post-kunci/unlock', { password: 'salah1234' }); assert(r.status === 403, 'password salah ditolak');
-r = await call('POST', '/p/post-kunci/unlock', { password: 'rahasia123' }); assert(r.status === 303, 'password benar redirect');
+r = await call('POST', '/post/post-kunci/unlock', { password: 'salah1234' }); assert(r.status === 403, 'password salah ditolak');
+r = await call('POST', '/post/post-kunci/unlock', { password: 'rahasia123' }); assert(r.status === 303, 'password benar redirect');
 let unlockCookie = cookieHeader(cookiesOf(r));
-r = await call('GET', '/p/post-kunci', null, unlockCookie); t = await r.text(); assert(t.includes('Isi sangat rahasia 12345'), 'password benar: isi baru dimuat setelah kunci dibuka');
+r = await call('GET', '/post/post-kunci', null, unlockCookie); t = await r.text(); assert(t.includes('Isi sangat rahasia 12345'), 'password benar: isi baru dimuat setelah kunci dibuka');
 // View: hanya logo mata + angka, sekali per perangkat per hari
-r = await call('GET', '/p/selamat-datang'); t = await r.text();
+r = await call('GET', '/post/selamat-datang'); t = await r.text();
 assert(t.includes('class="view-eye"') && t.includes('> 1') && !t.includes('👁'), 'view: ikon mata SVG + angka tampil, tanpa emoji dan tanpa kata dilihat');
 const viewCookie = cookieHeader(cookiesOf(r));
-r = await call('GET', '/p/selamat-datang', null, viewCookie); t = await r.text();
+r = await call('GET', '/post/selamat-datang', null, viewCookie); t = await r.text();
 assert(t.includes('class="view-eye"') && t.includes('> 1'), 'view: kunjungan ulang perangkat sama tidak menambah angka');
 
 // 13. Komentar: balasan + like/dislike (bisa batal / ganti)
 env.DB.rateLimits = new Map();
-r = await call('POST', '/p/post-uji/comment', { csrf: userCsrf, text: 'Balasan untuk Budi', parent_id: String(commentId) }, userCookie); assert(r.status === 303, 'balasan komentar redirect');
-r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('Balasan untuk Budi'), 'balasan pending belum tampil');
+r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Balasan untuk Budi', parent_id: String(commentId) }, userCookie); assert(r.status === 303, 'balasan komentar redirect');
+r = await call('GET', '/post/post-uji'); t = await r.text(); assert(!t.includes('Balasan untuk Budi'), 'balasan pending belum tampil');
 const replyId = env.DB.comments[env.DB.comments.length - 1].id;
 await call('POST', '/kendali/comments/approve', { csrf, id: String(replyId) }, cookie);
-r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('Balasan untuk Budi'), 'balasan disetujui tampil di bawah induknya');
-r = await call('POST', '/p/post-uji/comment/vote', { csrf: userCsrf, comment_id: String(commentId), vote: '1' }, userCookie); assert(r.status === 303, 'like redirect');
-r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('👍 1'), 'like terhitung');
-r = await call('POST', '/p/post-uji/comment/vote', { csrf: userCsrf, comment_id: String(commentId), vote: '1' }, userCookie);
-r = await call('GET', '/p/post-uji'); t = await r.text(); assert(!t.includes('👍 1'), 'like kedua kalinya membatalkan');
-r = await call('POST', '/p/post-uji/comment/vote', { csrf: userCsrf, comment_id: String(commentId), vote: '-1' }, userCookie);
-r = await call('GET', '/p/post-uji'); t = await r.text(); assert(t.includes('👎 1'), 'dislike terhitung');
+r = await call('GET', '/post/post-uji'); t = await r.text(); assert(t.includes('Balasan untuk Budi'), 'balasan disetujui tampil di bawah induknya');
+r = await call('POST', '/post/post-uji/comment/vote', { csrf: userCsrf, comment_id: String(commentId), vote: '1' }, userCookie); assert(r.status === 303, 'like redirect');
+r = await call('GET', '/post/post-uji'); t = await r.text(); assert(t.includes('👍 1'), 'like terhitung');
+r = await call('POST', '/post/post-uji/comment/vote', { csrf: userCsrf, comment_id: String(commentId), vote: '1' }, userCookie);
+r = await call('GET', '/post/post-uji'); t = await r.text(); assert(!t.includes('👍 1'), 'like kedua kalinya membatalkan');
+r = await call('POST', '/post/post-uji/comment/vote', { csrf: userCsrf, comment_id: String(commentId), vote: '-1' }, userCookie);
+r = await call('GET', '/post/post-uji'); t = await r.text(); assert(t.includes('👎 1'), 'dislike terhitung');
 // 14. Branding instance: logo SVG animasi + SITE_TITLE menang atas D1
 const brandHtml = themes.terang.render({ siteTitle: 'Hozin King', pageTitle: 'X', content: '' });
 assert(brandHtml.includes('<svg') && brandHtml.includes('animateTransform') && brandHtml.includes('>H</text>') && brandHtml.includes('Hozin King'), 'logo SVG: animasi kilau + mark H untuk Hozin King');
@@ -362,7 +362,7 @@ r = await call('POST', '/kendali/posts/update', { csrf, id: sampul.id, title: 'P
 assert(r.status === 303, 'update post redirect');
 const diubah = env.DB.posts.find(x => x.id === sampul.id);
 assert(diubah.title === 'Post Sampul Diubah' && diubah.slug === sampul.slug, 'update post: judul berubah, slug tetap');
-r = await call('GET', '/p/' + sampul.slug); t = await r.text();
+r = await call('GET', '/post/' + sampul.slug); t = await r.text();
 assert(t.includes('Post Sampul Diubah'), 'post lama tetap dibuka lewat slug lama');
 // Edit tanpa CSRF ditolak
 r = await call('POST', '/kendali/posts/update', { id: sampul.id, title: 'Jahat', body: 'x' }, cookie);
@@ -374,7 +374,7 @@ assert(r.status === 303, 'pengaturan foto + iklan tersimpan');
 r = await call('GET', '/'); t = await r.text();
 assert(t.includes('https://x.test/avatar.png'), 'header: foto profil tampil bila diisi');
 assert(t.includes('Iklan') && t.includes('https://x.test/banner.png') && t.includes('https://x.test/promo'), 'beranda: slot iklan tampil bila diisi');
-r = await call('GET', '/p/' + sampul.slug); t = await r.text();
+r = await call('GET', '/post/' + sampul.slug); t = await r.text();
 assert(t.includes('https://x.test/banner.png'), 'detail post: slot iklan tampil di bawah isi');
 // URL aneh dibersihkan, tidak tampil
 r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', theme: 'gelap', site_avatar: 'javascript:alert(1)', ad_image: '', ad_link: '', ad_text: '' }, cookie);
@@ -412,4 +412,32 @@ r = await call('GET', '/'); t = await r.text();
 assert(t.includes('class="view-eye"') && t.includes('eyeBlink') && t.includes('Date.now()%4000'), 'mata: SVG animasi kedip sinkron jam dinding, bukan emoji');
 assert(t.includes('viewBox="0 0 32 28"') && t.includes('width:22px'), 'mata: bentuk bulat terbuka, bukan sipit, dan ukuran lebih besar');
 assert(!t.includes('👁'), 'mata: tidak ada emoji mata di halaman mana pun');
+// 20. URL post profesional + sitemap + AdSense + plugin keamanan
+r = await call('GET', '/post/selamat-datang'); t = await r.text();
+assert(t.includes('Selamat Datang di WorkerCMS'), 'URL post baru /post/<slug> tampil');
+assert(r.headers.get('strict-transport-security') === 'max-age=31536000; includeSubDomains', 'HSTS Worker: max-age 1 tahun + includeSubDomains');
+r = await call('GET', '/p/selamat-datang'); assert(r.status === 301 && (r.headers.get('location') || '') === '/post/selamat-datang', 'URL lama /p/ dialihkan permanen 301 ke /post/');
+r = await call('GET', '/sitemap.xml'); t = await r.text();
+assert(r.headers.get('content-type') && r.headers.get('content-type').includes('application/xml'), 'sitemap: content-type XML');
+assert(t.includes('/post/selamat-datang') && !t.includes('/post/post-private') && !t.includes('/post/post-kunci'), 'sitemap: hanya post publik, bukan private/password');
+r = await call('GET', '/robots.txt'); t = await r.text();
+assert(t.includes('Disallow: /kendali/') && t.includes('/sitemap.xml'), 'robots: larang admin + tunjuk sitemap');
+r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
+assert(t.includes('AdSense: ID penayang'), 'pengaturan: kolom AdSense tampil');
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: 'ca-pub-1234567890123456', adsense_slot: '1234567890' }, cookie); assert(r.status === 303, 'pengaturan AdSense tersimpan');
+r = await call('GET', '/'); t = await r.text();
+assert(t.includes('adsbygoogle') && t.includes('ca-pub-1234567890123456'), 'AdSense: unit tampil di beranda bila client diisi');
+assert(r.headers.get('content-security-policy') && r.headers.get('content-security-policy').includes('pagead2.googlesyndication.com'), 'AdSense: CSP dilonggarkan hanya untuk domain Google Ads');
+r = await call('GET', '/kendali/plugins', null, cookie); t = await r.text();
+assert(t.includes('Filter Kata Kotor') && t.includes('Tahan Komentar Berlink') && t.includes('Tahan Komentar Panjang'), 'plugin keamanan: 3 plugin baru tampil di panel');
+// 21. Plugin keamanan benar-benar jalan (bukan saklar mati)
+r = await call('POST', '/post/post-uji/comment', { csrf, text: 'Halo anjing yang baik' }, cookie); assert(r.status === 303, 'komentar kotor admin redirect');
+r = await call('GET', '/post/post-uji', null, cookie); t = await r.text();
+assert(t.includes('***') && !t.includes('Halo anjing'), 'filter kata kotor: tampil *** bukan kata asli');
+r = await call('POST', '/post/post-uji/comment', { csrf, text: 'Cek link ini https://spam.test' }, cookie); assert(r.status === 303, 'komentar berlink admin redirect');
+r = await call('GET', '/post/post-uji', null, cookie); t = await r.text();
+assert(!t.includes('spam.test'), 'tahan link: komentar berlink admin ditahan, tidak tampil');
+r = await call('POST', '/post/post-uji/comment', { csrf, text: 'x'.repeat(1001) }, cookie); assert(r.status === 303, 'komentar panjang admin redirect');
+r = await call('GET', '/post/post-uji', null, cookie); t = await r.text();
+assert(!t.includes('x'.repeat(100)), 'tahan panjang: komentar >1000 karakter ditahan, tidak tampil');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

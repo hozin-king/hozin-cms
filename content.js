@@ -1,5 +1,6 @@
 // Content WorkerCMS — visibilitas post, kartu post, dan pohon komentar.
 import { esc, stripTags } from './util.js';
+import { maskDirtyWords } from './plugins.js';
 
 // Visibilitas post: 'public' (beranda + link), 'private' (hanya admin),
 // 'unlisted' (tidak di beranda, bisa dibuka siapa pun yang tahu link),
@@ -23,11 +24,18 @@ export function visibilityLabel(post, nowIso) {
 // Slot iklan manual (bukan AdSense): hanya tampil bila gambar + link diisi
 // di Pengaturan. Tidak ada script pihak ketiga, jadi tidak memperlambat
 // halaman. Kosong = tidak tampil sama sekali, tidak ada kotak kosong.
-export function adBanner(adImage, adLink, adText) {
+export function adBanner(adImage, adLink, adText, adsenseClient = '', adsenseSlot = '') {
   const img = typeof adImage === 'string' && adImage.startsWith('https://') ? adImage : '';
   const link = typeof adLink === 'string' && adLink.startsWith('https://') ? adLink : '';
-  if (!img || !link) return '';
-  return `<div class="card" style="text-align:center"><p class="meta">Iklan</p><a href="${esc(link)}" target="_blank" rel="sponsored noopener"><img src="${esc(img)}" alt="${esc(adText || 'Iklan')}" loading="lazy" style="max-width:100%;height:auto;border-radius:12px"></a>${adText ? `<p>${esc(adText)}</p>` : ''}</div>`;
+  const manual = (img && link) ? `<div class="card" style="text-align:center"><p class="meta">Iklan</p><a href="${esc(link)}" target="_blank" rel="sponsored noopener"><img src="${esc(img)}" alt="${esc(adText || 'Iklan')}" loading="lazy" style="max-width:100%;height:auto;border-radius:12px"></a>${adText ? `<p>${esc(adText)}</p>` : ''}</div>` : '';
+  // AdSense: hanya bila client valid (ca-pub-angka). Slot kosong = unit auto.
+  // Iklan AdSense baru tampil setelah Google menyetujui situs; sebelum itu
+  // slot ini bisa kosong — itu perilaku AdSense, bukan bug CMS.
+  const client = typeof adsenseClient === 'string' && /^ca-pub-\d+$/.test(adsenseClient.trim()) ? adsenseClient.trim() : '';
+  const slot = typeof adsenseSlot === 'string' && /^\d+$/.test(adsenseSlot.trim()) ? adsenseSlot.trim() : '';
+  if (!client) return manual;
+  const adsense = `<div class="card" style="text-align:center"><p class="meta">Iklan</p><script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${esc(client)}" crossorigin="anonymous"></script><ins class="adsbygoogle" style="display:block" data-ad-client="${esc(client)}"${slot ? ` data-ad-slot="${esc(slot)}"` : ''} data-ad-format="auto" data-full-width-responsive="true"></ins><script>(adsbygoogle = window.adsbygoogle || []).push({});</script></div>`;
+  return adsense + manual;
 }
 
 
@@ -51,17 +59,17 @@ export function postCard(post, plugins, isAdmin = false) {
   const views = Number(post.views) || 0;
   const imgMatch = String(post.body || '').match(/<img[^>]+src=["'](https?:[^"'\s>]+)["']/i);
   const cover = imgMatch
-    ? `<a href="/p/${esc(post.slug)}"><img class="post-cover" src="${esc(imgMatch[1])}" alt="" loading="lazy"></a>`
+    ? `<a href="/post/${esc(post.slug)}"><img class="post-cover" src="${esc(imgMatch[1])}" alt="" loading="lazy"></a>`
     : '';
   const editLink = isAdmin
     ? ` · <a href="/kendali/posts/edit?id=${esc(post.id)}">Edit</a>`
     : '';
-  return `<article class="card">${cover}<h2><a href="/p/${esc(post.slug)}">${esc(post.title)}</a></h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${meta}</p><p>${esc(plain.slice(0, 200))}${plain.length > 200 ? '…' : ''}</p><p><a class="read-more" href="/p/${esc(post.slug)}">Selengkapnya →</a>${editLink}</p></article>`;
+  return `<article class="card">${cover}<h2><a href="/post/${esc(post.slug)}">${esc(post.title)}</a></h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${meta}</p><p>${esc(plain.slice(0, 200))}${plain.length > 200 ? '…' : ''}</p><p><a class="read-more" href="/post/${esc(post.slug)}">Selengkapnya →</a>${editLink}</p></article>`;
 }
 
 // Pohon komentar: balasan menempel di bawah induknya, indent dibatasi
 // supaya tidak bergeser terlalu jauh di layar HP.
-export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply, postSlug) {
+export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply, postSlug, maskDirty = false) {
   const byParent = new Map();
   for (const c of comments) {
     const key = c.parent_id ? String(c.parent_id) : 'root';
@@ -73,13 +81,14 @@ export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply
     const mine = myVotes.get(c.id) || 0;
     const indent = Math.min(depth, 3) * 18;
     const replyForm = canReply
-      ? `<form method="post" action="/p/${esc(postSlug)}/comment" style="margin-top:8px"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="parent_id" value="${c.id}"><textarea name="text" maxlength="2000" placeholder="Balas ${esc(c.name)}…" required></textarea><button type="submit">Balas</button></form>`
+      ? `<form method="post" action="/post/${esc(postSlug)}/comment" style="margin-top:8px"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="parent_id" value="${c.id}"><textarea name="text" maxlength="2000" placeholder="Balas ${esc(c.name)}…" required></textarea><button type="submit">Balas</button></form>`
       : '';
     const voteForms = canReply
-      ? `<form method="post" action="/p/${esc(postSlug)}/comment/vote" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="1"><button type="submit">${mine === 1 ? '<b>👍 ' + v.like + '</b>' : '👍 ' + v.like}</button></form> <form method="post" action="/p/${esc(postSlug)}/comment/vote" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="-1"><button type="submit">${mine === -1 ? '<b>👎 ' + v.dislike + '</b>' : '👎 ' + v.dislike}</button></form>`
+      ? `<form method="post" action="/post/${esc(postSlug)}/comment/vote" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="1"><button type="submit">${mine === 1 ? '<b>👍 ' + v.like + '</b>' : '👍 ' + v.like}</button></form> <form method="post" action="/post/${esc(postSlug)}/comment/vote" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="-1"><button type="submit">${mine === -1 ? '<b>👎 ' + v.dislike + '</b>' : '👎 ' + v.dislike}</button></form>`
       : `<span>👍 ${v.like} · 👎 ${v.dislike}</span>`;
     const kids = (byParent.get(String(c.id)) || []).map(k => renderOne(k, depth + 1)).join('');
-    return `<div class="card" style="margin-left:${indent}px"><p><b>${esc(c.name)}</b></p><p>${esc(c.text)}</p><p>${voteForms}</p>${replyForm}${kids}</div>`;
+    const displayText = maskDirty ? maskDirtyWords(c.text) : c.text;
+    return `<div class="card" style="margin-left:${indent}px"><p><b>${esc(c.name)}</b></p><p>${esc(displayText)}</p><p>${voteForms}</p>${replyForm}${kids}</div>`;
   };
   // Komentar yang induknya sudah dihapus diperlakukan sebagai komentar utama,
   // supaya tidak hilang diam-diam.

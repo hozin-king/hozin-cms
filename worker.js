@@ -31,6 +31,8 @@ import { checkRateLimit } from './security.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye } from './content.js';
 import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle } from './store.js';
 import { editorCard } from './editor.js';
+import { hasLink } from './plugins.js';
+const ADSENSE_CSP = "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://pagead2.googlesyndication.com; frame-src https://googleads.g.doubleclick.net https://tpc.googlesyndication.com https://pagead2.googlesyndication.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
 
 
 function adminNav(current) {
@@ -123,12 +125,14 @@ async function handleFetch(request, env) {
       const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1);
       const offset = (page - 1) * 10;
       // Percepat: query independen ini jalan barengan, bukan berurutan.
-      const [rows, plugins, adImage, adLink, adText] = await Promise.all([
+      const [rows, plugins, adImage, adLink, adText, adsenseClient, adsenseSlot] = await Promise.all([
         env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC LIMIT 11 OFFSET ?`).bind(nowIso, offset).all(),
         getEnabledPlugins(env),
         getSetting(env, 'ad_image', ''),
         getSetting(env, 'ad_link', ''),
         getSetting(env, 'ad_text', ''),
+        getSetting(env, 'adsense_client', ''),
+        getSetting(env, 'adsense_slot', ''),
       ]);
       const allPosts = rows.results || [];
       const hasNext = allPosts.length > 10;
@@ -140,38 +144,53 @@ async function handleFetch(request, env) {
         ? `<a href="/kendali/posts/new" class="fab" id="fabPost" aria-label="Buat post">+</a><script>(function(){var f=document.getElementById('fabPost');if(!f)return;var t=null;window.addEventListener('scroll',function(){f.classList.add('fab-hidden');if(t)clearTimeout(t);t=setTimeout(function(){f.classList.remove('fab-hidden')},300)},{passive:true})})();<\/script>`
         : '';
       const nav = (page > 1 ? `<p><a href="/?page=${page - 1}">← Post baru</a></p>` : '') + (hasNext ? `<p><a href="/?page=${page + 1}">Post lama →</a></p>` : '');
-      const content = adBanner(adImage, adLink, adText) + (posts.length
+      const content = adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot) + (posts.length
         ? posts.map(p => postCard(p, plugins, admin)).join('')
         : '<div class="card"><p>Belum ada post.</p></div>') + nav + fab;
-      return html(await renderPage(env, 'Beranda', content));
+      return html(await renderPage(env, 'Beranda', content), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
     }
 
     // ---- Post terkunci: buka kunci (rate-limit per IP + post) ----
-    const unlockMatch = path.match(/^\/p\/([A-Za-z0-9-]+)\/unlock$/);
+    const unlockMatch = path.match(/^\/(?:p|post)\/([A-Za-z0-9-]+)\/unlock$/);
     if (unlockMatch && request.method === 'POST') {
       const slug = unlockMatch[1];
       const meta = await env.DB.prepare(`SELECT id, slug, visibility, publish_at, post_password_hash, post_password_salt FROM cms_posts WHERE slug = ?`).bind(slug).first();
-      if (!meta || meta.visibility !== 'password') return redirect(`/p/${slug}`);
+      if (!meta || meta.visibility !== 'password') return redirect(`/post/${slug}`);
       const ip = clientIp(request);
       if (!(await checkRateLimit(env, 'unlock:' + ip + ':' + meta.id, 5, 15 * 60 * 1000))) {
-        return html(await renderPage(env, 'Post Terkunci', '<div class="card"><p>Terlalu banyak percobaan. Coba lagi 15 menit.</p><p><a href="/p/' + esc(slug) + '">Kembali</a></p></div>'), 429);
+        return html(await renderPage(env, 'Post Terkunci', '<div class="card"><p>Terlalu banyak percobaan. Coba lagi 15 menit.</p><p><a href="/post/' + esc(slug) + '">Kembali</a></p></div>'), 429);
       }
       const form = await request.formData();
       const pw = String(form.get('password') || '');
       const ok = meta.post_password_salt && meta.post_password_hash && await verifyPassword(pw, meta.post_password_salt, meta.post_password_hash);
       if (!ok) {
-        return html(await renderPage(env, 'Post Terkunci', '<div class="card"><h2>Post Terkunci</h2><p>Password salah.</p><form method="post" action="/p/' + esc(slug) + '/unlock"><label>Password</label><input type="password" name="password" required><button type="submit">Buka</button></form></div>'), 403);
+        return html(await renderPage(env, 'Post Terkunci', '<div class="card"><h2>Post Terkunci</h2><p>Password salah.</p><form method="post" action="/post/' + esc(slug) + '/unlock"><label>Password</label><input type="password" name="password" required><button type="submit">Buka</button></form></div>'), 403);
       }
       const cookie = await postUnlockCookie(env, meta.id);
-      const headers = new Headers({ location: `/p/${slug}` });
+      const headers = new Headers({ location: `/post/${slug}` });
       headers.append('set-cookie', cookie);
       return new Response(null, { status: 303, headers });
     }
 
+    // ---- Sitemap + robots (audit 30 Okt 2026: sitemap.xml tadinya 404) ----
+    if (path === '/sitemap.xml' && request.method === 'GET') {
+      const rows = await env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY updated_at DESC`).bind(nowIso).all();
+      const urls = [`<url><loc>${esc(url.origin)}/</loc></url>`, ...(rows.results || []).map(p => `<url><loc>${esc(url.origin)}/post/${esc(p.slug)}</loc><lastmod>${esc(String(p.updated_at || p.created_at || '').slice(0, 10))}</lastmod></url>`)];
+      const xml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.join('')}</urlset>`;
+      return new Response(xml, { status: 200, headers: { 'content-type': 'application/xml; charset=utf-8' } });
+    }
+    if (path === '/robots.txt' && request.method === 'GET') {
+      const txt = `User-agent: *\nAllow: /\nDisallow: /kendali/\nDisallow: /akun/\nDisallow: /admin/\nSitemap: ${url.origin}/sitemap.xml\n`;
+      return new Response(txt, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    }
+
     // ---- Publik: detail post + komentar (metadata dulu, body belakangan) ----
-    const postMatch = path.match(/^\/p\/([A-Za-z0-9-]+)(?:\/comment)?$/);
+    const postMatch = path.match(/^\/(?:p|post)\/([A-Za-z0-9-]+)(?:\/comment)?$/);
     if (postMatch) {
       const slug = postMatch[1];
+      if (request.method === 'GET' && path.startsWith('/p/')) {
+        return new Response(null, { status: 301, headers: { location: '/post/' + slug + url.search } });
+      }
       if (request.method === 'GET') {
         // Langkah 1: metadata SAJA (tanpa judul, isi, kategori, tanggal).
         // Untuk post terkunci/private/terjadwal yang belum boleh dibuka, body
@@ -184,7 +203,7 @@ async function handleFetch(request, env) {
         if (meta.visibility === 'password' && !admin && !(await isPostUnlocked(request, env, meta.id))) {
           // Halaman kunci generik: tanpa judul asli, tanpa isi, tanpa
           // komentar, tanpa post terkait — tidak ada yang bocor.
-          const content = '<div class="card"><h2>Post Terkunci</h2><p>Post ini dilindungi password. Masukkan password untuk membukanya.</p><form method="post" action="/p/' + esc(slug) + '/unlock"><label>Password</label><input type="password" name="password" required><button type="submit">Buka</button></form></div>';
+          const content = '<div class="card"><h2>Post Terkunci</h2><p>Post ini dilindungi password. Masukkan password untuk membukanya.</p><form method="post" action="/post/' + esc(slug) + '/unlock"><label>Password</label><input type="password" name="password" required><button type="submit">Buka</button></form></div>';
           return html(await renderPage(env, 'Post Terkunci', content));
         }
         // Langkah 2: baru sekarang body boleh diambil (sudah lolos semua gate).
@@ -203,7 +222,7 @@ async function handleFetch(request, env) {
         }
         // Percepat: query independen detail post jalan barengan, bukan berurutan.
         const myKey = admin ? 'admin' : (commenter ? 'u:' + commenter.id : null);
-        const [plugins, comments, rel, voteRows, myRows, adImage, adLink, adText] = await Promise.all([
+        const [plugins, comments, rel, voteRows, myRows, adImage, adLink, adText, adsenseClient, adsenseSlot] = await Promise.all([
           getEnabledPlugins(env),
           env.DB.prepare(`SELECT * FROM cms_comments WHERE post_id = ? AND status = 'approved' ORDER BY created_at ASC`).bind(post.id).all(),
           env.DB.prepare(`SELECT * FROM cms_posts WHERE category = ? AND status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(post.category, nowIso).all(),
@@ -212,6 +231,8 @@ async function handleFetch(request, env) {
           getSetting(env, 'ad_image', ''),
           getSetting(env, 'ad_link', ''),
           getSetting(env, 'ad_text', ''),
+          getSetting(env, 'adsense_client', ''),
+          getSetting(env, 'adsense_slot', ''),
         ]);
         const metaHtml = plugins.map(p => p.postMeta ? p.postMeta(post) : '').join('');
         const footers = plugins.map(p => p.postFooter ? p.postFooter(post, { related: rel.results || [], baseUrl: url.origin }) : '').join('');
@@ -226,17 +247,18 @@ async function handleFetch(request, env) {
         for (const mr of (myRows.results || [])) myVotes.set(mr.comment_id, Number(mr.vote));
         const canReply = Boolean(admin || commenter);
         const csrfForComment = admin ? await csrfToken(env) : (commenter ? await userCsrf(env, commenter.id) : '');
-        const commentHtml = renderCommentsTree(comments.results || [], votes, myVotes, csrfForComment, canReply, slug);
+        const maskDirty = plugins.some(p => p.id === 'filter-kotor');
+        const commentHtml = renderCommentsTree(comments.results || [], votes, myVotes, csrfForComment, canReply, slug, maskDirty);
         const commentForm = canReply
-          ? `<form method="post" action="/p/${esc(slug)}/comment"><input type="hidden" name="csrf" value="${csrfForComment}"><label>Komentar sebagai ${admin ? 'Admin' : esc(commenter.username)}</label><textarea name="text" maxlength="2000" required></textarea><button type="submit">Kirim Komentar</button></form>`
+          ? `<form method="post" action="/post/${esc(slug)}/comment"><input type="hidden" name="csrf" value="${csrfForComment}"><label>Komentar sebagai ${admin ? 'Admin' : esc(commenter.username)}</label><textarea name="text" maxlength="2000" required></textarea><button type="submit">Kirim Komentar</button></form>`
           : `<div class="card"><p>Untuk berkomentar, login dulu atau buat akun.</p><p><a href="/akun">Login / Daftar Akun</a></p></div>`;
         const previewBanner = admin && (scheduled || meta.visibility !== 'public')
           ? `<div class="card"><p>Pratinjau admin: ${esc(visibilityLabel(post, nowIso))}${scheduled ? ' · terbit ' + esc(String(post.publish_at).slice(0, 16)) : ''}</p></div>`
           : '';
         const views = Number(post.views) || 0;
         const bodyHtml = post.body_mode === 'html' ? sanitizeHtml(post.body) : para(post.body);
-        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${metaHtml}</p>${bodyHtml}</article>${adBanner(adImage, adLink, adText)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
-        const res = html(await renderPage(env, post.title, content));
+        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${metaHtml}</p>${bodyHtml}</article>${adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
+        const res = html(await renderPage(env, post.title, content), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
         if (viewCookie) {
           const h = new Headers(res.headers);
           h.append('set-cookie', viewCookie);
@@ -254,7 +276,7 @@ async function handleFetch(request, env) {
         const form = await request.formData();
         // Honeypot anti-bot: kolom tersembunyi; kalau terisi, itu bot —
         // dibuang diam-diam tanpa disimpan.
-        if (String(form.get('website') || '').trim()) return redirect(`/p/${slug}?komentar=menunggu`);
+        if (String(form.get('website') || '').trim()) return redirect(`/post/${slug}?komentar=menunggu`);
         const csrfNeed = admin ? await csrfToken(env) : await userCsrf(env, commenter.id);
         if (String(form.get('csrf') || '') !== csrfNeed) {
           return html(await renderPage(env, 'Komentar', '<div class="card"><p>Token tidak valid. Muat ulang halaman lalu coba lagi.</p></div>'), 403);
@@ -272,15 +294,18 @@ async function handleFetch(request, env) {
         }
         if (text) {
           const name = admin ? 'Admin' : commenter.username;
-          const status = admin ? 'approved' : 'pending';
+          let status = admin ? 'approved' : 'pending';
+          const enabledIds = new Set((await getEnabledPlugins(env)).map(p => p.id));
+          if (enabledIds.has('tahan-link') && hasLink(text)) status = 'pending';
+          if (enabledIds.has('tahan-panjang') && text.length > 1000) status = 'pending';
           await env.DB.prepare(`INSERT INTO cms_comments (post_id, name, text, status, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?)`).bind(meta.id, name, text, status, new Date().toISOString(), parentId).run();
         }
-        return redirect(`/p/${slug}?komentar=menunggu`);
+        return redirect(`/post/${slug}?komentar=menunggu`);
       }
     }
 
     // ---- Like / dislike komentar (butuh akun, bisa batal / ganti) ----
-    const voteMatch = path.match(/^\/p\/([A-Za-z0-9-]+)\/comment\/vote$/);
+    const voteMatch = path.match(/^\/(?:p|post)\/([A-Za-z0-9-]+)\/comment\/vote$/);
     if (voteMatch && request.method === 'POST') {
       const slug = voteMatch[1];
       if (!admin && !commenter) return redirect('/akun?pesan=login');
@@ -307,7 +332,7 @@ async function handleFetch(request, env) {
           await env.DB.prepare(`INSERT INTO cms_comment_votes (comment_id, user_key, vote) VALUES (?, ?, ?)`).bind(commentId, myKey, vote).run();
         }
       }
-      return redirect(`/p/${slug}`);
+      return redirect(`/post/${slug}`);
     }
 
     // ---- Akun komentator (BUKAN akun admin — hanya bisa komentar + vote) ----
@@ -471,17 +496,19 @@ async function handleFetch(request, env) {
       }
       if (path === '/kendali/settings') {
         const envTitle = envSiteTitle(env);
-        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText] = await Promise.all([
+        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText, adsenseClient, adsenseSlot] = await Promise.all([
           getSetting(env, 'theme', 'terang'),
           envTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
           getSetting(env, 'site_avatar', ''),
           getSetting(env, 'ad_image', ''),
           getSetting(env, 'ad_link', ''),
           getSetting(env, 'ad_text', ''),
+          getSetting(env, 'adsense_client', ''),
+          getSetting(env, 'adsense_slot', ''),
         ]);
         const siteTitle = envTitle || siteTitleDb;
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
-        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><button type="submit">Simpan Pengaturan</button></form></div>`;
+        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><button type="submit">Simpan Pengaturan</button></form></div>`;
         return html(await renderPage(env, 'Pengaturan', content, { siteTitle, themeId }));
       }
       if (path === '/kendali/sessions') {
@@ -519,7 +546,7 @@ async function handleFetch(request, env) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const editError = url.searchParams.get('error') === 'password' ? '<div class="card"><p>Password post minimal 8 karakter, perubahan tidak disimpan.</p></div>' : '';
-      const content = editError + `<p><a href="/kendali/posts">← Kembali ke Post</a> · <a href="/kendali">Dashboard</a> · <a href="/p/${esc(post.slug)}">Lihat post</a></p>` + editorCard(csrfField, { post, action: '/kendali/posts/update' });
+      const content = editError + `<p><a href="/kendali/posts">← Kembali ke Post</a> · <a href="/kendali">Dashboard</a> · <a href="/post/${esc(post.slug)}">Lihat post</a></p>` + editorCard(csrfField, { post, action: '/kendali/posts/update' });
       return html(await renderPage(env, 'Edit Post', content));
     }
 
@@ -563,6 +590,10 @@ async function handleFetch(request, env) {
         const adImage = cleanUrl(form.get('ad_image'));
         const adLink = cleanUrl(form.get('ad_link'));
         const adText = String(form.get('ad_text') || '').trim().slice(0, 100);
+        const adsenseClientRaw = String(form.get('adsense_client') || '').trim();
+        const adsenseClient = /^ca-pub-\d+$/.test(adsenseClientRaw) ? adsenseClientRaw : '';
+        const adsenseSlotRaw = String(form.get('adsense_slot') || '').trim();
+        const adsenseSlot = /^\d+$/.test(adsenseSlotRaw) ? adsenseSlotRaw : '';
         if (themes[theme]) {
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('site_title', ?)`).bind(siteTitle).run();
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('theme', ?)`).bind(theme).run();
@@ -571,6 +602,8 @@ async function handleFetch(request, env) {
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_image', ?)`).bind(adImage).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_link', ?)`).bind(adLink).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_text', ?)`).bind(adText).run();
+        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_client', ?)`).bind(adsenseClient).run();
+        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_slot', ?)`).bind(adsenseSlot).run();
         return redirect('/kendali/settings');
       }
       if (path === '/kendali/posts') {

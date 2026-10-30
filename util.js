@@ -17,6 +17,7 @@ export function html(body, status = 200, headers = {}) {
     'x-frame-options': 'DENY',
     'referrer-policy': 'strict-origin-when-cross-origin',
     'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+    'strict-transport-security': 'max-age=31536000; includeSubDomains',
     // CSP: skrip/style inline diizinkan karena tema + editor blok memakai
     // skrip inline (footer uptime, editor). Yang dilarang keras: objek/embed
     // (Flash/Java), frame dari luar (clickjacking sudah DENY juga), form ke
