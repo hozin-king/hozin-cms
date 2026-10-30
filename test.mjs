@@ -315,10 +315,10 @@ let unlockCookie = cookieHeader(cookiesOf(r));
 r = await call('GET', '/p/post-kunci', null, unlockCookie); t = await r.text(); assert(t.includes('Isi sangat rahasia 12345'), 'password benar: isi baru dimuat setelah kunci dibuka');
 // View: hanya logo mata + angka, sekali per perangkat per hari
 r = await call('GET', '/p/selamat-datang'); t = await r.text();
-assert(t.includes('👁 1'), 'view: logo mata + angka tampil, tanpa kata dilihat');
+assert(t.includes('class="view-eye"') && t.includes('> 1') && !t.includes('👁'), 'view: ikon mata SVG + angka tampil, tanpa emoji dan tanpa kata dilihat');
 const viewCookie = cookieHeader(cookiesOf(r));
 r = await call('GET', '/p/selamat-datang', null, viewCookie); t = await r.text();
-assert(t.includes('👁 1'), 'view: kunjungan ulang perangkat sama tidak menambah angka');
+assert(t.includes('class="view-eye"') && t.includes('> 1'), 'view: kunjungan ulang perangkat sama tidak menambah angka');
 
 // 13. Komentar: balasan + like/dislike (bisa batal / ganti)
 env.DB.rateLimits = new Map();
@@ -406,4 +406,9 @@ r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
 assert(t.includes('Simpan Pengaturan') && t.includes('Foto profil situs'), 'halaman Pengaturan: form sendiri');
 r = await call('GET', '/kendali/comments', null, cookie); t = await r.text();
 assert(t.includes('<h2>Komentar</h2>'), 'halaman Komentar: sendiri');
+// 19. Ikon mata animasi sinkron WIB (perintah pemilik 30 Okt 2026 12:31)
+// Bukan emoji; SVG + keyframes kedip 4 detik + footer script sinkron fase
+r = await call('GET', '/'); t = await r.text();
+assert(t.includes('class="view-eye"') && t.includes('eyeBlink') && t.includes('Date.now()%4000'), 'mata: SVG animasi kedip sinkron jam dinding, bukan emoji');
+assert(!t.includes('👁'), 'mata: tidak ada emoji mata di halaman mana pun');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

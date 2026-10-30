@@ -30,6 +30,16 @@ export function adBanner(adImage, adLink, adText) {
   return `<div class="card" style="text-align:center"><p class="meta">Iklan</p><a href="${esc(link)}" target="_blank" rel="sponsored noopener"><img src="${esc(img)}" alt="${esc(adText || 'Iklan')}" loading="lazy" style="max-width:100%;height:auto;border-radius:12px"></a>${adText ? `<p>${esc(adText)}</p>` : ''}</div>`;
 }
 
+
+// Ikon mata kreatif (bukan emoji): SVG mata dengan iris biru-ungu, pupil,
+// dan titik cahaya. Animasi kedip diatur .eye-blink (4 detik, CSS di themes.js);
+// sinkronisasi fase dilakukan footer script di themes.js dari jam dinding
+// (Date.now() % 4000), jadi semua penonton yang jam HP-nya benar (NTP)
+// melihat kedip pada detik yang sama, bukan kedip acak per halaman.
+export function viewEye(views) {
+  return '<span class="view-eye" aria-label="Dilihat"><svg viewBox="0 0 32 24" fill="none" aria-hidden="true"><g class="eye-blink"><path d="M2 12 Q16 3 30 12 Q16 21 2 12 Z" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/><circle cx="16" cy="12" r="5.5" fill="#3b82f6"/><circle cx="16" cy="12" r="2.8" fill="#0b1220"/><circle cx="17.5" cy="10.5" r="1" fill="#ffffff"/></g></svg></span> ' + views;
+}
+
 export function postCard(post, plugins, isAdmin = false) {
   const meta = plugins.map(p => p.postMeta ? p.postMeta(post) : '').join('');
   // Cuplikan selalu dari teks polos (tag HTML post dibuang), jadi cuplikan
@@ -46,7 +56,7 @@ export function postCard(post, plugins, isAdmin = false) {
   const editLink = isAdmin
     ? ` · <a href="/kendali/posts/edit?id=${esc(post.id)}">Edit</a>`
     : '';
-  return `<article class="card">${cover}<h2><a href="/p/${esc(post.slug)}">${esc(post.title)}</a></h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · 👁 ${views}${meta}</p><p>${esc(plain.slice(0, 200))}${plain.length > 200 ? '…' : ''}</p><p><a class="read-more" href="/p/${esc(post.slug)}">Selengkapnya →</a>${editLink}</p></article>`;
+  return `<article class="card">${cover}<h2><a href="/p/${esc(post.slug)}">${esc(post.title)}</a></h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${meta}</p><p>${esc(plain.slice(0, 200))}${plain.length > 200 ? '…' : ''}</p><p><a class="read-more" href="/p/${esc(post.slug)}">Selengkapnya →</a>${editLink}</p></article>`;
 }
 
 // Pohon komentar: balasan menempel di bawah induknya, indent dibatasi

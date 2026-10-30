@@ -28,7 +28,7 @@ import { pluginDefs } from './plugins.js';
 import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex } from './util.js';
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie } from './auth.js';
 import { checkRateLimit } from './security.js';
-import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner } from './content.js';
+import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye } from './content.js';
 import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle } from './store.js';
 import { editorCard } from './editor.js';
 
@@ -235,7 +235,7 @@ async function handleFetch(request, env) {
           : '';
         const views = Number(post.views) || 0;
         const bodyHtml = post.body_mode === 'html' ? sanitizeHtml(post.body) : para(post.body);
-        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · 👁 ${views}${metaHtml}</p>${bodyHtml}</article>${adBanner(adImage, adLink, adText)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
+        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${metaHtml}</p>${bodyHtml}</article>${adBanner(adImage, adLink, adText)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
         const res = html(await renderPage(env, post.title, content));
         if (viewCookie) {
           const h = new Headers(res.headers);
@@ -441,7 +441,7 @@ async function handleFetch(request, env) {
       }
       if (path === '/kendali/posts') {
         const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all();
-        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · 👁 ${Number(p.views) || 0} · ${esc(p.body_mode || 'text')}) <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a> <form method="post" action="/kendali/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('') || '<p>Belum ada post.</p>';
+        const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · ${viewEye(Number(p.views) || 0)} · ${esc(p.body_mode || 'text')}) <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a> <form method="post" action="/kendali/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('') || '<p>Belum ada post.</p>';
         const content = `<h2>Post</h2>${nav}<p><a href="/kendali/posts/new">+ Post Baru</a></p>${postRows}`;
         return html(await renderPage(env, 'Post', content));
       }
