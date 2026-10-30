@@ -13,7 +13,7 @@ class Stmt {
 }
 class MockDB {
   constructor() {
-    this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = []; this.refreshTokens = [];
+    this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = []; this.refreshTokens = []; this.viewEvents = [];
     this.users = new Map(); this.votes = []; this.rateLimits = new Map();
   }
   prepare(sql) { return new Stmt(this, sql); }
@@ -116,6 +116,8 @@ class MockDB {
     if (s.startsWith('SELECT id FROM cms_posts WHERE slug')) return this.posts.filter(p => p.slug === a[0]).map(p => ({ id: p.id }));
     if (s.startsWith('SELECT * FROM cms_comments WHERE post_id')) return this.comments.filter(c => c.post_id === a[0] && c.status === 'approved').sort((x, y) => x.created_at.localeCompare(y.created_at));
     if (s.startsWith('SELECT * FROM cms_comments ORDER')) return [...this.comments].sort((x, y) => y.created_at.localeCompare(x.created_at));
+    if (s.startsWith('INSERT INTO cms_view_events')) { this.viewEvents.push({ post_id: a[0], viewed_at: a[1] }); return []; }
+    if (s.startsWith('SELECT post_id, viewed_at FROM cms_view_events')) return [...this.viewEvents].sort((x, y) => y.viewed_at.localeCompare(x.viewed_at));
     if (s.startsWith('SELECT * FROM cms_comments WHERE id')) return this.comments.filter(c => c.id === a[0]);
     if (s.startsWith('UPDATE cms_comments SET text')) { const c = this.comments.find(x => x.id === a[1]); if (c) { c.text = a[0]; if (s.includes("status = 'pending'")) c.status = 'pending'; } return []; }
     if (s.startsWith('UPDATE cms_comments SET pinned = 0 WHERE post_id')) { this.comments.filter(c => c.post_id === a[0] && c.id !== a[1]).forEach(c => { c.pinned = 0; }); return []; }
@@ -511,4 +513,10 @@ assert(t.includes('Simpan Plugin') && t.includes('plugin-toggle') && !t.includes
 r = await call('POST', '/kendali/plugins/save', { csrf, 'plugin_reading-time': '1' }, cookie); assert(r.status === 303, 'plugin: simpan massal redirect');
 r = await call('GET', '/kendali/plugins', null, cookie); t = await r.text();
 assert(t.includes('name="plugin_reading-time" value="1" checked'), 'plugin: simpan massal menyimpan status toggle');
+// 26. Dashboard lengkap (perintah pemilik 30 Okt 2026 17:50)
+r = await call('GET', '/post/post-uji', null, cookie); t = await r.text();
+env.DB.viewEvents.push({ post_id: 'p-mvul0ei4', viewed_at: new Date().toISOString() });
+r = await call('GET', '/kendali', null, cookie); t = await r.text();
+assert(t.includes('Post Terpopuler') && t.includes('views total') && t.includes('Post Paling Banyak Dikomentari') && t.includes('Komentator Teraktif') && t.includes('Post Terbaru'), 'dashboard: ringkasan + terpopuler + dikomentari + teraktif + terbaru tampil');
+assert(t.includes('7 hari terakhir'), 'dashboard: views 7 hari terakhir tampil (bukan grafik palsu)');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

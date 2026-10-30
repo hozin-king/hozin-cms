@@ -270,6 +270,9 @@ async function handleFetch(request, env) {
             await env.DB.prepare(`UPDATE cms_posts SET views = views + 1 WHERE id = ?`).bind(post.id).run();
             post.views = (Number(post.views) || 0) + 1;
             viewCookie = viewName + '=1; Path=/; Max-Age=86400';
+            // Riwayat views harian untuk dashboard (mulai rilis ini; data lama
+            // tidak direkonstruksi — total lama tetap dari counter cms_posts).
+            try { await env.DB.prepare(`INSERT INTO cms_view_events (post_id, viewed_at) VALUES (?, ?)`).bind(post.id, nowIso).run(); } catch (e) {}
           }
         }
         // Percepat: query independen detail post jalan barengan, bukan berurutan.
@@ -555,15 +558,46 @@ async function handleFetch(request, env) {
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
       if (path === '/kendali') {
-        const [posts, comments, users, pluginRows] = await Promise.all([
+        const [posts, comments, users, pluginRows, viewEvents] = await Promise.all([
           env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all(),
           env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all(),
           env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all(),
           env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all(),
+          env.DB.prepare(`SELECT post_id, viewed_at FROM cms_view_events ORDER BY viewed_at DESC`).all(),
         ]);
-        const pending = (comments.results || []).filter(c => c.status !== 'approved').length;
+        const postList = posts.results || [];
+        const commentList = comments.results || [];
+        const pending = commentList.filter(c => c.status !== 'approved').length;
+        const approvedComments = commentList.filter(c => c.status === 'approved').length;
         const activePlugins = (pluginRows.results || []).filter(r => Number(r.enabled) === 1).length;
-        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${nav}<div class="card"><p><b>${(posts.results || []).length} Post</b> · <a href="/kendali/posts">Lihat Post</a> · <a href="/kendali/posts/new">Post Baru</a></p><p><b>${pending} Komentar menunggu</b> · <a href="/kendali/comments">Moderasi Komentar</a></p><p><b>${(users.results || []).length} Akun komentator</b> · <a href="/kendali/users">Lihat Akun</a></p><p><b>${activePlugins} Plugin aktif</b> · <a href="/kendali/plugins">Lihat Plugin</a></p></div><form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>`;
+        const totalViews = postList.reduce((a, p) => a + (Number(p.views) || 0), 0);
+        const avgViews = postList.length ? (totalViews / postList.length).toFixed(1) : '0';
+        const byId = new Map(postList.map(p => [String(p.id), p]));
+        const commentCount = new Map();
+        for (const c of commentList) if (c.status === 'approved') commentCount.set(String(c.post_id), (commentCount.get(String(c.post_id)) || 0) + 1);
+        const postLink = p => `<a href="/post/${esc(p.slug)}">${esc(p.title)}</a>`;
+        const topViews = [...postList].sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0)).slice(0, 5);
+        const topViewsHtml = topViews.map((p, i) => `<p><b>${i + 1}.</b> ${postLink(p)} — ${viewEye(Number(p.views) || 0)} · ${esc(p.category)} · ${esc(String(p.created_at || '').slice(0, 10))} · ${commentCount.get(String(p.id)) || 0} komentar · <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a></p>`).join('') || '<p>Belum ada post.</p>';
+        // Views 7 hari terakhir dari riwayat (WIB, mulai dicatat rilis ini saja).
+        const nowMs = Date.now();
+        const sevenAgo = new Date(nowMs - 7 * 24 * 3600 * 1000).toISOString();
+        const wibDate = ms => new Date(ms + 7 * 3600 * 1000).toISOString().slice(0, 10);
+        const todayWib = wibDate(nowMs);
+        const events = viewEvents.results || [];
+        const recent = events.filter(e => String(e.viewed_at || '') >= sevenAgo);
+        const views7 = recent.length;
+        const viewsToday = events.filter(e => wibDate(new Date(String(e.viewed_at || '')).getTime()) === todayWib).length;
+        const perPost7 = new Map();
+        for (const e of recent) perPost7.set(String(e.post_id), (perPost7.get(String(e.post_id)) || 0) + 1);
+        const top7 = [...perPost7.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([pid, n]) => byId.get(pid)).filter(Boolean).map((p, i) => `<p><b>${i + 1}.</b> ${postLink(p)} — ${perPost7.get(String(p.id))} views 7 hari terakhir · ${viewEye(Number(p.views) || 0)} total</p>`).join('');
+        const top7Html = top7 || '<p>Belum ada data views 7 hari terakhir — riwayat views baru mulai dicatat dari rilis ini, jadi bagian ini terisi setelah ada pengunjung baru. Total views di atas tetap dari counter lama.</p>';
+        const topCommented = [...postList].map(p => ({ p, n: commentCount.get(String(p.id)) || 0 })).filter(x => x.n > 0).sort((a, b) => b.n - a.n).slice(0, 5).map((x, i) => `<p><b>${i + 1}.</b> ${postLink(x.p)} — ${x.n} komentar disetujui</p>`).join('') || '<p>Belum ada komentar disetujui.</p>';
+        const latest = postList.slice(0, 5).map(p => `<p>${postLink(p)} — ${viewEye(Number(p.views) || 0)} · ${esc(String(p.created_at || '').slice(0, 10))}</p>`).join('') || '<p>Belum ada post.</p>';
+        const commenterCount = new Map();
+        for (const c of commentList) if (c.status === 'approved') commenterCount.set(c.name, (commenterCount.get(c.name) || 0) + 1);
+        const topCommenters = [...commenterCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, n], i) => `<p><b>${i + 1}.</b> ${esc(name)} — ${n} komentar</p>`).join('') || '<p>Belum ada komentator aktif.</p>';
+        const zeroViews = postList.filter(p => (Number(p.views) || 0) === 0).slice(0, 5).map(p => `<p>${postLink(p)} · <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a></p>`).join('');
+        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${nav}<div class="card"><h3>Ringkasan</h3><p><b>${totalViews} views total</b> · ${views7} views 7 hari terakhir · ${viewsToday} views hari ini (WIB) · rata-rata ${avgViews} views/post</p><p><b>${postList.length} Post</b> · <a href="/kendali/posts">Lihat Post</a> · <a href="/kendali/posts/new">Post Baru</a></p><p><b>${commentList.length} Komentar</b> (${approvedComments} disetujui, ${pending} menunggu) · <a href="/kendali/comments">Moderasi Komentar</a></p><p><b>${(users.results || []).length} Akun komentator</b> · <a href="/kendali/users">Lihat Akun</a></p><p><b>${activePlugins} Plugin aktif</b> · <a href="/kendali/plugins">Lihat Plugin</a></p></div><div class="card"><h3>🔥 Post Terpopuler / Viral (views terbanyak sepanjang masa)</h3>${topViewsHtml}</div><div class="card"><h3>📈 Post Terpopuler 7 Hari Terakhir</h3>${top7Html}</div><div class="card"><h3>💬 Post Paling Banyak Dikomentari</h3>${topCommented}</div><div class="card"><h3>🆕 Post Terbaru</h3>${latest}</div><div class="card"><h3>👥 Komentator Teraktif</h3>${topCommenters}</div>${zeroViews ? `<div class="card"><h3>👀 Post Belum Pernah Dilihat</h3>${zeroViews}</div>` : ''}<form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>`;
         return html(await renderPage(env, 'Admin', content));
       }
       if (path === '/kendali/posts') {
