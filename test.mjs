@@ -146,8 +146,7 @@ function assert(cond, label) { console.log((cond ? 'OK  ' : 'GAGAL ') + label); 
 let r = await call('GET', '/'); let t = await r.text();
 assert(t.includes('Selamat Datang di WorkerCMS'), 'beranda: post sambutan tampil');
 assert(t.includes('menit baca'), 'beranda: plugin waktu baca aktif');
-// Tema baru GitHub (31 Okt 2026): footer uptime sengaja dihapus, copyright dipertahankan.
-assert(t.includes('id="copyr"') && !t.includes('id="uptime"'), 'beranda: footer copyright dipertahankan (uptime dihapus tema baru)');
+assert(t.includes('id="copyr"') && t.includes('id="uptime"') && t.includes('2024-01-01'), 'beranda: footer copyright + uptime dipertahankan');
 
 // 2. Login terpadu di form biasa /akun: nama 'admin' + token admin
 // (salah -> 403 generik, benar -> token akses + refresh + dashboard super-admin)
@@ -203,7 +202,7 @@ r = await call('GET', '/post/post-uji'); t = await r.text(); assert(t.includes('
 
 // 5. Ganti tema ke gelap + nonaktifkan plugin share, cek halaman berubah
 r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', theme: 'gelap' }, cookie);
-r = await call('GET', '/'); t = await r.text(); assert(t.includes('#0f1419'), 'tema gelap baru terpakai (palet tema GitHub)');
+r = await call('GET', '/'); t = await r.text(); assert(t.includes('#05070d'), 'tema gelap terpakai (identitas situs lama, bukan slate generik)');
 r = await call('POST', '/kendali/plugins/toggle', { csrf, id: 'share', enabled: '0' }, cookie);
 r = await call('GET', '/post/post-uji'); t = await r.text(); assert(!t.includes('Bagikan:'), 'plugin share nonaktif hilang dari post');
 
@@ -283,11 +282,11 @@ assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1'),
 
 // 10. Tema v2 ala WordPress: 4 tema, responsif lintas platform
 assert(Object.keys(themes).join(',') === 'terang,gelap,majalah,minimal', 'tema: 4 tema tersedia (terang, gelap, majalah, minimal)');
-assert(themes.gelap.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('#0f1419'), 'tema gelap: palet baru tema GitHub');
+assert(themes.gelap.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('#05070d'), 'tema gelap: identitas default dipertahankan');
 assert(themes.majalah.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('Georgia'), 'tema majalah: font serif berbeda dari terang/gelap');
 assert(themes.minimal.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('border-radius:8px'), 'tema minimal: radius kartu berbeda');
 const terangHtml = themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' });
-assert(terangHtml.includes('width=device-width') && terangHtml.includes('@media (max-width:640px)') && terangHtml.includes('min-height:44px'), 'tema responsif: viewport + breakpoint HP 640px + target sentuh 44px');
+assert(terangHtml.includes('width=device-width') && terangHtml.includes('@media (max-width:600px)') && terangHtml.includes('min-height:44px'), 'tema responsif: viewport + breakpoint HP + target sentuh 44px');
 
 // 11. Editor post: HTML disanitasi, teks di-escape, header keamanan, honeypot, rate-limit komentar
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post HTML', category: 'Tekno', body: '<script>alert(1)</script><p>Halo <b>Dunia</b></p><a href="javascript:alert(1)">x</a><img src="https://x.test/a.png" onerror="alert(1)"><video controls src="https://x.test/v.mp4"></video>', body_mode: 'html' }, cookie);
@@ -368,8 +367,7 @@ r = await call('POST', '/post/post-uji/comment/delete', { csrf, comment_id: Stri
 assert(!env.DB.comments.some(c => c.id === adminCid), 'hapus dari post: admin bisa hapus komentar siapa pun');
 // 14. Branding instance: logo SVG animasi + SITE_TITLE menang atas D1
 const brandHtml = themes.terang.render({ siteTitle: 'Hozin King', pageTitle: 'X', content: '' });
-// Tema baru GitHub: logo SVG polos tanpa animasi kilau, mark H dipertahankan.
-assert(brandHtml.includes('<svg') && brandHtml.includes('>H</text>') && brandHtml.includes('Hozin King'), 'logo SVG: mark H untuk Hozin King (tema baru tanpa animasi kilau)');
+assert(brandHtml.includes('<svg') && brandHtml.includes('animateTransform') && brandHtml.includes('>H</text>') && brandHtml.includes('Hozin King'), 'logo SVG: animasi kilau + mark H untuk Hozin King');
 assert(envSiteTitle({ SITE_TITLE: '  Hozin King  ' }) === 'Hozin King' && envSiteTitle({}) === '' && envSiteTitle({ SITE_TITLE: '   ' }) === '', 'envSiteTitle: trim, kosong bila tidak ada');
 r = await renderPage({ DB: env.DB, SITE_TITLE: 'Hozin King' }, 'Beranda', '<p>uji</p>'); t = r;
 assert(t.includes('Hozin King') && !t.includes('>WorkerCMS<') && t.includes('>H</text>'), 'renderPage: SITE_TITLE menang atas site_title D1 (WorkerCMS)');
@@ -443,8 +441,7 @@ assert(t.includes('<h2>Komentar</h2>'), 'halaman Komentar: sendiri');
 // 19. Ikon mata animasi sinkron WIB (perintah pemilik 30 Okt 2026 12:31)
 // Bukan emoji; SVG + keyframes kedip 4 detik + footer script sinkron fase
 r = await call('GET', '/'); t = await r.text();
-// Tema baru GitHub: ikon mata SVG dipertahankan, animasi kedip sinkron dihapus.
-assert(t.includes('class="view-eye"') && t.includes('viewBox="0 0 32 28"'), 'mata: SVG view-eye, bukan emoji (tema baru tanpa animasi kedip)');
+assert(t.includes('class="view-eye"') && t.includes('eyeBlink') && t.includes('Date.now()%4000'), 'mata: SVG animasi kedip sinkron jam dinding, bukan emoji');
 assert(t.includes('viewBox="0 0 32 28"') && t.includes('width:22px'), 'mata: bentuk bulat terbuka, bukan sipit, dan ukuran lebih besar');
 assert(!t.includes('👁'), 'mata: tidak ada emoji mata di halaman mana pun');
 // 20. URL post profesional + sitemap + AdSense + plugin keamanan
