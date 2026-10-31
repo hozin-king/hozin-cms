@@ -1,5 +1,6 @@
 // Tema WorkerCMS — sistem tema data-driven.
 // Responsif mobile / tablet / desktop. Aksen solid, tipografi nyaman, tidak gradient berat.
+import { esc } from './util.js';
 function baseCss(def) {
   const { bg, fg, card, muted, accent, border, font, radius, maxWidth } = def;
   return `body{margin:0;font-family:${font};background:${bg};color:${fg};line-height:1.65;display:flex;flex-direction:column;min-height:100vh;font-size:16px;-webkit-font-smoothing:antialiased}` +
@@ -13,6 +14,7 @@ function baseCss(def) {
     `button{padding:9px 16px;border:0;border-radius:8px;background:${accent};color:#fff;font-weight:600;cursor:pointer;font-size:14.5px}` +
     `.post-cover{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:10px;display:block;margin-bottom:12px}` +
     `.read-more{display:inline-block;padding:9px 16px;border-radius:8px;background:${accent};color:#fff!important;font-weight:600;text-decoration:none;font-size:14px}` +
+    `.view-eye{display:inline-block;width:22px;height:20px;vertical-align:-5px}.view-eye svg{width:22px;height:20px;display:block}` +
     `.fab{position:fixed;right:18px;bottom:22px;width:54px;height:54px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:26px;box-shadow:0 3px 10px rgba(0,0,0,.18);z-index:50;text-decoration:none;color:#fff;background:${accent}}` +
     `@media (max-width:640px){header{padding:10px 12px}main{padding:12px 10px}.card{padding:14px}button,.read-more{min-height:44px}}` +
     `@media (min-width:641px) and (max-width:900px){main,footer{max-width:680px;padding:16px 18px}}` +
@@ -24,7 +26,9 @@ function shell(css, def, siteTitle, pageTitle, content, siteAvatar, metaDesc = '
   const avatarHtml = siteAvatar ? `<img src="${siteAvatar}" alt="" style="width:26px;height:26px;flex:0 0 26px;margin-right:9px;border-radius:50%;object-fit:cover">` : '';
   const accent = def.accent;
   const markSvg = `<svg viewBox="0 0 48 48" aria-hidden="true"><rect width="48" height="48" rx="11" fill="${accent}"/><text x="24" y="33" text-anchor="middle" font-size="26" font-weight="700" fill="#fff" font-family="Inter,system-ui,sans-serif">${mark}</text></svg>`;
-  const desc = metaDesc ? String(metaDesc).slice(0, 155) : '';
+  // metaDesc di-escape: nilainya bisa berasal dari isi post di masa depan,
+  // dan tanpa escape kutip di dalamnya bisa menutup atribut content="...".
+  const desc = metaDesc ? esc(String(metaDesc).slice(0, 155)) : '';
   const metaTags = desc ? `<meta name="description" content="${desc}"><meta property="og:title" content="${pageTitle} — ${siteTitle}"><meta property="og:description" content="${desc}"><meta property="og:type" content="website">` : '';
   const footerScript = `<script>(function(){try{var yr=document.getElementById('copyr');if(yr){var y=new Date().getFullYear();yr.textContent=y>2024?('2024–'+y):'2024'}}catch(e){}})();<\/script>`;
   return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${pageTitle} — ${siteTitle}</title>${metaTags}<style>${css}</style></head><body><header><a class="brand" href="/">${avatarHtml || `<span class="mark">${markSvg}</span>`}${siteTitle}</a><nav><a href="/">Beranda</a><a href="/akun">Akun</a></nav></header><main>${content}</main><footer><p>© <span id="copyr">2024–2026</span> ${siteTitle}</p></footer>${footerScript}</body></html>`;

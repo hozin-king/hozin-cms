@@ -18,15 +18,15 @@ export function maskDirtyWords(text) {
 
 export function normalizeText(text) {
   let t = String(text || '').toLowerCase();
-  t = t.replace(/0/g, 'o').replace(/1/g, 'i').replace(/3/g, 'e').replace(/4/g, 'a').replace(/5/g, 's').replace(/7/g, 't').replace(/\\$/g, 's').replace(/@/g, 'a');
-  t = t.replace(/[^a-z0-9 ]+/g, ' ').replace(/\\s+/g, ' ').trim();
-  t = t.replace(/(.)\\1{2,}/g, '$1');
+  t = t.replace(/0/g, 'o').replace(/1/g, 'i').replace(/3/g, 'e').replace(/4/g, 'a').replace(/5/g, 's').replace(/7/g, 't').replace(/\$/g, 's').replace(/@/g, 'a');
+  t = t.replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  t = t.replace(/(.)\1{2,}/g, '$1');
   return t;
 }
 export function hasDirtyWord(text) {
   const norm = normalizeText(text);
   const nospace = norm.replace(/ /g, '');
-  return DIRTY_WORDS.some(w => new RegExp('\\\\b' + w + '\\\\b').test(norm) || nospace.includes(w));
+  return DIRTY_WORDS.some(w => new RegExp('\\b' + w + '\\b').test(norm) || nospace.includes(w));
 }
 export const JUDOL_PATTERNS = ['judol', 'judi', 'judi online', 'judi slot', 'judi bola', 'situs judi', 'situs slot', 'situs slot gacor', 'situs togel', 'situs gacor', 'slot gacor', 'slot online', 'slot88', 'togel88', 'gacor', 'gacor hari ini', 'jam gacor', 'jam hoki', 'maxwin', 'togel', 'bandar togel', 'agen togel', 'agen slot', 'prediksi togel', 'bocoran slot', 'bocoran pola', 'pola slot', 'pola gacor', 'pola turbo', 'pola malam', 'rtp slot', 'rtp live', 'rtp gacor', 'link gacor', 'link alternatif', 'daftar slot', 'daftar sekarang', 'mix parlay', 'parlay', 'scatter', 'free spin', 'bonus deposit', 'bonus new member', 'bonus besar', 'win rate', 'deposit pulsa', 'deposit dana', 'cashback', 'bit.ly', 'tinyurl', 'linktr.ee'];
 export function hasJudol(text) {
@@ -40,7 +40,7 @@ export function hasJudol(text) {
 }
 
 export function hasLink(text) {
-  return /(https?:\\/\\/|www\\.)/i.test(String(text || ''));
+  return /(https?:\/\/|www\.)/i.test(String(text || ''));
 }
 
 export const pluginDefs = [
@@ -49,7 +49,7 @@ export const pluginDefs = [
     name: 'Waktu Baca',
     description: 'Menampilkan perkiraan menit baca di bawah judul post.',
     postMeta: (post) => {
-      const words = String(post.body || '').trim().split(/\\s+/).filter(Boolean).length;
+      const words = String(post.body || '').trim().split(/\s+/).filter(Boolean).length;
       const minutes = Math.max(1, Math.round(words / 200));
       return ` · ±${minutes} menit baca`;
     },
