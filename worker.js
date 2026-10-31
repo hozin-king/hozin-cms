@@ -32,6 +32,37 @@ import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, v
 import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle } from './store.js';
 import { editorCard } from './editor.js';
 import { hasLink, hasDirtyWord, hasJudol } from './plugins.js';
+// Balasan otomatis komentar (perintah pemilik 31 Okt 2026): model TEKS Dahono
+// gratis saja (dahono/auto, chat completions). BUKAN S3, bukan model gambar/video.
+// Pemicu: admin menyetujui komentar komentator (bukan saat komentar masuk, karena
+// komentar masuk berstatus pending dan belum tampil). Satu komentar = maks 1 balasan,
+// nama jelas bot (bukan Admin), tidak membalas balasan bot sendiri, dan kegagalan
+// Dahono TIDAK PERNAH menggagalkan persetujuan komentar (fail-silent).
+// Kunci WAJIB secret Worker DAHONO_API_KEY — jangan pernah ditulis di kode/repo
+// (repo ini publik). Toggle di Pengaturan: auto_reply_enabled ('1' = aktif).
+const AUTO_REPLY_BOT_NAME = 'Balasan Otomatis';
+async function generateAutoReply(env, postTitle, commentText) {
+  try {
+    if (!env.DAHONO_API_KEY) return null;
+    const res = await fetch('https://gateway.dahono.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + env.DAHONO_API_KEY },
+      body: JSON.stringify({
+        model: 'dahono/auto',
+        messages: [
+          { role: 'system', content: 'Kamu asisten balasan komentar blog berbahasa Indonesia. Balas sopan, singkat (maksimal 2 kalimat), nyambung ke isi komentar, jangan mengarang fakta, jangan beri link, jangan promosi.' },
+          { role: 'user', content: 'Judul post: ' + String(postTitle || '') + '\nKomentar: ' + String(commentText || '') },
+        ],
+        temperature: 0.7,
+        max_tokens: 160,
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const text = String(data?.choices?.[0]?.message?.content || '').trim();
+    return text ? text.slice(0, 500) : null;
+  } catch (e) { return null; }
+}
 const ADSENSE_CSP = "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://pagead2.googlesyndication.com; frame-src https://googleads.g.doubleclick.net https://tpc.googlesyndication.com https://pagead2.googlesyndication.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
 
 
@@ -654,7 +685,7 @@ async function handleFetch(request, env) {
       }
       if (path === '/kendali/settings') {
         const envTitle = envSiteTitle(env);
-        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText, adsenseClient, adsenseSlot, imgbbKeys] = await Promise.all([
+        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText, adsenseClient, adsenseSlot, imgbbKeys, autoReplyEnabled] = await Promise.all([
           getSetting(env, 'theme', 'terang'),
           envTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
           getSetting(env, 'site_avatar', ''),
@@ -664,10 +695,11 @@ async function handleFetch(request, env) {
           getSetting(env, 'adsense_client', ''),
           getSetting(env, 'adsense_slot', ''),
           getImgbbKeys(env),
+          getSetting(env, 'auto_reply_enabled', '0'),
         ]);
         const siteTitle = envTitle || siteTitleDb;
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
-        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Upload Gambar via ImgBB — banyak kunci</h3><p>Upload memilih satu kunci secara acak, kalau gagal otomatis coba kunci lain. Status di bawah dari upload terakhir, bukan ping live: 🟢 = upload terakhir berhasil, 🔴 = gagal terakhir, ⚪ = belum pernah dicoba. Kunci tidak pernah tampil penuh, hanya 4 karakter awal + akhir.</p>${imgbbKeys.length ? imgbbKeys.map((e, i) => `<p>${keyDot(e)} Kunci ${i + 1}: ${esc(maskKey(e.k))}${e.ok ? ` · terakhir berhasil ${esc(String(e.ok).slice(0, 16))}` : ''}${e.fail ? ` · terakhir gagal ${esc(String(e.fail).slice(0, 16))}${e.fail_reason ? ` (${esc(e.fail_reason)})` : ''}` : ''} <form method="post" action="/kendali/imgbb/delete" style="display:inline">${csrfField}<input type="hidden" name="index" value="${i}"><button type="submit">Hapus</button></form></p>`).join('') : '<p>Belum ada kunci ImgBB.</p>'}<form method="post" action="/kendali/imgbb/add">${csrfField}<label>Tambah kunci API ImgBB baru (dari imgbb.com, menu API)</label><input type="password" name="new_key" autocomplete="new-password" placeholder="tempel kunci baru di sini"><button type="submit">Tambah Kunci</button></form></div>`;
+        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><h4>Balasan Otomatis Komentar (model teks Dahono gratis)</h4><p>Kalau aktif, saat admin menyetujui komentar komentator, Worker meminta balasan singkat ke Dahono lalu menyimpannya sebagai balasan atas nama “Balasan Otomatis” (1 balasan per komentar, tidak membalas balasan bot). Kunci Dahono WAJIB secret Worker <code>DAHONO_API_KEY</code> — bukan kolom ini, dan tidak pernah ditulis di repo. Status secret: <b>${env.DAHONO_API_KEY ? 'sudah diset' : 'belum diset — balasan tidak akan terkirim sampai secret diset'}</b>.</p><label><input type="checkbox" name="auto_reply" value="1" ${autoReplyEnabled === '1' ? 'checked' : ''}> Aktifkan balasan otomatis</label><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Upload Gambar via ImgBB — banyak kunci</h3><p>Upload memilih satu kunci secara acak, kalau gagal otomatis coba kunci lain. Status di bawah dari upload terakhir, bukan ping live: 🟢 = upload terakhir berhasil, 🔴 = gagal terakhir, ⚪ = belum pernah dicoba. Kunci tidak pernah tampil penuh, hanya 4 karakter awal + akhir.</p>${imgbbKeys.length ? imgbbKeys.map((e, i) => `<p>${keyDot(e)} Kunci ${i + 1}: ${esc(maskKey(e.k))}${e.ok ? ` · terakhir berhasil ${esc(String(e.ok).slice(0, 16))}` : ''}${e.fail ? ` · terakhir gagal ${esc(String(e.fail).slice(0, 16))}${e.fail_reason ? ` (${esc(e.fail_reason)})` : ''}` : ''} <form method="post" action="/kendali/imgbb/delete" style="display:inline">${csrfField}<input type="hidden" name="index" value="${i}"><button type="submit">Hapus</button></form></p>`).join('') : '<p>Belum ada kunci ImgBB.</p>'}<form method="post" action="/kendali/imgbb/add">${csrfField}<label>Tambah kunci API ImgBB baru (dari imgbb.com, menu API)</label><input type="password" name="new_key" autocomplete="new-password" placeholder="tempel kunci baru di sini"><button type="submit">Tambah Kunci</button></form></div>`;
         return html(await renderPage(env, 'Pengaturan', content, { siteTitle, themeId }));
       }
       if (path === '/kendali/sessions') {
@@ -853,6 +885,7 @@ async function handleFetch(request, env) {
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_text', ?)`).bind(adText).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_client', ?)`).bind(adsenseClient).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_slot', ?)`).bind(adsenseSlot).run();
+        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('auto_reply_enabled', ?)`).bind(String(form.get('auto_reply') || '') === '1' ? '1' : '0').run();
         const retS = String(form.get('return_to') || '');
         return redirect(retS.startsWith('/kendali/') ? retS : '/kendali/settings');
       }
@@ -944,7 +977,27 @@ async function handleFetch(request, env) {
         return redirect('/kendali/posts');
       }
       if (path === '/kendali/comments/approve') {
-        await env.DB.prepare(`UPDATE cms_comments SET status = 'approved' WHERE id = ?`).bind(Number(form.get('id'))).run();
+        const cid = Number(form.get('id'));
+        const comment = cid ? await env.DB.prepare(`SELECT * FROM cms_comments WHERE id = ?`).bind(cid).first() : null;
+        // Tangkap status SEBELUM update: objek hasil first() bisa berupa
+        // referensi yang ikut berubah saat UPDATE (mock lokal), jadi jangan
+        // baca comment.status lagi setelah update.
+        const wasPending = !!(comment && comment.status !== 'approved');
+        await env.DB.prepare(`UPDATE cms_comments SET status = 'approved' WHERE id = ?`).bind(cid).run();
+        // Balasan otomatis: hanya komentar komentator yang baru disetujui
+        // (bukan yang sudah approved, bukan balasan, bukan balasan bot).
+        // Kegagalan di sini tidak boleh menggagalkan persetujuan di atas.
+        try {
+          if (comment && wasPending && !comment.parent_id && comment.name !== AUTO_REPLY_BOT_NAME && (await getSetting(env, 'auto_reply_enabled', '0')) === '1') {
+            const allCm = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
+            const already = (allCm.results || []).some(c => Number(c.parent_id) === cid && c.name === AUTO_REPLY_BOT_NAME);
+            if (!already) {
+              const post = comment.post_id ? await env.DB.prepare(`SELECT * FROM cms_posts WHERE id = ?`).bind(comment.post_id).first() : null;
+              const reply = await generateAutoReply(env, post ? post.title : '', comment.text);
+              if (reply) await env.DB.prepare(`INSERT INTO cms_comments (post_id, name, text, status, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?)`).bind(comment.post_id, AUTO_REPLY_BOT_NAME, reply, 'approved', new Date().toISOString(), cid).run();
+            }
+          }
+        } catch (e) {}
         return redirect('/kendali/comments');
       }
       if (path === '/kendali/comments/delete') {
