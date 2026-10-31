@@ -83,20 +83,30 @@ export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply
     const replyForm = canReply
       ? `<form method="post" action="/post/${esc(postSlug)}/comment" style="margin-top:8px"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="parent_id" value="${c.id}"><textarea name="text" maxlength="2000" placeholder="Balas ${esc(c.name)}…" required></textarea><button type="submit">Balas</button></form>`
       : '';
+    // Ikon vote buatan sendiri (SVG, bukan emoji): jempol atas/bawah gaya
+    // YouTube — angka Suka tampil, angka Tidak Suka DISEMBUNYIKAN (tetap
+    // tercatat di database dan tombolnya tetap bisa dipakai).
+    const thumbUp = '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="vertical-align:-3px"><path d="M1 21h4V9H1v12zM23 10c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z"/></svg>';
+    const thumbDown = '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="vertical-align:-3px"><g transform="translate(0,24) scale(1,-1)"><path d="M1 21h4V9H1v12zM23 10c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z"/></g></svg>';
     const voteForms = canReply
-      ? `<form method="post" action="/post/${esc(postSlug)}/comment/vote" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="1"><button type="submit">${mine === 1 ? '<b>👍 ' + v.like + '</b>' : '👍 ' + v.like}</button></form> <form method="post" action="/post/${esc(postSlug)}/comment/vote" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="-1"><button type="submit">${mine === -1 ? '<b>👎 ' + v.dislike + '</b>' : '👎 ' + v.dislike}</button></form>`
-      : `<span>👍 ${v.like} · 👎 ${v.dislike}</span>`;
+      ? `<form method="post" action="/post/${esc(postSlug)}/comment/vote" class="vote-form" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="1"><button type="submit" data-vote="like" data-count="${v.like}" aria-label="Suka" aria-pressed="${mine === 1}">${thumbUp} <span>${v.like}</span></button></form> <form method="post" action="/post/${esc(postSlug)}/comment/vote" class="vote-form" style="display:inline"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><input type="hidden" name="vote" value="-1"><button type="submit" data-vote="dislike" aria-label="Tidak suka" aria-pressed="${mine === -1}">${thumbDown}</button></form>`
+      : `<span>${thumbUp} ${v.like} · ${thumbDown}</span>`;
     const kids = (byParent.get(String(c.id)) || []).map(k => renderOne(k, depth + 1)).join('');
     const displayText = maskDirty ? maskDirtyWords(c.text) : c.text;
     const pinLabel = Number(c.pinned) === 1 ? '<p><b>📌 Disematkan</b></p>' : '';
-    // Edit di halaman post hanya untuk pemilik komentar (komentator).
-    // Admin edit lewat /kendali/comments, supaya halaman post yang dibuka
-    // admin tidak ikut menampilkan teks asli yang sedang disensor filter.
-    const canEdit = !viewer.isAdmin && viewer.username && c.name === viewer.username;
-    const editForm = canEdit
-      ? `<details><summary>Edit komentar</summary><form method="post" action="/post/${esc(postSlug)}/comment/edit"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><textarea name="text" maxlength="2000" required>${esc(c.text)}</textarea><button type="submit">Simpan Edit</button></form>'<p>Komentar yang diedit kembali menunggu persetujuan admin.</p>'</details>`
+    // Edit + hapus langsung dari halaman post, sesuai peran:
+    // - Admin: komentar siapa pun (peran tertinggi).
+    // - Komentator: hanya komentarnya sendiri.
+    // - Pengunjung / komentator lain: tidak ada tombolnya sama sekali.
+    // Edit komentator kembali pending; edit admin langsung tampil.
+    const canManage = Boolean(viewer.isAdmin || (viewer.username && c.name === viewer.username));
+    const editForm = canManage
+      ? `<details><summary>Edit komentar</summary><form method="post" action="/post/${esc(postSlug)}/comment/edit"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><textarea name="text" maxlength="2000" required>${esc(c.text)}</textarea><button type="submit">Simpan Edit</button></form>${viewer.isAdmin ? '' : '<p>Komentar yang diedit kembali menunggu persetujuan admin.</p>'}</details>`
       : '';
-    return `<div class="card" style="margin-left:${indent}px">${pinLabel}<p><b>${esc(c.name)}</b></p><p>${esc(displayText)}</p><p>${voteForms}</p>${editForm}${replyForm}${kids}</div>`;
+    const deleteForm = canManage
+      ? `<details><summary>Hapus komentar</summary><form method="post" action="/post/${esc(postSlug)}/comment/delete"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><p>Komentar ini akan dihapus permanen.</p><button type="submit">Hapus Permanen</button></form></details>`
+      : '';
+    return `<div class="card" style="margin-left:${indent}px">${pinLabel}<p><b>${esc(c.name)}</b></p><p>${esc(displayText)}</p><p>${voteForms}</p>${editForm}${deleteForm}${replyForm}${kids}</div>`;
   };
   // Komentar yang induknya sudah dihapus diperlakukan sebagai komentar utama,
   // supaya tidak hilang diam-diam.
@@ -106,5 +116,9 @@ export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply
   }
   // Disematkan dulu (ala YouTube: 1 per post, paling atas), lalu terlama dulu.
   roots.sort((a, b) => (Number(b.pinned || 0) - Number(a.pinned || 0)) || String(a.created_at || '').localeCompare(String(b.created_at || '')));
-  return roots.map(c => renderOne(c, 0)).join('') || '<p>Belum ada komentar.</p>';
+  // Vote TANPA reload: form vote dicegat JS, kirim fetch, angka Suka di-update
+  // di tempat. Kalau JS mati / fetch gagal, form dikirim biasa (reload) —
+  // jadi vote tidak pernah hilang gara-gara script ini.
+  const voteScript = `<script>(function(){if(window.__cmsVoteAjax)return;window.__cmsVoteAjax=1;document.addEventListener('submit',async function(e){var f=e.target;if(!f.classList||!f.classList.contains('vote-form'))return;e.preventDefault();var btn=f.querySelector('button');if(!btn||btn.disabled)return;btn.disabled=true;try{var res=await fetch(f.action,{method:'POST',headers:{'X-Requested-With':'fetch'},body:new FormData(f)});if(!res.ok)throw new Error('vote gagal');var d=await res.json();var wrap=f.parentElement;var likeBtn=wrap&&wrap.querySelector('button[data-vote="like"]');var disBtn=wrap&&wrap.querySelector('button[data-vote="dislike"]');if(likeBtn){var sp=likeBtn.querySelector('span');if(sp)sp.textContent=d.like;likeBtn.setAttribute('data-count',d.like);likeBtn.setAttribute('aria-pressed',d.mine===1);}if(disBtn)disBtn.setAttribute('aria-pressed',d.mine===-1);}catch(err){f.submit();}finally{btn.disabled=false;}});})();<\/script>`;
+  return (roots.map(c => renderOne(c, 0)).join('') || '<p>Belum ada komentar.</p>') + voteScript;
 }

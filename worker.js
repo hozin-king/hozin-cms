@@ -433,6 +433,40 @@ async function handleFetch(request, env) {
           await env.DB.prepare(`INSERT INTO cms_comment_votes (comment_id, user_key, vote) VALUES (?, ?, ?)`).bind(commentId, myKey, vote).run();
         }
       }
+      // Vote AJAX (dari script di halaman post): balas JSON, bukan redirect,
+      // supaya halaman tidak reload. Form biasa (tanpa header ini) tetap redirect.
+      if (request.headers.get('x-requested-with') === 'fetch' && meta && comment) {
+        const rows = await env.DB.prepare(`SELECT vote FROM cms_comment_votes WHERE comment_id = ?`).bind(commentId).all();
+        let like = 0, dislike = 0, mine = 0;
+        for (const r of (rows.results || [])) {
+          if (Number(r.vote) === 1) like++; else if (Number(r.vote) === -1) dislike++;
+        }
+        const myRow = await env.DB.prepare(`SELECT vote FROM cms_comment_votes WHERE comment_id = ? AND user_key = ?`).bind(commentId, myKey).first();
+        if (myRow) mine = Number(myRow.vote);
+        return new Response(JSON.stringify({ like, dislike, mine }), { headers: { 'Content-Type': 'application/json' } });
+      }
+      return redirect(`/post/${slug}`);
+    }
+
+    // ---- Hapus komentar langsung dari halaman post ----
+    // Admin: komentar siapa pun. Komentator: hanya komentarnya sendiri.
+    // Selain itu: dialihkan kembali (tidak ada tombolnya di halaman).
+    const deleteMatch = path.match(/^\/(?:p|post)\/([A-Za-z0-9-]+)\/comment\/delete$/);
+    if (deleteMatch && request.method === 'POST') {
+      const slug = deleteMatch[1];
+      if (!admin && !commenter) return redirect('/akun?pesan=login');
+      const form = await request.formData();
+      const csrfNeed = admin ? await csrfToken(env) : await userCsrf(env, commenter.id);
+      if (String(form.get('csrf') || '') !== csrfNeed) {
+        return html(await renderPage(env, 'Komentar', '<div class="card"><p>Token tidak valid.</p></div>'), 403);
+      }
+      const commentId = Number(form.get('comment_id') || 0);
+      const meta = await env.DB.prepare(`SELECT id FROM cms_posts WHERE slug = ?`).bind(slug).first();
+      const comment = commentId ? await env.DB.prepare(`SELECT * FROM cms_comments WHERE id = ?`).bind(commentId).first() : null;
+      if (meta && comment && String(comment.post_id) === String(meta.id) && (admin || comment.name === commenter.username)) {
+        await env.DB.prepare(`DELETE FROM cms_comment_votes WHERE comment_id = ?`).bind(commentId).run();
+        await env.DB.prepare(`DELETE FROM cms_comments WHERE id = ?`).bind(commentId).run();
+      }
       return redirect(`/post/${slug}`);
     }
 
