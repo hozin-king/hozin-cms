@@ -1,5 +1,5 @@
 // Content WorkerCMS — visibilitas post, kartu post, dan pohon komentar.
-import { esc, stripTags } from './util.js';
+import { esc, stripTags, parseTags, tagSlug } from './util.js';
 import { maskDirtyWords } from './plugins.js';
 
 // Visibilitas post: 'public' (beranda + link), 'private' (hanya admin),
@@ -48,6 +48,14 @@ export function viewEye(views) {
   return '<span class="view-eye" aria-label="Dilihat"><svg viewBox="0 0 32 28" fill="none" aria-hidden="true"><g class="eye-blink"><path d="M2 14 Q16 2 30 14 Q16 26 2 14 Z" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/><circle cx="16" cy="14" r="7" fill="#3b82f6"/><circle cx="16" cy="14" r="3.5" fill="#0b1220"/><circle cx="18" cy="11.5" r="1.3" fill="#ffffff"/></g></svg></span> ' + views;
 }
 
+// Tag: tampil sebagai link ke arsip /tag/<slug>. Nama tag selalu di-escape,
+// slug selalu lewat tagSlug, jadi tag berisi markup tidak bisa jadi HTML.
+export function tagLinks(post) {
+  const tags = parseTags(post.tags || '');
+  if (!tags.length) return '';
+  return 'Tag: ' + tags.map(t => `<a href="/tag/${esc(tagSlug(t))}">${esc(t)}</a>`).join(', ');
+}
+
 export function postCard(post, plugins, isAdmin = false) {
   const meta = plugins.map(p => p.postMeta ? p.postMeta(post) : '').join('');
   // Cuplikan selalu dari teks polos (tag HTML post dibuang), jadi cuplikan
@@ -64,7 +72,8 @@ export function postCard(post, plugins, isAdmin = false) {
   const editLink = isAdmin
     ? ` · <a href="/kendali/posts/edit?id=${esc(post.id)}">Edit</a>`
     : '';
-  return `<article class="card">${cover}<h2><a href="/post/${esc(post.slug)}">${esc(post.title)}</a></h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${meta}</p><p>${esc(plain.slice(0, 200))}${plain.length > 200 ? '…' : ''}</p><p><a class="read-more" href="/post/${esc(post.slug)}">Selengkapnya →</a>${editLink}</p></article>`;
+  const tags = tagLinks(post);
+  return `<article class="card">${cover}<h2><a href="/post/${esc(post.slug)}">${esc(post.title)}</a></h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${meta}</p>${tags ? `<p class="meta">${tags}</p>` : ''}<p>${esc(plain.slice(0, 200))}${plain.length > 200 ? '…' : ''}</p><p><a class="read-more" href="/post/${esc(post.slug)}">Selengkapnya →</a>${editLink}</p></article>`;
 }
 
 // Pohon komentar: balasan menempel di bawah induknya, indent dibatasi

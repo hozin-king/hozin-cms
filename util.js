@@ -10,6 +10,26 @@ export function para(text) {
 export function slugify(title) {
   return String(title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'post';
 }
+// Tag post: disimpan sebagai satu string dipisah koma di kolom cms_posts.tags.
+// Normalisasi: potong spasi, buang yang kosong/terlalu panjang, dedup
+// (tak peduli huruf besar-kecil, pertahankan ejaan pertama), maks 10 tag.
+export function parseTags(raw) {
+  const seen = new Set();
+  const out = [];
+  for (const part of String(raw || '').split(',')) {
+    const t = part.trim();
+    if (!t || t.length > 30) continue;
+    const key = t.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+export function tagSlug(tag) {
+  return slugify(tag);
+}
 export function html(body, status = 200, headers = {}) {
   return new Response(body, { status, headers: {
     'content-type': 'text/html; charset=utf-8',

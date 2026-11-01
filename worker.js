@@ -25,10 +25,10 @@
 // Situs lama yang ada di root harus dipindah ke subdomain dulu bila root mau jadi CMS ini.
 import { themes } from './themes.js';
 import { pluginDefs } from './plugins.js';
-import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex } from './util.js';
+import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex, parseTags, tagSlug } from './util.js';
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie } from './auth.js';
 import { checkRateLimit } from './security.js';
-import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye } from './content.js';
+import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
 import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle } from './store.js';
 import { editorCard } from './editor.js';
 import { hasLink, hasDirtyWord, hasJudol } from './plugins.js';
@@ -233,6 +233,24 @@ async function handleFetch(request, env) {
       return html(await renderPage(env, 'Beranda', content), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
     }
 
+    // ---- Publik: arsip tag (hanya post publik yang sudah terbit) ----
+    // Tag dicocokkan di JS lewat tagSlug, bukan LIKE SQL, supaya tag
+    // "hp" tidak ikut menarik post bertag "hape" atau sejenisnya.
+    const tagMatch = path.match(/^\/tag\/([A-Za-z0-9-]+)$/);
+    if (request.method === 'GET' && tagMatch) {
+      const wanted = tagMatch[1];
+      const [rows, plugins] = await Promise.all([
+        env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(nowIso).all(),
+        getEnabledPlugins(env),
+      ]);
+      const matched = (rows.results || []).filter(p => parseTags(p.tags || '').some(t => tagSlug(t) === wanted));
+      const label = matched.length ? parseTags(matched[0].tags || '').find(t => tagSlug(t) === wanted) || wanted : wanted;
+      const content = `<h2>Tag: ${esc(label)}</h2>` + (matched.length
+        ? matched.map(p => postCard(p, plugins, admin)).join('')
+        : '<div class="card"><p>Belum ada post dengan tag ini.</p></div>') + `<p><a href="/">← Beranda</a></p>`;
+      return html(await renderPage(env, 'Tag: ' + label, content), 200);
+    }
+
     // ---- Post terkunci: buka kunci (rate-limit per IP + post) ----
     const unlockMatch = path.match(/^\/(?:p|post)\/([A-Za-z0-9-]+)\/unlock$/);
     if (unlockMatch && request.method === 'POST') {
@@ -343,7 +361,8 @@ async function handleFetch(request, env) {
           : '';
         const views = Number(post.views) || 0;
         const bodyHtml = post.body_mode === 'html' ? sanitizeHtml(post.body) : para(post.body);
-        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${metaHtml}</p>${bodyHtml}</article>${adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
+        const detailTags = tagLinks(post);
+        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${metaHtml}</p>${detailTags ? `<p class="meta">${detailTags}</p>` : ''}${bodyHtml}</article>${adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
         const res = html(await renderPage(env, post.title, content), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
         if (viewCookie) {
           const h = new Headers(res.headers);
@@ -696,7 +715,7 @@ async function handleFetch(request, env) {
         return html(await renderPage(env, 'Plugin', content));
       }
       if (path === '/kendali/super') {
-        const [siteTitleS, themeS, imgbbS, adsenseS, usersN, postsN, pluginsS, pcbActive, pcbMsg] = await Promise.all([
+        const [siteTitleS, themeS, imgbbS, adsenseS, usersN, postsN, pluginsS, pcbActive, pcbMsg, viewEventsS] = await Promise.all([
           getSetting(env, 'site_title', 'WorkerCMS'),
           getSetting(env, 'theme', 'terang'),
           getImgbbKeys(env).then(a => a.length),
@@ -706,6 +725,7 @@ async function handleFetch(request, env) {
           getEnabledPlugins(env),
           getSetting(env, 'pcbuilder_event_active', '0'),
           getSetting(env, 'pcbuilder_event_text', ''),
+          env.DB.prepare(`SELECT post_id, viewed_at FROM cms_view_events ORDER BY viewed_at DESC`).all(),
         ]);
         // Hitung pending dari daftar komentar (lebih andal di semua DB daripada COUNT mock)
         const allCm = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
@@ -714,7 +734,46 @@ async function handleFetch(request, env) {
           const on = pluginsS.some(pp => pp.id === pd.id);
           return `<p>${esc(pd.name)}: <b>${on ? 'Aktif' : 'Nonaktif'}</b> <form method="post" action="/kendali/plugins/toggle" style="display:inline">${csrfField}<input type="hidden" name="id" value="${pd.id}"><input type="hidden" name="enabled" value="${on ? '0' : '1'}"><input type="hidden" name="return_to" value="/kendali/super"><button type="submit">${on ? 'Nonaktifkan' : 'Aktifkan'}</button></form></p>`;
         }).join('');
-        const content = `<h2>Super Panel</h2>${nav}<div class="card"><h3>Situs</h3><p>Judul: <b>${esc(envSiteTitle(env) || siteTitleS)}</b> · Tema: ${esc(themeS)} · ImgBB: ${imgbbS} kunci · AdSense: ${adsenseS ? 'sudah diset' : 'belum diset'}</p><form method="post" action="/kendali/settings">${csrfField}<input type="hidden" name="return_to" value="/kendali/super"><label>Judul situs</label><input name="site_title" value="${esc(envSiteTitle(env) || siteTitleS)}"><label>Tema</label><select name="theme">${Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeS ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select><button type="submit">Simpan Judul & Tema</button></form><p><a href="/kendali/settings">Pengaturan lengkap (foto profil, iklan, AdSense, kunci ImgBB)</a></p></div><div class="card"><h3>Komentar & Keamanan</h3><p>${pendingCount} komentar menunggu · ${(usersN.results || []).length} akun komentator · ${(postsN.results || []).length} post · <a href="/kendali/comments">Moderasi Komentar</a> · <a href="/kendali/users">Akun</a></p>${pluginList}<p><a href="/kendali/plugins">Semua plugin</a> · <a href="/kendali/backup">Backup</a> · <a href="/kendali/sessions">Sesi</a></p></div><div class="card"><h3>Event PC Builder (game)</h3><p>Status: <b>${pcbActive === '1' ? 'Aktif — game memberi diskon 10%' : 'Nonaktif — game tidak memberi diskon'}</b></p><p>Game v1.0.3 hanya membaca on/off diskon dari endpoint ini; pesan kustom di bawah hanya catatan admin, belum tampil di game.</p><form method="post" action="/kendali/super/pcbuilder">${csrfField}<label>Event aktif?</label><select name="pcbuilder_active"><option value="1" ${pcbActive === '1' ? 'selected' : ''}>Aktif (diskon 10%)</option><option value="0" ${pcbActive !== '1' ? 'selected' : ''}>Nonaktif</option></select><label>Pesan event (catatan admin, maks 200 karakter)</label><input name="pcbuilder_message" value="${esc(pcbMsg)}" placeholder="mis. Event akhir pekan"><button type="submit">Simpan Event PC Builder</button></form><p>Endpoint game: <code>/api/pcbuilder-events</code></p></div>`;
+        // Traffic lengkap (Super Panel): total dari counter post (mencakup
+        // views lama sebelum riwayat harian ada), sedangkan per-hari/per-post
+        // 7/30 hari dihitung dari cms_view_events yang baru dicatat sejak
+        // rilis dashboard 30 Okt 2026 — jadi angka harian bisa lebih kecil
+        // dari total, dan itu dijelaskan di kartu, bukan disembunyikan.
+        const trafficEvents = viewEventsS.results || [];
+        const wibDay = ms => new Date(ms + 7 * 3600 * 1000).toISOString().slice(0, 10);
+        const nowTraffic = Date.now();
+        const todayTraffic = wibDay(nowTraffic);
+        const yesterdayTraffic = wibDay(nowTraffic - 24 * 3600 * 1000);
+        const trafficTotal = (postsN.results || []).reduce((a, p) => a + (Number(p.views) || 0), 0);
+        const perDayTraffic = new Map();
+        const perPostTraffic = new Map();
+        for (const e of trafficEvents) {
+          const d = wibDay(new Date(String(e.viewed_at || '')).getTime());
+          if (!d || d === 'NaN-NaN-NaN') continue;
+          perDayTraffic.set(d, (perDayTraffic.get(d) || 0) + 1);
+          const key = String(e.post_id);
+          const cur = perPostTraffic.get(key) || { total: 0, d7: 0, d30: 0, today: 0 };
+          cur.total += 1;
+          if (d === todayTraffic) cur.today += 1;
+          const ageDays = (nowTraffic - new Date(String(e.viewed_at || '')).getTime()) / (24 * 3600 * 1000);
+          if (ageDays < 7) cur.d7 += 1;
+          if (ageDays < 30) cur.d30 += 1;
+          perPostTraffic.set(key, cur);
+        }
+        const traffic7 = [...perDayTraffic.entries()].filter(([d]) => (nowTraffic - new Date(d + 'T00:00:00+07:00').getTime()) / (24 * 3600 * 1000) < 7).reduce((a, [, n]) => a + n, 0);
+        const traffic30 = [...perDayTraffic.entries()].filter(([d]) => (nowTraffic - new Date(d + 'T00:00:00+07:00').getTime()) / (24 * 3600 * 1000) < 30).reduce((a, [, n]) => a + n, 0);
+        const dayRows = [];
+        for (let i = 0; i < 30; i++) {
+          const d = wibDay(nowTraffic - i * 24 * 3600 * 1000);
+          dayRows.push(`<p>${d} — <b>${perDayTraffic.get(d) || 0}</b> views</p>`);
+        }
+        const byPostId = new Map((postsN.results || []).map(p => [String(p.id), p]));
+        const postTrafficRows = [...(postsN.results || [])].sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0)).map(p => {
+          const t = perPostTraffic.get(String(p.id)) || { total: 0, d7: 0, d30: 0, today: 0 };
+          return `<p><a href="/post/${esc(p.slug)}">${esc(p.title)}</a> — total <b>${Number(p.views) || 0}</b> · hari ini ${t.today} · 7 hari ${t.d7} · 30 hari ${t.d30}</p>`;
+        }).join('') || '<p>Belum ada post.</p>';
+        const trafficCard = `<div class="card"><h3>Traffic Lengkap</h3><p><b>${trafficTotal} views total</b> (counter post) · hari ini (WIB) ${perDayTraffic.get(todayTraffic) || 0} · kemarin ${perDayTraffic.get(yesterdayTraffic) || 0} · 7 hari ${traffic7} · 30 hari ${traffic30}</p><p>Catatan: angka per-hari dan per-post 7/30 hari hanya dari riwayat views yang dicatat sejak 30 Okt 2026. Views lama sebelum tanggal itu hanya ada di total counter, tidak bisa dipecah per hari.</p><h4>Per Hari (30 hari terakhir, WIB)</h4>${dayRows.join('')}<h4>Per Post (semua post, urut total tertinggi)</h4>${postTrafficRows}</div>`;
+        const content = `<h2>Super Panel</h2>${nav}<div class="card"><h3>Situs</h3><p>Judul: <b>${esc(envSiteTitle(env) || siteTitleS)}</b> · Tema: ${esc(themeS)} · ImgBB: ${imgbbS} kunci · AdSense: ${adsenseS ? 'sudah diset' : 'belum diset'}</p><form method="post" action="/kendali/settings">${csrfField}<input type="hidden" name="return_to" value="/kendali/super"><label>Judul situs</label><input name="site_title" value="${esc(envSiteTitle(env) || siteTitleS)}"><label>Tema</label><select name="theme">${Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeS ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select><button type="submit">Simpan Judul & Tema</button></form><p><a href="/kendali/settings">Pengaturan lengkap (foto profil, iklan, AdSense, kunci ImgBB)</a></p></div><div class="card"><h3>Komentar & Keamanan</h3><p>${pendingCount} komentar menunggu · ${(usersN.results || []).length} akun komentator · ${(postsN.results || []).length} post · <a href="/kendali/comments">Moderasi Komentar</a> · <a href="/kendali/users">Akun</a></p>${pluginList}<p><a href="/kendali/plugins">Semua plugin</a> · <a href="/kendali/backup">Backup</a> · <a href="/kendali/sessions">Sesi</a></p></div>${trafficCard}<div class="card"><h3>Event PC Builder (game)</h3><p>Status: <b>${pcbActive === '1' ? 'Aktif — game memberi diskon 10%' : 'Nonaktif — game tidak memberi diskon'}</b></p><p>Game v1.0.3 hanya membaca on/off diskon dari endpoint ini; pesan kustom di bawah hanya catatan admin, belum tampil di game.</p><form method="post" action="/kendali/super/pcbuilder">${csrfField}<label>Event aktif?</label><select name="pcbuilder_active"><option value="1" ${pcbActive === '1' ? 'selected' : ''}>Aktif (diskon 10%)</option><option value="0" ${pcbActive !== '1' ? 'selected' : ''}>Nonaktif</option></select><label>Pesan event (catatan admin, maks 200 karakter)</label><input name="pcbuilder_message" value="${esc(pcbMsg)}" placeholder="mis. Event akhir pekan"><button type="submit">Simpan Event PC Builder</button></form><p>Endpoint game: <code>/api/pcbuilder-events</code></p></div>`;
         return html(await renderPage(env, 'Super Panel', content));
       }
       if (path === '/kendali/settings') {
@@ -927,6 +986,7 @@ async function handleFetch(request, env) {
         const title = String(form.get('title') || '').trim().slice(0, 200);
         let body = String(form.get('body') || '').trim();
         const category = String(form.get('category') || 'Umum').trim().slice(0, 80) || 'Umum';
+        const tags = parseTags(form.get('tags') || '').join(', ');
         const bodyMode = String(form.get('body_mode') || 'text') === 'html' ? 'html' : 'text';
         const visibilityRaw = String(form.get('visibility') || 'public');
         const visibility = ['public', 'private', 'unlisted', 'password'].includes(visibilityRaw) ? visibilityRaw : 'public';
@@ -952,7 +1012,7 @@ async function handleFetch(request, env) {
           let slug = slugify(title);
           const clash = await env.DB.prepare(`SELECT id FROM cms_posts WHERE slug = ?`).bind(slug).first();
           if (clash) slug = slug + '-' + Date.now().toString(36).slice(-4);
-          await env.DB.prepare(`INSERT INTO cms_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views) VALUES (?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?, 0)`).bind(id, slug, title, body, category, now, now, bodyMode, visibility, publishAt, pwHash, pwSalt).run();
+          await env.DB.prepare(`INSERT INTO cms_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views, tags) VALUES (?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?, 0, ?)`).bind(id, slug, title, body, category, now, now, bodyMode, visibility, publishAt, pwHash, pwSalt, tags).run();
         }
         return redirect('/kendali/posts');
       }
@@ -963,6 +1023,7 @@ async function handleFetch(request, env) {
         const title = String(form.get('title') || '').trim().slice(0, 200);
         let body = String(form.get('body') || '').trim();
         const category = String(form.get('category') || 'Umum').trim().slice(0, 80) || 'Umum';
+        const tags = parseTags(form.get('tags') || '').join(', ');
         const bodyMode = String(form.get('body_mode') || 'text') === 'html' ? 'html' : 'text';
         const visibilityRaw = String(form.get('visibility') || 'public');
         const visibility = ['public', 'private', 'unlisted', 'password'].includes(visibilityRaw) ? visibilityRaw : 'public';
@@ -992,7 +1053,7 @@ async function handleFetch(request, env) {
         if (bodyMode === 'html') body = sanitizeHtml(body).slice(0, 100000);
         else body = body.slice(0, 50000);
         if (title && body) {
-          await env.DB.prepare(`UPDATE cms_posts SET title = ?, body = ?, category = ?, updated_at = ?, body_mode = ?, visibility = ?, publish_at = ?, post_password_hash = ?, post_password_salt = ? WHERE id = ?`).bind(title, body, category, now, bodyMode, visibility, publishAt, pwHash, pwSalt, postId).run();
+          await env.DB.prepare(`UPDATE cms_posts SET title = ?, body = ?, category = ?, updated_at = ?, body_mode = ?, visibility = ?, publish_at = ?, post_password_hash = ?, post_password_salt = ?, tags = ? WHERE id = ?`).bind(title, body, category, now, bodyMode, visibility, publishAt, pwHash, pwSalt, tags, postId).run();
         }
         return redirect('/kendali/posts');
       }
