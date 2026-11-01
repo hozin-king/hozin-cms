@@ -17,7 +17,8 @@ function baseCss(def) {
     `@media (max-width:640px){header{padding:10px 12px}main{padding:12px 10px}.card{padding:14px}button,.read-more{min-height:44px}}` +
     `@media (min-width:641px) and (max-width:900px){main,footer{max-width:680px;padding:16px 18px}}` +
     `@media (min-width:901px){main,footer{max-width:${maxWidth + 40}px;padding:24px 20px}}` +
-    `footer{width:100%;max-width:${maxWidth}px;margin:0 auto;padding:20px 14px;color:${muted};font-size:13px;margin-top:auto;border-top:1px solid ${border}}`;
+    `footer{width:100%;max-width:${maxWidth}px;margin:0 auto;padding:20px 14px;color:${muted};font-size:13px;margin-top:auto;border-top:1px solid ${border}}` +
+    `.view-eye{display:inline-block;width:22px;height:20px;vertical-align:-5px}.view-eye svg{width:22px;height:20px;display:block}`;
 }
 function shell(css, def, siteTitle, pageTitle, content, siteAvatar, metaDesc = '') {
   const mark = String(siteTitle || 'W').trim().charAt(0).toUpperCase() || 'W';

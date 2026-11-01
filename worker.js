@@ -200,6 +200,46 @@ async function handleFetch(request, env) {
       return new Response(body, { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
     }
 
+    // ---- Laporan hasil load test (BUKAN jalur admin) ----
+    // Pengirim: aplikasi load test. Auth HANYA Bearer LOADTEST_TOKEN
+    // (secret Worker, bukan ADMIN_TOKEN): token ini tidak bisa login
+    // admin, tidak bisa ubah post, hanya bisa menitipkan hasil tes.
+    // Fail-closed: secret belum diset -> 503; token salah -> 401.
+    // Batas: body maks 20 KB, paths maks 20, path maks 200 karakter.
+    if (request.method === 'POST' && path === '/api/loadtest-results') {
+      const ltJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!env.LOADTEST_TOKEN) return ltJson({ ok: false, error: 'loadtest tidak dikonfigurasi' }, 503);
+      if (String(request.headers.get('authorization') || '') !== 'Bearer ' + env.LOADTEST_TOKEN) return ltJson({ ok: false, error: 'unauthorized' }, 401);
+      if (Number(request.headers.get('content-length') || '0') > 20480) return ltJson({ ok: false, error: 'payload terlalu besar' }, 413);
+      let data = null;
+      try {
+        const text = await request.text();
+        if (text.length > 20480) return ltJson({ ok: false, error: 'payload terlalu besar' }, 413);
+        data = JSON.parse(text);
+      } catch (e) { return ltJson({ ok: false, error: 'payload bukan JSON' }, 400); }
+      const bad = () => ltJson({ ok: false, error: 'payload tidak valid' }, 400);
+      const isRate = n => typeof n === 'number' && isFinite(n) && n >= 0 && n <= 1;
+      const isMs = n => typeof n === 'number' && isFinite(n) && n >= 0 && n <= 3600000;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return bad();
+      if (!Number.isInteger(data.vu) || data.vu < 1 || data.vu > 100000) return bad();
+      if (!Number.isInteger(data.duration_s) || data.duration_s < 1 || data.duration_s > 86400) return bad();
+      if (!isMs(data.p95_ms)) return bad();
+      if (!isRate(data.failed_rate)) return bad();
+      if (typeof data.passed !== 'boolean') return bad();
+      if (!Array.isArray(data.paths) || data.paths.length > 20) return bad();
+      for (const p of data.paths) {
+        if (!p || typeof p !== 'object' || Array.isArray(p)) return bad();
+        if (typeof p.path !== 'string' || !p.path || p.path.length > 200) return bad();
+        if (!Number.isInteger(p.status) || p.status < 100 || p.status > 599) return bad();
+        if (!isMs(p.p95_ms)) return bad();
+        if (!isRate(p.failed_rate)) return bad();
+        if (typeof p.checks_passed !== 'boolean') return bad();
+      }
+      const id = 'lt-' + Date.now().toString(36) + '-' + randomHex(6);
+      await env.DB.prepare(`INSERT INTO cms_loadtest_runs (id, created_at, vu, duration_s, p95_ms, failed_rate, passed, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, new Date().toISOString(), data.vu, data.duration_s, data.p95_ms, data.failed_rate, data.passed ? 1 : 0, JSON.stringify(data.paths)).run();
+      return ltJson({ ok: true, id }, 201);
+    }
+
     // ---- Publik: beranda (hanya post publik yang sudah terbit) ----
     if (request.method === 'GET' && path === '/') {
       // Anti overload: 10 post per halaman, ambil 11 untuk tahu ada halaman
@@ -312,8 +352,10 @@ async function handleFetch(request, env) {
         if (!post || post.status !== 'published') return html(await renderPage(env, 'Tidak ditemukan', '<div class="card"><p>Post tidak ditemukan.</p></div>'), 404);
         // Hitung tayang: hanya pengunjung (bukan admin), dan hanya sekali per
         // perangkat per hari (cookie) supaya refresh tidak menggelembungkan.
+        // Traffic load test TIDAK dihitung: request dengan header
+        // X-Load-Test: 1 melewati penambah views + riwayat view_events.
         let viewCookie = null;
-        if (!admin) {
+        if (!admin && request.headers.get('x-load-test') !== '1') {
           const viewName = 'cms_view_' + String(post.id).replace(/[^A-Za-z0-9_-]/g, '_');
           if (!parseCookies(request)[viewName]) {
             await env.DB.prepare(`UPDATE cms_posts SET views = views + 1 WHERE id = ?`).bind(post.id).run();
@@ -715,7 +757,7 @@ async function handleFetch(request, env) {
         return html(await renderPage(env, 'Plugin', content));
       }
       if (path === '/kendali/super') {
-        const [siteTitleS, themeS, imgbbS, adsenseS, usersN, postsN, pluginsS, pcbActive, pcbMsg, viewEventsS] = await Promise.all([
+        const [siteTitleS, themeS, imgbbS, adsenseS, usersN, postsN, pluginsS, pcbActive, pcbMsg, viewEventsS, loadtestS] = await Promise.all([
           getSetting(env, 'site_title', 'WorkerCMS'),
           getSetting(env, 'theme', 'terang'),
           getImgbbKeys(env).then(a => a.length),
@@ -726,6 +768,7 @@ async function handleFetch(request, env) {
           getSetting(env, 'pcbuilder_event_active', '0'),
           getSetting(env, 'pcbuilder_event_text', ''),
           env.DB.prepare(`SELECT post_id, viewed_at FROM cms_view_events ORDER BY viewed_at DESC`).all(),
+          env.DB.prepare(`SELECT * FROM cms_loadtest_runs ORDER BY created_at DESC LIMIT 10`).all(),
         ]);
         // Hitung pending dari daftar komentar (lebih andal di semua DB daripada COUNT mock)
         const allCm = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
@@ -773,7 +816,23 @@ async function handleFetch(request, env) {
           return `<p><a href="/post/${esc(p.slug)}">${esc(p.title)}</a> — total <b>${Number(p.views) || 0}</b> · hari ini ${t.today} · 7 hari ${t.d7} · 30 hari ${t.d30}</p>`;
         }).join('') || '<p>Belum ada post.</p>';
         const trafficCard = `<div class="card"><h3>Traffic Lengkap</h3><p><b>${trafficTotal} views total</b> (counter post) · hari ini (WIB) ${perDayTraffic.get(todayTraffic) || 0} · kemarin ${perDayTraffic.get(yesterdayTraffic) || 0} · 7 hari ${traffic7} · 30 hari ${traffic30}</p><p>Catatan: angka per-hari dan per-post 7/30 hari hanya dari riwayat views yang dicatat sejak 30 Okt 2026. Views lama sebelum tanggal itu hanya ada di total counter, tidak bisa dipecah per hari.</p><h4>Per Hari (30 hari terakhir, WIB)</h4>${dayRows.join('')}<h4>Per Post (semua post, urut total tertinggi)</h4>${postTrafficRows}</div>`;
-        const content = `<h2>Super Panel</h2>${nav}<div class="card"><h3>Situs</h3><p>Judul: <b>${esc(envSiteTitle(env) || siteTitleS)}</b> · Tema: ${esc(themeS)} · ImgBB: ${imgbbS} kunci · AdSense: ${adsenseS ? 'sudah diset' : 'belum diset'}</p><form method="post" action="/kendali/settings">${csrfField}<input type="hidden" name="return_to" value="/kendali/super"><label>Judul situs</label><input name="site_title" value="${esc(envSiteTitle(env) || siteTitleS)}"><label>Tema</label><select name="theme">${Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeS ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select><button type="submit">Simpan Judul & Tema</button></form><p><a href="/kendali/settings">Pengaturan lengkap (foto profil, iklan, AdSense, kunci ImgBB)</a></p></div><div class="card"><h3>Komentar & Keamanan</h3><p>${pendingCount} komentar menunggu · ${(usersN.results || []).length} akun komentator · ${(postsN.results || []).length} post · <a href="/kendali/comments">Moderasi Komentar</a> · <a href="/kendali/users">Akun</a></p>${pluginList}<p><a href="/kendali/plugins">Semua plugin</a> · <a href="/kendali/backup">Backup</a> · <a href="/kendali/sessions">Sesi</a></p></div>${trafficCard}<div class="card"><h3>Event PC Builder (game)</h3><p>Status: <b>${pcbActive === '1' ? 'Aktif — game memberi diskon 10%' : 'Nonaktif — game tidak memberi diskon'}</b></p><p>Game v1.0.3 hanya membaca on/off diskon dari endpoint ini; pesan kustom di bawah hanya catatan admin, belum tampil di game.</p><form method="post" action="/kendali/super/pcbuilder">${csrfField}<label>Event aktif?</label><select name="pcbuilder_active"><option value="1" ${pcbActive === '1' ? 'selected' : ''}>Aktif (diskon 10%)</option><option value="0" ${pcbActive !== '1' ? 'selected' : ''}>Nonaktif</option></select><label>Pesan event (catatan admin, maks 200 karakter)</label><input name="pcbuilder_message" value="${esc(pcbMsg)}" placeholder="mis. Event akhir pekan"><button type="submit">Simpan Event PC Builder</button></form><p>Endpoint game: <code>/api/pcbuilder-events</code></p></div>`;
+        // Hasil load test: 10 run terbaru, terbaru di atas. Tanggal WIB
+        // (geser +7 jam dari ISO UTC, sama seperti hitung traffic di atas).
+        // failed_rate disimpan sebagai fraksi (0–1), tampil sebagai persen.
+        const wibStamp = iso => {
+          const ms = new Date(String(iso || '')).getTime();
+          if (isNaN(ms)) return esc(String(iso || ''));
+          return new Date(ms + 7 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' WIB';
+        };
+        const pct = v => (Math.round(Number(v || 0) * 10000) / 100) + '%';
+        const loadtestRows = (loadtestS.results || []).map(rr => {
+          let paths = [];
+          try { const d = JSON.parse(rr.details || '[]'); if (Array.isArray(d)) paths = d; } catch (e) {}
+          const pathHtml = paths.map(pp => `<p style="margin-left:16px">${esc(pp.path)} — status ${esc(pp.status)} · p95 ${esc(pp.p95_ms)} ms · gagal ${pct(pp.failed_rate)} · checks ${pp.checks_passed ? 'lulus' : 'gagal'}</p>`).join('');
+          return `<div><p><b>${wibStamp(rr.created_at)}</b> — ${Number(rr.passed) === 1 ? 'Lulus' : 'Gagal'} · ${esc(rr.vu)} VU · ${esc(rr.duration_s)} detik · p95 ${esc(rr.p95_ms)} ms · gagal ${pct(rr.failed_rate)}</p>${pathHtml}</div>`;
+        }).join('') || '<p>Belum ada hasil load test.</p>';
+        const loadtestCard = `<div class="card"><h3>Hasil Load Test</h3><p>10 run terbaru, terbaru di atas. Dikirim aplikasi load test lewat token khusus (bukan token admin).</p>${loadtestRows}</div>`;
+        const content = `<h2>Super Panel</h2>${nav}<div class="card"><h3>Situs</h3><p>Judul: <b>${esc(envSiteTitle(env) || siteTitleS)}</b> · Tema: ${esc(themeS)} · ImgBB: ${imgbbS} kunci · AdSense: ${adsenseS ? 'sudah diset' : 'belum diset'}</p><form method="post" action="/kendali/settings">${csrfField}<input type="hidden" name="return_to" value="/kendali/super"><label>Judul situs</label><input name="site_title" value="${esc(envSiteTitle(env) || siteTitleS)}"><label>Tema</label><select name="theme">${Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeS ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select><button type="submit">Simpan Judul & Tema</button></form><p><a href="/kendali/settings">Pengaturan lengkap (foto profil, iklan, AdSense, kunci ImgBB)</a></p></div><div class="card"><h3>Komentar & Keamanan</h3><p>${pendingCount} komentar menunggu · ${(usersN.results || []).length} akun komentator · ${(postsN.results || []).length} post · <a href="/kendali/comments">Moderasi Komentar</a> · <a href="/kendali/users">Akun</a></p>${pluginList}<p><a href="/kendali/plugins">Semua plugin</a> · <a href="/kendali/backup">Backup</a> · <a href="/kendali/sessions">Sesi</a></p></div>${trafficCard}${loadtestCard}<div class="card"><h3>Event PC Builder (game)</h3><p>Status: <b>${pcbActive === '1' ? 'Aktif — game memberi diskon 10%' : 'Nonaktif — game tidak memberi diskon'}</b></p><p>Game v1.0.3 hanya membaca on/off diskon dari endpoint ini; pesan kustom di bawah hanya catatan admin, belum tampil di game.</p><form method="post" action="/kendali/super/pcbuilder">${csrfField}<label>Event aktif?</label><select name="pcbuilder_active"><option value="1" ${pcbActive === '1' ? 'selected' : ''}>Aktif (diskon 10%)</option><option value="0" ${pcbActive !== '1' ? 'selected' : ''}>Nonaktif</option></select><label>Pesan event (catatan admin, maks 200 karakter)</label><input name="pcbuilder_message" value="${esc(pcbMsg)}" placeholder="mis. Event akhir pekan"><button type="submit">Simpan Event PC Builder</button></form><p>Endpoint game: <code>/api/pcbuilder-events</code></p></div>`;
         return html(await renderPage(env, 'Super Panel', content));
       }
       if (path === '/kendali/settings') {

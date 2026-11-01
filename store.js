@@ -19,6 +19,7 @@ export async function ensureSchema(env) {
         `CREATE TABLE IF NOT EXISTS cms_users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS cms_comment_votes (comment_id INTEGER NOT NULL, user_key TEXT NOT NULL, vote INTEGER NOT NULL, PRIMARY KEY (comment_id, user_key))`,
         `CREATE TABLE IF NOT EXISTS cms_view_events (id INTEGER PRIMARY KEY AUTOINCREMENT, post_id TEXT NOT NULL, viewed_at TEXT NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS cms_loadtest_runs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, vu INTEGER NOT NULL DEFAULT 0, duration_s INTEGER NOT NULL DEFAULT 0, p95_ms REAL NOT NULL DEFAULT 0, failed_rate REAL NOT NULL DEFAULT 0, passed INTEGER NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '')`,
         `CREATE TABLE IF NOT EXISTS cms_rate_limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, window_start TEXT NOT NULL)`,
       ];
       for (const sql of ddl) await env.DB.prepare(sql).run();
@@ -77,6 +78,7 @@ export async function doBackup(env) {
   const plugins = await env.DB.prepare(`SELECT * FROM cms_plugins ORDER BY id ASC`).all();
   const users = await env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at ASC`).all();
   const votes = await env.DB.prepare(`SELECT * FROM cms_comment_votes ORDER BY comment_id ASC`).all();
+  const loadtests = await env.DB.prepare(`SELECT * FROM cms_loadtest_runs ORDER BY created_at ASC`).all();
   const now = new Date().toISOString();
   const bak = env.BACKUP_DB;
   for (const sql of [
@@ -86,6 +88,7 @@ export async function doBackup(env) {
     `CREATE TABLE IF NOT EXISTS cms_backup_plugins (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, backup_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS cms_backup_users (id TEXT PRIMARY KEY, username TEXT NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL, backup_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS cms_backup_votes (comment_id INTEGER NOT NULL, user_key TEXT NOT NULL, vote INTEGER NOT NULL, backup_at TEXT NOT NULL, PRIMARY KEY (comment_id, user_key))`,
+    `CREATE TABLE IF NOT EXISTS cms_backup_loadtest_runs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, vu INTEGER NOT NULL DEFAULT 0, duration_s INTEGER NOT NULL DEFAULT 0, p95_ms REAL NOT NULL DEFAULT 0, failed_rate REAL NOT NULL DEFAULT 0, passed INTEGER NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '', backup_at TEXT NOT NULL)`,
   ]) await bak.prepare(sql).run();
   const stmts = [
     bak.prepare(`DELETE FROM cms_backup_posts`),
@@ -94,6 +97,7 @@ export async function doBackup(env) {
     bak.prepare(`DELETE FROM cms_backup_plugins`),
     bak.prepare(`DELETE FROM cms_backup_users`),
     bak.prepare(`DELETE FROM cms_backup_votes`),
+    bak.prepare(`DELETE FROM cms_backup_loadtest_runs`),
   ];
   for (const p of (posts.results || [])) {
     stmts.push(bak.prepare(`INSERT INTO cms_backup_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views, tags, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(p.id, p.slug, p.title, p.body, p.category, p.status, p.created_at, p.updated_at, p.body_mode || 'text', p.visibility || 'public', p.publish_at || p.created_at || '', p.post_password_hash || '', p.post_password_salt || '', Number(p.views) || 0, p.tags || '', now));
@@ -109,6 +113,9 @@ export async function doBackup(env) {
   }
   for (const s of (settings.results || [])) {
     stmts.push(bak.prepare(`INSERT INTO cms_backup_settings (key, value, backup_at) VALUES (?, ?, ?)`).bind(s.key, s.value, now));
+  }
+  for (const r of (loadtests.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_loadtest_runs (id, created_at, vu, duration_s, p95_ms, failed_rate, passed, details, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(r.id, r.created_at, r.vu, r.duration_s, r.p95_ms, r.failed_rate, r.passed, r.details || '', now));
   }
   for (const p of (plugins.results || [])) {
     stmts.push(bak.prepare(`INSERT INTO cms_backup_plugins (id, enabled, backup_at) VALUES (?, ?, ?)`).bind(p.id, p.enabled, now));

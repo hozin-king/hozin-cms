@@ -16,7 +16,7 @@ class Stmt {
 class MockDB {
   constructor() {
     this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = []; this.refreshTokens = []; this.viewEvents = [];
-    this.users = new Map(); this.votes = []; this.rateLimits = new Map();
+    this.users = new Map(); this.votes = []; this.rateLimits = new Map(); this.loadtestRuns = [];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { for (const s of stmts) await s.run(); }
@@ -119,6 +119,10 @@ class MockDB {
     if (s.startsWith('SELECT * FROM cms_comments WHERE post_id')) return this.comments.filter(c => c.post_id === a[0] && c.status === 'approved').sort((x, y) => x.created_at.localeCompare(y.created_at));
     if (s.startsWith('SELECT * FROM cms_comments ORDER')) return [...this.comments].sort((x, y) => y.created_at.localeCompare(x.created_at));
     if (s.startsWith('INSERT INTO cms_view_events')) { this.viewEvents.push({ post_id: a[0], viewed_at: a[1] }); return []; }
+    if (s.startsWith('INSERT INTO cms_loadtest_runs')) { this.loadtestRuns.push({ id: a[0], created_at: a[1], vu: a[2], duration_s: a[3], p95_ms: a[4], failed_rate: a[5], passed: a[6], details: a[7] }); return []; }
+    if (s.startsWith('SELECT * FROM cms_loadtest_runs ORDER BY created_at DESC')) return [...this.loadtestRuns].sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, 10);
+    if (s.startsWith('SELECT * FROM cms_loadtest_runs ORDER BY created_at ASC')) return [...this.loadtestRuns].sort((x, y) => x.created_at.localeCompare(y.created_at));
+    if (s.startsWith('INSERT INTO cms_backup_loadtest_runs')) { this.backupLoadtests = (this.backupLoadtests || 0) + 1; return []; }
     if (s.startsWith('SELECT post_id, viewed_at FROM cms_view_events')) return [...this.viewEvents].sort((x, y) => y.viewed_at.localeCompare(x.viewed_at));
     if (s.startsWith('SELECT * FROM cms_comments WHERE id')) return this.comments.filter(c => c.id === a[0]);
     if (s.startsWith('UPDATE cms_comments SET text')) { const c = this.comments.find(x => x.id === a[1]); if (c) { c.text = a[0]; if (s.includes("status = 'pending'")) c.status = 'pending'; } return []; }
@@ -589,4 +593,57 @@ r = await call('GET', '/post/post-bertag'); t = await r.text(); assert(t.include
 r = await call('GET', '/tag/hp'); t = await r.text(); assert(t.includes('Post Bertag'), 'tag: arsip /tag/hp memuat post bertag hp');
 r = await call('GET', '/tag/hape'); t = await r.text(); assert(!t.includes('Post Bertag'), 'tag: arsip /tag/hape tidak menarik post bertag hp');
 r = await call('GET', '/kendali/posts/new', null, cookie); t = await r.text(); assert(t.includes('name="tags"'), 'tag: editor menampilkan input tag');
+// 29. Load test: endpoint bertoken khusus + kartu Super Panel + traffic tes tidak dihitung
+async function callJson(method, path, obj, headers = {}) {
+  const h = { 'content-type': 'application/json', ...headers };
+  const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
+  return worker.fetch(req, env);
+}
+const ltGood = { vu: 10, duration_s: 60, p95_ms: 320.5, failed_rate: 0.02, passed: true, paths: [{ path: '/', status: 200, p95_ms: 310, failed_rate: 0, checks_passed: true }] };
+r = await callJson('POST', '/api/loadtest-results', ltGood);
+assert(r.status === 503, 'loadtest: secret belum diset ditolak 503 (fail-closed)');
+assert(env.DB.loadtestRuns.length === 0, 'loadtest: 503 tidak menyimpan run');
+env.LOADTEST_TOKEN = 'test-loadtest-token';
+r = await callJson('POST', '/api/loadtest-results', ltGood);
+assert(r.status === 401, 'loadtest: tanpa token ditolak 401');
+r = await callJson('POST', '/api/loadtest-results', ltGood, { authorization: 'Bearer salah' });
+assert(r.status === 401, 'loadtest: token salah ditolak 401');
+assert(env.DB.loadtestRuns.length === 0, 'loadtest: 401 tidak menyimpan run');
+r = await callJson('POST', '/api/loadtest-results', { ...ltGood, vu: 'sepuluh' }, { authorization: 'Bearer test-loadtest-token' });
+assert(r.status === 400, 'loadtest: vu bukan angka ditolak 400');
+r = await callJson('POST', '/api/loadtest-results', { ...ltGood, failed_rate: 1.5 }, { authorization: 'Bearer test-loadtest-token' });
+assert(r.status === 400, 'loadtest: failed_rate di luar 0-1 ditolak 400');
+r = await callJson('POST', '/api/loadtest-results', { ...ltGood, passed: 'ya' }, { authorization: 'Bearer test-loadtest-token' });
+assert(r.status === 400, 'loadtest: passed bukan boolean ditolak 400');
+r = await callJson('POST', '/api/loadtest-results', { ...ltGood, paths: Array.from({ length: 21 }, () => ({ path: '/', status: 200, p95_ms: 1, failed_rate: 0, checks_passed: true })) }, { authorization: 'Bearer test-loadtest-token' });
+assert(r.status === 400, 'loadtest: paths lebih dari 20 ditolak 400');
+r = await callJson('POST', '/api/loadtest-results', { ...ltGood, paths: [{ path: 'x'.repeat(201), status: 200, p95_ms: 1, failed_rate: 0, checks_passed: true }] }, { authorization: 'Bearer test-loadtest-token' });
+assert(r.status === 400, 'loadtest: path lebih dari 200 karakter ditolak 400');
+r = await callJson('POST', '/api/loadtest-results', { ...ltGood, junk: 'x'.repeat(25000) }, { authorization: 'Bearer test-loadtest-token' });
+assert(r.status === 413, 'loadtest: body lebih dari 20 KB ditolak 413');
+assert(env.DB.loadtestRuns.length === 0, 'loadtest: semua payload invalid tidak menyimpan run');
+r = await callJson('POST', '/api/loadtest-results', ltGood, { authorization: 'Bearer test-loadtest-token' });
+assert(r.status === 201, 'loadtest: token benar tersimpan 201 (tanpa sesi admin)');
+assert(env.DB.loadtestRuns.length === 1 && env.DB.loadtestRuns[0].vu === 10, 'loadtest: run tersimpan di cms_loadtest_runs');
+r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
+assert(t.includes('Hasil Load Test') && t.includes('Lulus') && t.includes('10 VU') && t.includes('320.5 ms') && t.includes('gagal 2%') && t.includes('WIB'), 'loadtest: run muncul di Super Panel (Lulus, VU, p95, gagal%, WIB)');
+assert(t.includes('status 200') && t.includes('checks lulus'), 'loadtest: per-jalur tampil di Super Panel');
+r = await call('GET', '/kendali/super', null, userCookie); assert(r.status === 303, 'loadtest: Super Panel tetap hanya admin');
+// Token load test tidak bisa dipakai login admin
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-loadtest-token' }); assert(r.status === 403, 'loadtest: token khusus tidak bisa login admin');
+// Detail post dengan header X-Load-Test tidak menambah views
+const ujiPost = env.DB.posts.find(x => x.slug === 'post-uji');
+const viewsBefore = Number(ujiPost.views) || 0;
+const eventsBefore = env.DB.viewEvents.length;
+{
+  const ltReq = new Request(base + '/post/post-uji', { method: 'GET', headers: { 'x-load-test': '1' } });
+  r = await worker.fetch(ltReq, env); t = await r.text();
+  assert(r.status === 200 && t.includes('Post Uji'), 'loadtest: detail post dengan header tes tetap tampil');
+}
+assert(Number(env.DB.posts.find(x => x.slug === 'post-uji').views) === viewsBefore, 'loadtest: header X-Load-Test tidak menambah counter views');
+assert(env.DB.viewEvents.length === eventsBefore, 'loadtest: header X-Load-Test tidak menambah riwayat view_events');
+r = await call('GET', '/post/post-uji'); assert(Number(env.DB.posts.find(x => x.slug === 'post-uji').views) === viewsBefore + 1, 'loadtest: tanpa header tes, views tetap bertambah normal');
+// Backup ikut menyalin run load test
+r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status === 303, 'loadtest: tombol backup redirect');
+assert(env.BACKUP_DB.backupLoadtests >= 1, 'loadtest: backup menyalin run ke cms_backup_loadtest_runs');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
