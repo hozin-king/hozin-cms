@@ -510,6 +510,9 @@ r = await call('GET', '/kendali/super', null, userCookie); assert(r.status === 3
 r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('Super Panel') && t.includes('Komentar & Keamanan') && t.includes('Event PC Builder'), 'super panel: admin melihat situs + komentar + PC Builder');
 assert(t.includes('Traffic Lengkap') && t.includes('views total') && t.includes('Per Hari') && t.includes('Per Post'), 'super panel: traffic lengkap tampil (total, per-hari, per-post)');
+env.DB.viewEvents.push({ post_id: 'p1', viewed_at: new Date().toISOString() });
+r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
+assert(t.includes('background:#3b82f6') && t.includes('width:100%'), 'super panel: grafik batang per-hari tampil (hari tertinggi = batang penuh)');
 r = await call('GET', '/api/pcbuilder-events'); t = await r.text();
 assert(r.status === 200 && !t.toLowerCase().includes('discount'), 'pcbuilder events: nonaktif tidak mengandung kata discount (game tidak salah diskon)');
 r = await call('POST', '/kendali/super/pcbuilder', { csrf, pcbuilder_active: '1', pcbuilder_message: 'Event akhir pekan' }, cookie); assert(r.status === 303 && (r.headers.get('location') || '') === '/kendali/super', 'super panel: simpan event PC Builder redirect ke super');

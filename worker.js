@@ -805,17 +805,27 @@ async function handleFetch(request, env) {
         }
         const traffic7 = [...perDayTraffic.entries()].filter(([d]) => (nowTraffic - new Date(d + 'T00:00:00+07:00').getTime()) / (24 * 3600 * 1000) < 7).reduce((a, [, n]) => a + n, 0);
         const traffic30 = [...perDayTraffic.entries()].filter(([d]) => (nowTraffic - new Date(d + 'T00:00:00+07:00').getTime()) / (24 * 3600 * 1000) < 30).reduce((a, [, n]) => a + n, 0);
-        const dayRows = [];
+        const dayData = [];
         for (let i = 0; i < 30; i++) {
           const d = wibDay(nowTraffic - i * 24 * 3600 * 1000);
-          dayRows.push(`<p>${d} — <b>${perDayTraffic.get(d) || 0}</b> views</p>`);
+          dayData.push([d, perDayTraffic.get(d) || 0]);
         }
+        const dayMax = Math.max(1, ...dayData.map(([, n]) => n));
+        // Grafik batang per-hari (HTML/CSS murni, tanpa library/JS): lebar
+        // batang = jumlah views hari itu relatif terhadap hari tertinggi.
+        // Angka persis tetap tampil di ujung batang, jadi daftar angka lama
+        // diganti grafik ini tanpa kehilangan data.
+        const dayChart = dayData.map(([d, n]) => {
+          const w = Math.round((n / dayMax) * 100);
+          const bar = n > 0 ? `<span style="display:inline-block;height:18px;background:#3b82f6;border-radius:4px;min-width:18px;width:${w}%"></span>` : `<span style="display:inline-block;height:18px"></span>`;
+          return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0"><span style="min-width:92px;font-size:13px">${d}</span>${bar}<span style="font-size:13px"><b>${n}</b> views</span></div>`;
+        }).join('');
         const byPostId = new Map((postsN.results || []).map(p => [String(p.id), p]));
         const postTrafficRows = [...(postsN.results || [])].sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0)).map(p => {
           const t = perPostTraffic.get(String(p.id)) || { total: 0, d7: 0, d30: 0, today: 0 };
           return `<p><a href="/post/${esc(p.slug)}">${esc(p.title)}</a> — total <b>${Number(p.views) || 0}</b> · hari ini ${t.today} · 7 hari ${t.d7} · 30 hari ${t.d30}</p>`;
         }).join('') || '<p>Belum ada post.</p>';
-        const trafficCard = `<div class="card"><h3>Traffic Lengkap</h3><p><b>${trafficTotal} views total</b> (counter post) · hari ini (WIB) ${perDayTraffic.get(todayTraffic) || 0} · kemarin ${perDayTraffic.get(yesterdayTraffic) || 0} · 7 hari ${traffic7} · 30 hari ${traffic30}</p><p>Catatan: angka per-hari dan per-post 7/30 hari hanya dari riwayat views yang dicatat sejak 30 Okt 2026. Views lama sebelum tanggal itu hanya ada di total counter, tidak bisa dipecah per hari.</p><h4>Per Hari (30 hari terakhir, WIB)</h4>${dayRows.join('')}<h4>Per Post (semua post, urut total tertinggi)</h4>${postTrafficRows}</div>`;
+        const trafficCard = `<div class="card"><h3>Traffic Lengkap</h3><p><b>${trafficTotal} views total</b> (counter post) · hari ini (WIB) ${perDayTraffic.get(todayTraffic) || 0} · kemarin ${perDayTraffic.get(yesterdayTraffic) || 0} · 7 hari ${traffic7} · 30 hari ${traffic30}</p><p>Catatan: angka per-hari dan per-post 7/30 hari hanya dari riwayat views yang dicatat sejak 30 Okt 2026. Views lama sebelum tanggal itu hanya ada di total counter, tidak bisa dipecah per hari.</p><h4>Per Hari (30 hari terakhir, WIB)</h4>${dayChart}<h4>Per Post (semua post, urut total tertinggi)</h4>${postTrafficRows}</div>`;
         // Hasil load test: 10 run terbaru, terbaru di atas. Tanggal WIB
         // (geser +7 jam dari ISO UTC, sama seperti hitung traffic di atas).
         // failed_rate disimpan sebagai fraksi (0–1), tampil sebagai persen.
