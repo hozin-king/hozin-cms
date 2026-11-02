@@ -273,6 +273,20 @@ async function handleFetch(request, env) {
       return html(await renderPage(env, 'Beranda', content), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
     }
 
+    // ---- Publik: halaman uptime (tautan dari footer "Online sejak ...") ----
+    // Halaman ini dirender Worker itu sendiri, jadi bila halaman ini terbuka
+    // berarti Worker sedang merespons. Sengaja TIDAK menampilkan persentase
+    // uptime (mis. 99,9%) karena tidak ada riwayat monitoring eksternal yang
+    // dicatat — yang ditampilkan hanya status saat ini + hitungan hari sejak
+    // 1 Januari 2024 WIB, keduanya bisa diverifikasi dari halaman ini sendiri.
+    if (request.method === 'GET' && path === '/uptime') {
+      const startMs = Date.UTC(2023, 11, 31, 17, 0, 0); // 1 Jan 2024 00:00 WIB
+      const days = Math.max(0, Math.floor((Date.now() - startMs) / 86400000));
+      const checkedWib = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+      const content = `<div class="card"><h2>Status Situs</h2><p><strong>● Online</strong> — Worker merespons permintaan ini.</p><p>Online sejak 1 Januari 2024 — sudah <strong>${days} hari</strong> berjalan.</p><p class="meta">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><p><a href="/">← Beranda</a></p>`;
+      return html(await renderPage(env, 'Status Situs', content), 200);
+    }
+
     // ---- Publik: arsip tag (hanya post publik yang sudah terbit) ----
     // Tag dicocokkan di JS lewat tagSlug, bukan LIKE SQL, supaya tag
     // "hp" tidak ikut menarik post bertag "hape" atau sejenisnya.

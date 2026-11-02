@@ -649,4 +649,8 @@ r = await call('GET', '/post/post-uji'); assert(Number(env.DB.posts.find(x => x.
 // Backup ikut menyalin run load test
 r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status === 303, 'loadtest: tombol backup redirect');
 assert(env.BACKUP_DB.backupLoadtests >= 1, 'loadtest: backup menyalin run ke cms_backup_loadtest_runs');
+// 30. Halaman uptime (perintah pemilik 2 Nov 2026): footer "Online sejak ..." jadi tautan ke /uptime
+r = await call('GET', '/'); t = await r.text(); assert(t.includes('<a href="/uptime">Online sejak 1 Januari 2024</a>'), 'uptime: footer menautkan "Online sejak" ke /uptime');
+r = await call('GET', '/uptime'); t = await r.text(); assert(r.status === 200 && t.includes('Status Situs') && t.includes('Online') && t.includes('Online sejak 1 Januari 2024') && t.includes('hari'), 'uptime: /uptime 200, menampilkan status + hitungan hari sejak 1 Jan 2024');
+assert(!t.includes('99,9%') && !t.includes('99.9%'), 'uptime: tidak mengklaim persen uptime tanpa data monitoring');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
