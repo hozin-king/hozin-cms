@@ -17,6 +17,8 @@ class MockDB {
   constructor() {
     this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = []; this.refreshTokens = []; this.viewEvents = [];
     this.users = new Map(); this.votes = []; this.rateLimits = new Map(); this.loadtestRuns = [];
+    this.dracinKeys = []; this.dracinCatalog = []; this.dracinEpisodes = []; this.dracinSeeds = []; this.dracinUsage = [];
+    this.backupDracinKeys = 0; this.backupDracinCatalog = 0; this.backupDracinEpisodes = 0; this.backupDracinSeeds = 0; this.backupDracinUsage = 0;
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { for (const s of stmts) await s.run(); }
@@ -132,6 +134,60 @@ class MockDB {
     if (s.startsWith('UPDATE cms_comments SET pinned')) { const c = this.comments.find(x => x.id === a[1]); if (c) c.pinned = a[0]; return []; }
     if (s.startsWith('UPDATE cms_comments SET status')) { const c = this.comments.find(x => x.id === a[0]); if (c) c.status = 'approved'; return []; }
     if (s.startsWith('UPDATE cms_plugins SET enabled')) { this.plugins.set(a[1], a[0]); return []; }
+    // Mock Dracin: kunci, katalog, episode, seed, usage (tanpa IP / user-agent di mana pun)
+    if (s.startsWith('PRAGMA table_info(dracin_api_usage)')) return [{ name: 'ts' }, { name: 'key_id' }, { name: 'endpoint' }, { name: 'method' }, { name: 'status' }, { name: 'country' }, { name: 'region' }, { name: 'city' }];
+    if (s.startsWith('SELECT * FROM dracin_api_keys WHERE key_hash')) return this.dracinKeys.filter(k => k.key_hash === a[0]);
+    if (s.startsWith('SELECT * FROM dracin_api_keys ORDER BY created_at')) return [...this.dracinKeys].sort((x, y) => s.includes('DESC') ? y.created_at - x.created_at : x.created_at - y.created_at);
+    if (s.startsWith('INSERT INTO dracin_api_keys')) { this.dracinKeys.push({ id: a[0], name: a[1], key_hash: a[2], scope: a[3], active: a[4], created_at: a[5] }); return []; }
+    if (s.startsWith('UPDATE dracin_api_keys SET active = 0')) { const k = this.dracinKeys.find(x => x.id === a[0]); if (k) k.active = 0; return []; }
+    if (s.startsWith('SELECT COUNT(*) AS n FROM dracin_api_usage')) return [{ n: this.dracinUsage.length }];
+    if (s.startsWith('SELECT * FROM dracin_api_usage ORDER BY ts DESC')) return [...this.dracinUsage].sort((x, y) => y.ts - x.ts).slice(0, 5000);
+    if (s.startsWith('SELECT * FROM dracin_api_usage ORDER BY ts ASC')) return [...this.dracinUsage].sort((x, y) => x.ts - y.ts);
+    if (s.startsWith('INSERT INTO dracin_api_usage')) { this.dracinUsage.push({ ts: a[0], key_id: a[1], endpoint: a[2], method: a[3], status: a[4], country: a[5], region: a[6], city: a[7] }); return []; }
+    if (s.startsWith('SELECT * FROM dracin_catalog WHERE platform = ? AND title_id = ?')) return this.dracinCatalog.filter(x => x.platform === a[0] && x.title_id === a[1]);
+    if (s.startsWith('SELECT * FROM dracin_catalog')) {
+      if (s.includes('ORDER BY platform ASC')) return [...this.dracinCatalog].sort((x, y) => (x.platform + x.title_id).localeCompare(y.platform + y.title_id));
+      let i = 0, pf = null, lf = null;
+      if (s.includes('platform = ?')) pf = a[i++];
+      if (s.includes('language = ?')) lf = a[i++];
+      const limit = a[i++], offset = a[i++];
+      let rows = [...this.dracinCatalog];
+      if (pf) rows = rows.filter(x => x.platform === pf);
+      if (lf) rows = rows.filter(x => x.language === lf);
+      rows.sort((x, y) => y.updated_at - x.updated_at);
+      return rows.slice(offset, offset + limit);
+    }
+    if (s.startsWith('INSERT INTO dracin_catalog')) {
+      const row = { platform: a[0], title_id: a[1], title: a[2], cover_url: a[3], synopsis: a[4], language: a[5], episode_count: a[6], free_count: a[7], locked_count: a[8], updated_at: a[9] };
+      const ix = this.dracinCatalog.findIndex(x => x.platform === row.platform && x.title_id === row.title_id);
+      if (ix >= 0) this.dracinCatalog[ix] = row; else this.dracinCatalog.push(row);
+      return [];
+    }
+    if (s.startsWith('DELETE FROM dracin_catalog')) { this.dracinCatalog = this.dracinCatalog.filter(x => !(x.platform === a[0] && x.title_id === a[1])); return []; }
+    if (s.startsWith('SELECT * FROM dracin_episodes')) return [...this.dracinEpisodes].sort((x, y) => (x.platform + x.title_id).localeCompare(y.platform + y.title_id) || x.idx - y.idx);
+    if (s.startsWith('INSERT OR REPLACE INTO dracin_episodes')) {
+      const row = { platform: a[0], title_id: a[1], idx: a[2], item_id: a[3], duration_s: a[4], locked: a[5] };
+      const ix = this.dracinEpisodes.findIndex(x => x.platform === row.platform && x.title_id === row.title_id && x.idx === row.idx);
+      if (ix >= 0) this.dracinEpisodes[ix] = row; else this.dracinEpisodes.push(row);
+      return [];
+    }
+    if (s.startsWith('DELETE FROM dracin_episodes')) { this.dracinEpisodes = this.dracinEpisodes.filter(x => !(x.platform === a[0] && x.title_id === a[1])); return []; }
+    if (s.startsWith('SELECT * FROM dracin_seeds WHERE platform = ? AND query = ?')) return this.dracinSeeds.filter(x => x.platform === a[0] && x.query === a[1]);
+    if (s.startsWith('SELECT * FROM dracin_seeds WHERE enabled = 1')) return this.dracinSeeds.filter(x => Number(x.enabled) === 1).sort((x, y) => (x.platform + x.query).localeCompare(y.platform + y.query));
+    if (s.startsWith('SELECT * FROM dracin_seeds')) return [...this.dracinSeeds].sort((x, y) => (x.platform + x.query).localeCompare(y.platform + y.query));
+    if (s.startsWith('INSERT OR REPLACE INTO dracin_seeds')) {
+      const row = { platform: a[0], query: a[1], enabled: a[2] };
+      const ix = this.dracinSeeds.findIndex(x => x.platform === row.platform && x.query === row.query);
+      if (ix >= 0) this.dracinSeeds[ix] = row; else this.dracinSeeds.push(row);
+      return [];
+    }
+    if (s.startsWith('UPDATE dracin_seeds SET enabled')) { const sd = this.dracinSeeds.find(x => x.platform === a[1] && x.query === a[2]); if (sd) sd.enabled = a[0]; return []; }
+    if (s.startsWith('DELETE FROM dracin_seeds')) { this.dracinSeeds = this.dracinSeeds.filter(x => !(x.platform === a[0] && x.query === a[1])); return []; }
+    if (s.startsWith('INSERT INTO cms_backup_dracin_api_keys')) { this.backupDracinKeys++; return []; }
+    if (s.startsWith('INSERT INTO cms_backup_dracin_catalog')) { this.backupDracinCatalog++; return []; }
+    if (s.startsWith('INSERT INTO cms_backup_dracin_episodes')) { this.backupDracinEpisodes++; return []; }
+    if (s.startsWith('INSERT INTO cms_backup_dracin_seeds')) { this.backupDracinSeeds++; return []; }
+    if (s.startsWith('INSERT INTO cms_backup_dracin_api_usage')) { this.backupDracinUsage++; return []; }
     if (s.startsWith('DELETE FROM cms_posts')) { this.posts = this.posts.filter(p => p.id !== a[0]); return []; }
     if (s.startsWith('DELETE FROM cms_comments')) { this.comments = this.comments.filter(c => c.id !== a[0]); return []; }
     throw new Error('Mock SQL tidak dikenal: ' + s);
@@ -653,4 +709,99 @@ assert(env.BACKUP_DB.backupLoadtests >= 1, 'loadtest: backup menyalin run ke cms
 r = await call('GET', '/'); t = await r.text(); assert(t.includes('<a href="/uptime">Online sejak 1 Januari 2024</a>'), 'uptime: footer menautkan "Online sejak" ke /uptime');
 r = await call('GET', '/uptime'); t = await r.text(); assert(r.status === 200 && t.includes('Status Situs') && t.includes('Online') && t.includes('Online sejak 1 Januari 2024') && t.includes('hari'), 'uptime: /uptime 200, menampilkan status + hitungan hari sejak 1 Jan 2024');
 assert(!t.includes('99,9%') && !t.includes('99.9%'), 'uptime: tidak mengklaim persen uptime tanpa data monitoring');
+// 31. API Dracin (PART A, lokal saja): kunci hash-only, scope, sync idempotent,
+// filter katalog, CRUD admin, usage tanpa IP/user-agent, kartu Super Panel
+async function dracinKeyFor(name, scope) {
+  r = await call('POST', '/kendali/super/dracin-keys', { csrf, action: 'create', name, scope }, cookie);
+  t = await r.text();
+  assert(r.status === 200 && t.includes('hanya tampil sekali'), 'dracin: buat kunci ' + scope + ' tampil sekali di halaman');
+  const raw = (t.match(/<code>([A-Za-z0-9_-]{32,})<\/code>/) || [])[1] || '';
+  assert(raw.length >= 32, 'dracin: kunci mentah minimal 32 byte (b64url)');
+  return raw;
+}
+const syncKey = await dracinKeyFor('sync-test', 'sync');
+const readKey = await dracinKeyFor('read-test', 'read');
+const adminKey = await dracinKeyFor('admin-test', 'admin');
+const storedSync = env.DB.dracinKeys.find(k => k.name === 'sync-test');
+assert(storedSync && storedSync.key_hash !== syncKey && /^[0-9a-f]{64}$/.test(storedSync.key_hash), 'dracin: yang tersimpan hanya hash SHA-256 hex, bukan kunci mentah');
+r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
+assert(t.includes('API Dracin') && t.includes('sync-test') && !t.includes(syncKey), 'dracin: Super Panel menampilkan nama kunci, bukan kunci mentah');
+const syncBody = { titles: [{ platform: 'dracin', title_id: 't1', title: 'Judul Satu', cover_url: 'https://cdn.test/c1.jpg', synopsis: 'Sinopsis.', language: 'id', episode_count: 2, free_count: 1, locked_count: 1, episodes: [{ idx: 0, item_id: 'e0', duration_s: 60, locked: 0 }, { idx: 1, item_id: 'e1', duration_s: 90, locked: 1 }] }] };
+r = await callJson('POST', '/api/dracin/sync', syncBody);
+assert(r.status === 401, 'dracin: sync tanpa kunci ditolak 401');
+r = await callJson('POST', '/api/dracin/sync', syncBody, { authorization: 'Bearer ' + readKey });
+assert(r.status === 403, 'dracin: sync dengan scope read ditolak 403');
+r = await callJson('POST', '/api/dracin/sync', { titles: [{ platform: 'dracin', title_id: 'x', title: 123 }] }, { authorization: 'Bearer ' + syncKey });
+assert(r.status === 400, 'dracin: sync tipe judul salah ditolak 400');
+r = await callJson('POST', '/api/dracin/sync', syncBody, { authorization: 'Bearer ' + syncKey });
+let syncRes = await r.json();
+assert(r.status === 200 && syncRes.titles === 1 && syncRes.episodes === 2, 'dracin: sync sukses, counts {titles:1, episodes:2}');
+r = await callJson('POST', '/api/dracin/sync', syncBody, { authorization: 'Bearer ' + syncKey });
+syncRes = await r.json();
+assert(r.status === 200 && syncRes.titles === 1 && syncRes.episodes === 2 && env.DB.dracinCatalog.length === 1 && env.DB.dracinEpisodes.length === 2, 'dracin: sync kedua idempotent, tanpa duplikat');
+const enBody = { titles: [{ platform: 'dracin', title_id: 't2', title: 'Title Two', language: 'en', episode_count: 0, free_count: 0, locked_count: 0, episodes: [] }] };
+r = await callJson('POST', '/api/dracin/sync', enBody, { authorization: 'Bearer ' + syncKey });
+assert(r.status === 200, 'dracin: sync judul kedua sukses');
+r = await callJson('GET', '/api/dracin/catalog?dub=1', null);
+let cat = await r.json();
+assert(r.status === 200 && cat.titles.length === 1 && cat.titles[0].title_id === 't1', 'dracin: filter dub=1 hanya judul bahasa id');
+r = await callJson('GET', '/api/dracin/catalog?platform=dracin&limit=1', null);
+cat = await r.json();
+assert(cat.titles.length === 1, 'dracin: pagination limit=1 mengembalikan 1 judul');
+r = await callJson('POST', '/api/dracin/titles', { platform: 'dracin', title_id: 't3', title: 'Judul Tiga' }, { authorization: 'Bearer ' + syncKey });
+assert(r.status === 403, 'dracin: CRUD judul dengan scope sync ditolak 403');
+r = await callJson('POST', '/api/dracin/titles', { platform: 'dracin', title_id: 't3', title: 'Judul Tiga' }, { authorization: 'Bearer ' + adminKey });
+assert(r.status === 201, 'dracin: CRUD judul dengan scope admin sukses 201');
+r = await callJson('PUT', '/api/dracin/titles', { platform: 'dracin', title_id: 't3', title: 'Judul Tiga Diedit' }, { authorization: 'Bearer ' + adminKey });
+assert(r.status === 200 && env.DB.dracinCatalog.find(x => x.title_id === 't3').title === 'Judul Tiga Diedit', 'dracin: PUT judul admin mengubah judul');
+r = await callJson('DELETE', '/api/dracin/titles', { platform: 'dracin', title_id: 't3' }, { authorization: 'Bearer ' + readKey });
+assert(r.status === 403, 'dracin: hapus judul dengan scope read ditolak 403');
+r = await callJson('DELETE', '/api/dracin/titles', { platform: 'dracin', title_id: 't3' }, { authorization: 'Bearer ' + adminKey });
+assert(r.status === 200 && !env.DB.dracinCatalog.some(x => x.title_id === 't3'), 'dracin: hapus judul admin sukses');
+r = await callJson('POST', '/api/dracin/seeds', { platform: 'dracin', query: 'romance', enabled: 1 }, { authorization: 'Bearer ' + syncKey });
+assert(r.status === 403, 'dracin: CRUD seed dengan scope sync ditolak 403');
+r = await callJson('POST', '/api/dracin/seeds', { platform: 'dracin', query: 'romance', enabled: 1 }, { authorization: 'Bearer ' + adminKey });
+assert(r.status === 201, 'dracin: tambah seed admin sukses');
+r = await callJson('POST', '/api/dracin/seeds', { platform: 'dracin', query: 'hidden', enabled: 0 }, { authorization: 'Bearer ' + adminKey });
+assert(r.status === 201, 'dracin: tambah seed nonaktif sukses');
+r = await callJson('GET', '/api/dracin/seeds', null);
+let seeds = await r.json();
+assert(seeds.seeds.length === 1 && seeds.seeds[0].query === 'romance', 'dracin: GET seeds publik hanya yang enabled=1');
+r = await callJson('PUT', '/api/dracin/seeds', { platform: 'dracin', query: 'hidden', enabled: 1 }, { authorization: 'Bearer ' + adminKey });
+assert(r.status === 200, 'dracin: PUT seed admin sukses');
+r = await callJson('GET', '/api/dracin/seeds', null);
+seeds = await r.json();
+assert(seeds.seeds.length === 2, 'dracin: seed yang diaktifkan muncul di GET publik');
+r = await callJson('DELETE', '/api/dracin/seeds', { platform: 'dracin', query: 'hidden' }, { authorization: 'Bearer ' + adminKey });
+assert(r.status === 200, 'dracin: hapus seed admin sukses');
+const usageBefore = env.DB.dracinUsage.length;
+r = await callJson('GET', '/api/dracin/catalog', null);
+assert(r.status === 200, 'dracin: GET katalog publik sukses');
+assert(env.DB.dracinUsage.length === usageBefore + 1, 'dracin: satu baris usage tercatat setelah GET katalog');
+const urow = env.DB.dracinUsage[env.DB.dracinUsage.length - 1];
+assert(JSON.stringify(Object.keys(urow).sort()) === JSON.stringify(['city', 'country', 'endpoint', 'key_id', 'method', 'region', 'status', 'ts']), 'dracin: baris usage hanya berisi ts/key_id/endpoint/method/status/country/region/city (tanpa ip/user-agent)');
+assert(urow.endpoint === '/api/dracin/catalog' && urow.method === 'GET' && urow.status === 200, 'dracin: baris usage mencatat endpoint/metode/status benar');
+// Pemeriksaan skema dari sumber (bukan dari mock): usage di schema.sql dan
+// INSERT di worker.js tidak menyebut ip maupun user-agent sama sekali.
+{
+  const { readFileSync } = await import('node:fs');
+  const schemaTxt = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
+  const usageLine = (schemaTxt.split('\n').find(l => l.includes('dracin_api_usage (ts')) || '');
+  assert(usageLine.includes('country TEXT') && !/\bip\b/.test(usageLine.replace('key_id', '')) && !/user.agent/i.test(usageLine), 'dracin: schema.sql dracin_api_usage tanpa kolom ip/user-agent');
+  const workerTxt = readFileSync(new URL('./worker.js', import.meta.url), 'utf8');
+  assert(workerTxt.includes('INSERT INTO dracin_api_usage (ts, key_id, endpoint, method, status, country, region, city)'), 'dracin: worker.js INSERT usage hanya 8 kolom, tanpa ip/user-agent');
+}
+r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
+assert(t.includes('API Dracin') && t.includes('hits total') && t.includes('Per Kunci') && t.includes('Per Endpoint') && t.includes('Per Hari') && t.includes('Per Negara') && t.includes('Buat Kunci Baru'), 'dracin: kartu Super Panel tampil (total, per kunci/endpoint/hari/negara, form kunci)');
+assert(t.includes('background:#3b82f6'), 'dracin: grafik batang per-hari Super Panel tampil');
+assert(t.includes('terakhir dipakai'), 'dracin: kartu menampilkan terakhir dipakai per kunci (WIB)');
+r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status === 303, 'dracin: tombol backup redirect');
+assert(env.BACKUP_DB.backupDracinKeys >= 3 && env.BACKUP_DB.backupDracinCatalog >= 2 && env.BACKUP_DB.backupDracinEpisodes >= 2 && env.BACKUP_DB.backupDracinSeeds >= 1, 'dracin: backup menyalin kunci/katalog/episode/seed ke tabel cms_backup_dracin_*');
+const revokeKey = await dracinKeyFor('revoke-me', 'sync');
+const revokeId = env.DB.dracinKeys.find(k => k.name === 'revoke-me').id;
+r = await call('POST', '/kendali/super/dracin-keys', { csrf, action: 'revoke', id: revokeId }, cookie); assert(r.status === 303, 'dracin: cabut kunci redirect');
+r = await callJson('POST', '/api/dracin/sync', syncBody, { authorization: 'Bearer ' + revokeKey });
+assert(r.status === 401, 'dracin: kunci yang dicabut ditolak 401');
+r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
+assert(t.includes('revoke-me') && t.includes('dicabut'), 'dracin: kunci yang dicabut tampil sebagai dicabut di Super Panel');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
