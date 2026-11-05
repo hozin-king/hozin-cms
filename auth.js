@@ -19,12 +19,21 @@ export function sessionExp(request) {
   return exp || '';
 }
 
-// CSRF sengaja TIDAK diikat ke masa berlaku token akses: token akses diputar
-// tiap jam, dan form dashboard yang sudah dimuat harus tetap sah setelah
-// rotasi. Karena hanya ada satu admin, token CSRF tetap yang hanya diketahui
-// admin yang login sudah cukup melawan pemalsuan lintas situs.
+// H5 (5 Nov 2026): token CSRF TIDAK LAGI diturunkan dari ADMIN_TOKEN.
+// Kunci CSRF sendiri ('csrf_secret') disimpan di cms_settings, dibuat acak
+// saat pertama dipakai, dan diputar tiap login admin (issueTokens) — jadi
+// token CSRF lama mati saat login baru. Tetap tidak diikat ke masa berlaku
+// token akses: token akses diputar tiap jam, dan form dashboard yang sudah
+// dimuat harus tetap sah setelah rotasi.
+async function getCsrfSecret(env) {
+  const row = await env.DB.prepare(`SELECT value FROM cms_settings WHERE key = ?`).bind('csrf_secret').first();
+  if (row && row.value) return String(row.value);
+  const secret = randomHex(32);
+  await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('csrf_secret', ?)`).bind(secret).run();
+  return secret;
+}
 export async function csrfToken(env) {
-  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'csrf') : '';
+  return env.ADMIN_TOKEN ? await hmacHex(await getCsrfSecret(env), 'csrf') : '';
 }
 
 export function accessCookie(env, exp) {
@@ -42,7 +51,9 @@ export async function issueTokens(env, request, remember) {
   const iso = new Date(now).toISOString();
   const expires = new Date(now + ttl).toISOString();
   const device = (request.headers.get('user-agent') || '').slice(0, 80);
-  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(id, hash, device, clientIp(request), iso, iso, expires, remember ? 1 : 0).run();
+  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember, ip_changed, prev_ip) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?, 0, '')`).bind(id, hash, device, clientIp(request), iso, iso, expires, remember ? 1 : 0).run();
+  // H5: putar kunci CSRF tiap login — token CSRF dari sesi lama mati.
+  await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('csrf_secret', ?)`).bind(randomHex(32)).run();
   const refresh = `cms_refresh=${raw}; Path=/kendali; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
   return [access, refresh];
 }
@@ -78,6 +89,19 @@ export async function tryRefresh(request, env) {
     await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(row.id).run();
     return null;
   }
+  // H4 (5 Nov 2026): refresh diikat IP + perangkat (kolom ip/device sudah
+  // ada, tapi tidak pernah dibandingkan). IP DAN perangkat sama-sama beda
+  // = sinyal pencurian: cabut semua sesi. Hanya IP beda (umum di HP yang
+  // pindah jaringan) = izinkan, tapi tandai di sesi baru supaya admin
+  // melihat peringatan di halaman Sesi & Perangkat.
+  const curIp = clientIp(request);
+  const curDevice = (request.headers.get('user-agent') || '').slice(0, 80);
+  const ipChanged = curIp !== (row.ip || '');
+  const deviceChanged = curDevice !== (row.device || '');
+  if (ipChanged && deviceChanged) {
+    await revokeAllRefresh(env);
+    return null;
+  }
   const now = Date.now();
   const newRaw = b64url(crypto.getRandomValues(new Uint8Array(32)));
   const newHash = await sha256Hex(newRaw);
@@ -86,7 +110,7 @@ export async function tryRefresh(request, env) {
   const iso = new Date(now).toISOString();
   const expires = new Date(now + ttl).toISOString();
   await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1, replaced_by = ? WHERE id = ?`).bind(newId, row.id).run();
-  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(newId, newHash, row.device || '', row.ip || '', iso, iso, expires, row.remember ? 1 : 0).run();
+  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember, ip_changed, prev_ip) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?, ?, ?)`).bind(newId, newHash, curDevice, curIp, iso, iso, expires, row.remember ? 1 : 0, ipChanged ? 1 : 0, ipChanged ? (row.ip || '') : '').run();
   const access = await accessCookie(env, String(now + ACCESS_TTL_MS));
   const refresh = `cms_refresh=${newRaw}; Path=/kendali; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
   const headers = new Headers(request.headers);
@@ -123,7 +147,7 @@ export async function verifyPassword(password, saltHex, hashHex) {
   return diff === 0;
 }
 export async function userCsrf(env, userId) {
-  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'user-csrf:' + userId) : '';
+  return env.ADMIN_TOKEN ? await hmacHex(await getCsrfSecret(env), 'user-csrf:' + userId) : '';
 }
 export async function getCommenter(request, env) {
   if (!env.ADMIN_TOKEN) return null;

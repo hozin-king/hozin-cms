@@ -2,7 +2,7 @@
 // Jalankan: node test.mjs  (harus keluar semua OK (kini 18+ cek, termasuk CSRF & rate-limit))
 import worker from './worker.js';
 import { themes } from './themes.js';
-import { renderPage, envSiteTitle } from './store.js';
+import { renderPage, envSiteTitle, pruneRateTables } from './store.js';
 import { parseTags, tagSlug } from './util.js';
 import { tagLinks } from './content.js';
 
@@ -27,6 +27,7 @@ class MockDB {
     if (s.startsWith('CREATE TABLE')) return [];
     if (s.startsWith('PRAGMA table_info(cms_posts)')) return [{ name: 'id' }, { name: 'slug' }, { name: 'title' }, { name: 'body' }, { name: 'category' }, { name: 'status' }, { name: 'created_at' }, { name: 'updated_at' }, { name: 'body_mode' }, { name: 'visibility' }, { name: 'publish_at' }, { name: 'post_password_hash' }, { name: 'post_password_salt' }, { name: 'views' }, { name: 'tags' }];
     if (s.startsWith('PRAGMA table_info(cms_comments)')) return [{ name: 'id' }, { name: 'post_id' }, { name: 'name' }, { name: 'text' }, { name: 'status' }, { name: 'created_at' }, { name: 'parent_id' }];
+    if (s.startsWith('PRAGMA table_info(cms_refresh_tokens)')) return [{ name: 'id' }, { name: 'token_hash' }, { name: 'device' }, { name: 'ip' }, { name: 'created_at' }, { name: 'last_used_at' }, { name: 'expires_at' }, { name: 'revoked' }, { name: 'replaced_by' }, { name: 'remember' }];
     if (s.startsWith('ALTER TABLE')) return [];
     if (s.startsWith('INSERT OR IGNORE INTO cms_settings')) {
       // SQL worker memakai kunci literal di VALUES, bukan bind: ('theme', 'terang')
@@ -54,9 +55,11 @@ class MockDB {
     if (s.startsWith('SELECT * FROM cms_users WHERE id')) return [...this.users.values()].filter(u => u.id === a[0]);
     if (s.startsWith('SELECT * FROM cms_users ORDER BY created_at DESC')) return [...this.users.values()].sort((x, y) => y.created_at.localeCompare(x.created_at));
     if (s.startsWith('SELECT * FROM cms_users ORDER BY created_at ASC')) return [...this.users.values()].sort((x, y) => x.created_at.localeCompare(y.created_at));
+    if (s.startsWith('SELECT id, username, created_at FROM cms_users')) return [...this.users.values()].map(u => ({ id: u.id, username: u.username, created_at: u.created_at })).sort((x, y) => x.created_at.localeCompare(y.created_at));
     if (s.startsWith('DELETE FROM cms_users')) { this.users.delete(a[0]); return []; }
     if (s.startsWith('SELECT count FROM cms_rate_limits')) return this.rateLimits.has(a[0]) ? [{ count: this.rateLimits.get(a[0]) }] : [];
-    if (s.startsWith('INSERT INTO cms_rate_limits')) { this.rateLimits.set(a[0], (this.rateLimits.get(a[0]) || 0) + 1); return []; }
+    if (s.startsWith('INSERT INTO cms_rate_limits')) { this.rateLimits.set(a[0], (this.rateLimits.get(a[0]) || 0) + 1); (this.rateLimitsAt = this.rateLimitsAt || new Map()).set(a[0], Date.now()); return []; }
+    if (s.startsWith('DELETE FROM cms_rate_limits WHERE window_start')) { const cut = new Date(a[0]).getTime(); for (const [k, at] of (this.rateLimitsAt || new Map()).entries()) { if (at < cut) { this.rateLimits.delete(k); this.rateLimitsAt.delete(k); } } return []; }
     if (s.startsWith('SELECT id, slug, visibility, publish_at, post_password_hash, post_password_salt FROM cms_posts WHERE slug')) return this.posts.filter(p => p.slug === a[0]).map(p => ({ id: p.id, slug: p.slug, visibility: p.visibility, publish_at: p.publish_at, post_password_hash: p.post_password_hash, post_password_salt: p.post_password_salt }));
     if (s.startsWith('UPDATE cms_posts SET views')) { const p = this.posts.find(x => x.id === a[0]); if (p) p.views = (p.views || 0) + 1; return []; }
     if (s.startsWith('SELECT id, post_id FROM cms_comments WHERE id')) return this.comments.filter(c => c.id === a[0]).map(c => ({ id: c.id, post_id: c.post_id }));
@@ -75,10 +78,11 @@ class MockDB {
     if (s.startsWith('SELECT * FROM cms_comment_votes ORDER')) return [...this.votes].sort((x, y) => x.comment_id - y.comment_id);
     if (s.startsWith('INSERT INTO cms_login_attempts')) { this.attempts.push({ ip: a[0], created_at: a[1] }); return []; }
     if (s.startsWith('SELECT COUNT(*) AS n FROM cms_login_attempts')) return [{ n: this.attempts.filter(x => x.ip === a[0] && x.created_at > a[1]).length }];
+    if (s.startsWith('DELETE FROM cms_login_attempts WHERE created_at')) { this.attempts = this.attempts.filter(x => x.created_at >= a[0]); return []; }
     if (s.startsWith('DELETE FROM cms_login_attempts')) { this.attempts = this.attempts.filter(x => x.ip !== a[0]); return []; }
-    if (s.startsWith('INSERT INTO cms_refresh_tokens')) { this.refreshTokens.push({ id: a[0], token_hash: a[1], device: a[2], ip: a[3], created_at: a[4], last_used_at: a[5], expires_at: a[6], revoked: 0, replaced_by: '', remember: a[7] }); return []; }
+    if (s.startsWith('INSERT INTO cms_refresh_tokens')) { this.refreshTokens.push({ id: a[0], token_hash: a[1], device: a[2], ip: a[3], created_at: a[4], last_used_at: a[5], expires_at: a[6], revoked: 0, replaced_by: '', remember: a[7], ip_changed: a[8] || 0, prev_ip: a[9] || '' }); return []; }
     if (s.startsWith('SELECT * FROM cms_refresh_tokens WHERE token_hash')) return this.refreshTokens.filter(x => x.token_hash === a[0]);
-    if (s.startsWith('SELECT id, device, ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens')) return this.refreshTokens.filter(x => x.revoked === 0 && x.expires_at > a[0]).sort((x, y) => y.last_used_at.localeCompare(x.last_used_at));
+    if (s.startsWith('SELECT id, device, ip, ip_changed, prev_ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens')) return this.refreshTokens.filter(x => x.revoked === 0 && x.expires_at > a[0]).sort((x, y) => y.last_used_at.localeCompare(x.last_used_at));
     if (s.startsWith('UPDATE cms_refresh_tokens SET revoked = 1, replaced_by = ? WHERE id = ?')) { const rr = this.refreshTokens.find(x => x.id === a[1]); if (rr) { rr.revoked = 1; rr.replaced_by = a[0]; } return []; }
     if (s.startsWith('UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?')) { const rr = this.refreshTokens.find(x => x.id === a[0]); if (rr) rr.revoked = 1; return []; }
     if (s.startsWith('UPDATE cms_refresh_tokens SET revoked = 1 WHERE revoked = 0')) { this.refreshTokens.forEach(x => x.revoked = 1); return []; }
@@ -93,12 +97,17 @@ class MockDB {
     // Mock backup DB: tabel cms_backup_* disimpan di objek yang sama, cukup terima tulisnya
     if (s.startsWith('CREATE TABLE IF NOT EXISTS cms_backup')) return [];
     if (s.startsWith('DELETE FROM cms_backup')) return [];
-    if (s.startsWith('INSERT INTO cms_backup_posts')) { this.backupPosts = (this.backupPosts || 0) + 1; return []; }
+    if (s.startsWith('INSERT INTO cms_backup_posts')) { this.backupPosts = (this.backupPosts || 0) + 1; (this.backupPostRows = this.backupPostRows || []).push({ id: a[0], post_password_hash: a[11], post_password_salt: a[12] }); return []; }
     if (s.startsWith('INSERT INTO cms_backup_comments')) { this.backupComments = (this.backupComments || 0) + 1; return []; }
-    if (s.startsWith('INSERT INTO cms_backup_settings') || s.startsWith('INSERT INTO cms_backup_plugins') || s.startsWith('INSERT INTO cms_backup_users') || s.startsWith('INSERT INTO cms_backup_votes')) return [];
+    if (s.startsWith('INSERT INTO cms_backup_settings') || s.startsWith('INSERT INTO cms_backup_plugins') || s.startsWith('INSERT INTO cms_backup_users') || s.startsWith('INSERT INTO cms_backup_votes')) {
+      if (s.startsWith('INSERT INTO cms_backup_settings')) (this.backupSettings = this.backupSettings || []).push({ key: a[0], value: a[1] });
+      if (s.startsWith('INSERT INTO cms_backup_users')) (this.backupUsers = this.backupUsers || []).push({ id: a[0], username: a[1], password_hash: a[2], salt: a[3], created_at: a[4] });
+      return [];
+    }
     if (s === 'SELECT COUNT(*) AS n FROM cms_posts') return [{ n: this.posts.length }];
     if (s.startsWith('SELECT value FROM cms_settings')) return this.settings.has(a[0]) ? [{ value: this.settings.get(a[0]) }] : [];
     if (s.startsWith('SELECT * FROM cms_settings ORDER')) return [...this.settings.entries()].map(([key, value]) => ({ key, value })).sort((x, y) => x.key.localeCompare(y.key));
+    if (s.startsWith('SELECT key, value FROM cms_settings WHERE key NOT IN')) return [...this.settings.entries()].filter(([k]) => !['imgbb_api_keys', 'imgbb_api_key', 'csrf_secret'].includes(k)).map(([key, value]) => ({ key, value })).sort((x, y) => x.key.localeCompare(y.key));
     if (s.startsWith('SELECT * FROM cms_plugins ORDER')) return [...this.plugins.entries()].map(([id, enabled]) => ({ id, enabled })).sort((x, y) => x.id.localeCompare(y.id));
     if (s.startsWith('SELECT * FROM cms_plugins') || s.startsWith('SELECT id, enabled FROM cms_plugins')) return [...this.plugins.entries()].map(([id, enabled]) => ({ id, enabled }));
     if (s.startsWith('SELECT * FROM cms_posts WHERE status')) {
@@ -230,7 +239,7 @@ r = await call('GET', '/admin'); assert(r.status === 303 && (r.headers.get('loca
 r = await call('POST', '/akun/daftar', { username: 'admin', password: 'password123' }); assert(r.status === 409, 'daftar nama admin ditolak');
 // Ambil token CSRF dari dashboard admin, semua aksi admin wajib pakai token ini
 r = await call('GET', '/kendali', null, cookie); t = await r.text();
-const csrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+let csrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 assert(csrf.length > 10, 'dashboard memberi token CSRF');
 assert(t.includes('Super-Super-Admin'), 'dashboard menandai peran super-super-admin');
 // Aksi admin tanpa CSRF harus ditolak
@@ -254,7 +263,7 @@ r = await call('POST', '/akun/daftar', { username: 'budi', password: 'password12
 let userCookie = cookieHeader(cookiesOf(r));
 assert(userCookie.includes('cms_user='), 'daftar memberi sesi komentator');
 r = await call('GET', '/post/post-uji', null, userCookie); t = await r.text();
-const userCsrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+let userCsrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 assert(userCsrf.length > 10, 'halaman post memberi CSRF komentator');
 r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Komentar uji' }, userCookie); assert(r.status === 303, 'kirim komentar redirect');
 r = await call('GET', '/post/post-uji'); t = await r.text(); assert(!t.includes('Komentar uji'), 'komentar pending belum tampil');
@@ -280,6 +289,20 @@ r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status ===
 r = await call('GET', '/kendali/backup', null, cookie); t = await r.text();
 assert(t.includes('Backup ke Stopwatch') && t.includes('BERHASIL'), 'riwayat backup BERHASIL tampil di halaman Backup');
 assert(env.BACKUP_DB.backupPosts >= 2, 'backup menyalin post ke stopwatch');
+// H2 (5 Nov 2026): backup TIDAK menyalin rahasia — kunci ImgBB, csrf_secret,
+// hash/salt password komentator & post dikosongkan di BACKUP_DB
+// (csrf_secret TIDAK disentuh di sini: sudah ada dari login §2, dan asersi
+// berbasis key — menimpanya akan mematikan token csrf yang dipakai tes lain)
+env.DB.settings.set('imgbb_api_keys', JSON.stringify([{ k: 'RAHASIA-IMGBB', ok: '', fail: '', fail_reason: '' }]));
+env.DB.settings.set('imgbb_api_key', 'RAHASIA-LAMA');
+env.BACKUP_DB.backupSettings = []; env.BACKUP_DB.backupUsers = []; env.BACKUP_DB.backupPostRows = [];
+r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status === 303, 'H2: backup dengan rahasia tetap redirect');
+assert(!env.BACKUP_DB.backupSettings.some(s => s.key === 'imgbb_api_keys' || s.key === 'imgbb_api_key' || s.key === 'csrf_secret'), 'H2: kunci ImgBB + csrf_secret tidak tersalin ke backup');
+assert(env.BACKUP_DB.backupSettings.some(s => s.key === 'site_title'), 'H2: pengaturan biasa tetap tersalin ke backup');
+assert(env.BACKUP_DB.backupUsers.some(u => u.username === 'budi') && env.BACKUP_DB.backupUsers.every(u => u.password_hash === '' && u.salt === ''), 'H2: username tersalin, hash/salt password komentator dikosongkan di backup');
+assert((env.BACKUP_DB.backupPostRows || []).length >= 2 && env.BACKUP_DB.backupPostRows.every(p => p.post_password_hash === '' && p.post_password_salt === ''), 'H2: hash/salt password post dikosongkan di backup');
+// Bersihkan rahasia tes supaya tes berikutnya (ImgBB) mulai dari keadaan tanpa kunci
+env.DB.settings.delete('imgbb_api_keys'); env.DB.settings.delete('imgbb_api_key');
 // Backup tanpa BACKUP_DB -> dicatat GAGAL, bukan crash
 const savedBak = env.BACKUP_DB; delete env.BACKUP_DB;
 r = await call('POST', '/kendali/backup', { csrf }, cookie); assert(r.status === 303, 'backup gagal tetap redirect');
@@ -323,6 +346,65 @@ const csrf3 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 r = await call('POST', '/kendali/logout', { csrf: csrf3 }, cookie); assert(r.status === 303, 'logout satu perangkat redirect');
 r = await call('GET', '/kendali', null, refreshOnly3); t = await r.text();
 assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'setelah logout, refresh perangkat itu dialihkan ke /akun');
+// H4 (5 Nov 2026): refresh token diikat IP + perangkat
+// (helper lokal: request dengan IP + user-agent yang bisa diatur)
+async function callNet(method, path, ip, ua, cookieH = '', body = null) {
+  const headers = { 'cf-connecting-ip': ip, 'user-agent': ua };
+  if (cookieH) headers.cookie = cookieH;
+  if (body) headers['content-type'] = 'application/x-www-form-urlencoded';
+  const req = new Request(base + path, { method, headers, body: body ? new URLSearchParams(body).toString() : undefined });
+  return worker.fetch(req, env);
+}
+env.DB.attempts = [];
+let r4 = await callNet('POST', '/akun/login', '10.0.0.1', 'POCO-Test/1.0', '', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' });
+let cookie4 = cookieHeader(cookiesOf(r4));
+assert(cookie4.includes('cms_refresh='), 'H4: login dari IP A memberi refresh');
+const refreshA = cookie4.split('; ').find(c => c.startsWith('cms_refresh='));
+const rowA = env.DB.refreshTokens[env.DB.refreshTokens.length - 1];
+assert(rowA.ip === '10.0.0.1' && rowA.device === 'POCO-Test/1.0', 'H4: refresh menyimpan IP + perangkat saat login');
+r4 = await callNet('GET', '/kendali', '10.0.0.1', 'POCO-Test/1.0', refreshA);
+assert(r4.status === 200, 'H4: refresh IP + perangkat sama tetap masuk');
+const rowA2 = env.DB.refreshTokens[env.DB.refreshTokens.length - 1];
+assert(rowA2.ip_changed === 0, 'H4: refresh normal tanpa tanda IP berubah');
+const refreshA2 = cookieHeader(cookiesOf(r4)).split('; ').find(c => c.startsWith('cms_refresh='));
+r4 = await callNet('GET', '/kendali', '10.0.0.2', 'POCO-Test/1.0', refreshA2);
+assert(r4.status === 200, 'H4: refresh IP beda perangkat sama tetap masuk (pindah jaringan)');
+const rowA3 = env.DB.refreshTokens[env.DB.refreshTokens.length - 1];
+assert(rowA3.ip_changed === 1 && rowA3.prev_ip === '10.0.0.1' && rowA3.ip === '10.0.0.2', 'H4: refresh IP beda ditandai ip_changed + prev_ip');
+const refreshA3 = cookieHeader(cookiesOf(r4)).split('; ').find(c => c.startsWith('cms_refresh='));
+r4 = await callNet('GET', '/kendali/sessions', '10.0.0.2', 'POCO-Test/1.0', cookieHeader(cookiesOf(r4)));
+t = await r4.text();
+assert(t.includes('IP berubah dari 10.0.0.1'), 'H4: halaman sesi menampilkan peringatan IP berubah');
+r4 = await callNet('GET', '/kendali', '9.9.9.9', 'Pencuri/1.0', refreshA3);
+assert(r4.status === 303 && (r4.headers.get('location') || '').startsWith('/akun'), 'H4: refresh IP + perangkat beda dialihkan ke /akun');
+assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'H4: IP + perangkat beda mencabut semua sesi');
+// H5 (5 Nov 2026): login memutar kunci CSRF — token csrf lama mati, ambil yang baru
+// (tes-tes berikutnya memakai csrf/userCsrf yang diperbarui di sini)
+const csrfLama = csrf;
+assert(env.DB.settings.get('csrf_secret') && env.DB.settings.get('csrf_secret') !== 'test-admin-token', 'H5: kunci CSRF tersimpan di settings, bukan ADMIN_TOKEN');
+env.DB.attempts = [];
+r4 = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' });
+cookie = cookieHeader(cookiesOf(r4));
+r4 = await call('GET', '/kendali', null, cookie); t = await r4.text();
+csrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+assert(csrf.length > 10 && csrf !== csrfLama, 'H5: login baru memutar token CSRF');
+r4 = await call('POST', '/kendali/posts', { csrf: csrfLama, title: 'Post CSRF Lama', category: 'X', body: 'x' }, cookie); assert(r4.status === 403, 'H5: token CSRF lama setelah login ulang ditolak');
+r4 = await call('GET', '/post/post-uji', null, userCookie); t = await r4.text();
+userCsrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+assert(userCsrf.length > 10, 'H5: CSRF komentator baru setelah login admin ulang');
+// H6 (5 Nov 2026): tabel rate-limit + percobaan login di-prune berkala
+env.DB.rateLimits.set('stale-key:0', 5);
+(env.DB.rateLimitsAt = env.DB.rateLimitsAt || new Map()).set('stale-key:0', Date.now() - 25 * 3600 * 1000);
+env.DB.rateLimits.set('fresh-key:0', 1);
+(env.DB.rateLimitsAt = env.DB.rateLimitsAt || new Map()).set('fresh-key:0', Date.now());
+env.DB.attempts.push({ ip: '9.9.9.9', created_at: new Date(Date.now() - 2 * 3600 * 1000).toISOString() });
+env.DB.attempts.push({ ip: '10.10.10.10', created_at: new Date().toISOString() });
+await pruneRateTables(env);
+assert(!env.DB.rateLimits.has('stale-key:0'), 'H6: baris rate-limit kedaluwarsa (>24 jam) di-prune');
+assert(env.DB.rateLimits.has('fresh-key:0'), 'H6: baris rate-limit baru tetap ada setelah prune');
+assert(!env.DB.attempts.some(x => x.ip === '9.9.9.9'), 'H6: percobaan login lama (>1 jam) di-prune');
+assert(env.DB.attempts.some(x => x.ip === '10.10.10.10'), 'H6: percobaan login baru tetap ada setelah prune');
+env.DB.rateLimits.delete('fresh-key:0');
 // 9. Failsafe = halaman Pemeliharaan berbahasa Inggris untuk SELURUH situs
 // saat database hilang/error (perintah pemilik 29 Okt 2026 20:44 WIB;
 // sebelumnya 20:42-20:43: tanpa detail teknis di situs, bentuk pemeliharaan).
@@ -627,12 +709,22 @@ env.DB.rateLimits = new Map();
 r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Komentar auto-reply dua' }, userCookie);
 const arCid2 = env.DB.comments[env.DB.comments.length - 1].id;
 r = await call('POST', '/kendali/comments/approve', { csrf, id: String(arCid2) }, cookie); assert(r.status === 303, 'auto-reply: setujui dengan secret redirect');
-assert(env.DB.comments.some(c => c.parent_id === arCid2 && c.name === 'Balasan Otomatis' && c.text === 'Terima kasih atas komentarnya!' && c.status === 'approved'), 'auto-reply: balasan bot tersimpan sebagai anak komentar, status approved');
+assert(env.DB.comments.some(c => c.parent_id === arCid2 && c.name === 'Balasan Otomatis' && c.text === 'Terima kasih atas komentarnya!' && c.status === 'pending'), 'auto-reply: balasan bot tersimpan sebagai anak komentar, status pending (H3: ditinjau admin dulu)');
 r = await call('GET', '/post/post-uji'); t = await r.text();
-assert(t.includes('Balasan Otomatis') && t.includes('Terima kasih atas komentarnya!'), 'auto-reply: balasan bot tampil di halaman post');
+assert(!t.includes('Terima kasih atas komentarnya!'), 'auto-reply: balasan bot pending belum tampil di halaman post (H3)');
 const botCount = env.DB.comments.filter(c => c.parent_id === arCid2 && c.name === 'Balasan Otomatis').length;
 r = await call('POST', '/kendali/comments/approve', { csrf, id: String(arCid2) }, cookie);
 assert(env.DB.comments.filter(c => c.parent_id === arCid2 && c.name === 'Balasan Otomatis').length === botCount, 'auto-reply: setujui ulang tidak menggandakan balasan');
+// H3: balasan bot yang kena filter blokir (ada link) tidak disimpan sama sekali
+// (tes simpan-massal plugin sebelumnya mematikan semua plugin kecuali reading-time,
+// jadi nyalakan lagi ketiga plugin blokir lewat jalur resmi)
+r = await call('POST', '/kendali/plugins/save', { csrf, 'plugin_reading-time': '1', 'plugin_blokir-link': '1', 'plugin_blokir-kotor': '1', 'plugin_blokir-judol': '1' }, cookie); assert(r.status === 303, 'H3: aktifkan kembali plugin blokir redirect');
+globalThis.fetch = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: 'Cek https://contoh.com ya!' } }] }) });
+env.DB.rateLimits = new Map();
+r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Komentar auto-reply link' }, userCookie);
+const arCid4 = env.DB.comments[env.DB.comments.length - 1].id;
+r = await call('POST', '/kendali/comments/approve', { csrf, id: String(arCid4) }, cookie); assert(r.status === 303, 'H3: setujui komentar pemicu filter tetap redirect');
+assert(!env.DB.comments.some(c => c.parent_id === arCid4 && c.name === 'Balasan Otomatis'), 'H3: balasan bot ber-link tidak disimpan (filter blokir-link)');
 globalThis.fetch = async () => ({ ok: false, json: async () => ({}) });
 env.DB.rateLimits = new Map();
 r = await call('POST', '/post/post-uji/comment', { csrf: userCsrf, text: 'Komentar auto-reply gagal' }, userCookie);
@@ -804,4 +896,19 @@ r = await callJson('POST', '/api/dracin/sync', syncBody, { authorization: 'Beare
 assert(r.status === 401, 'dracin: kunci yang dicabut ditolak 401');
 r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
 assert(t.includes('revoke-me') && t.includes('dicabut'), 'dracin: kunci yang dicabut tampil sebagai dicabut di Super Panel');
+// 30. H1 audit (31 Okt 2026): penulisan view dibatasi per IP, halaman tetap tampil
+env.DB.rateLimits = new Map();
+const h1Post = env.DB.posts.find(x => x.slug === 'post-uji');
+const h1Before = Number(h1Post.views) || 0;
+const h1EventsBefore = env.DB.viewEvents.length;
+async function h1View() {
+  const req = new Request(base + '/post/post-uji', { method: 'GET', headers: { 'cf-connecting-ip': '203.0.113.99' } });
+  return worker.fetch(req, env);
+}
+for (let i = 0; i < 30; i++) { r = await h1View(); assert(r.status === 200, 'h1: 30 view pertama dari satu IP tetap tampil 200'); }
+assert(Number(env.DB.posts.find(x => x.slug === 'post-uji').views) === h1Before + 30, 'h1: 30 view pertama menambah counter');
+assert(env.DB.viewEvents.length === h1EventsBefore + 30, 'h1: 30 view pertama menambah riwayat view_events');
+for (let i = 0; i < 5; i++) { r = await h1View(); t = await r.text(); assert(r.status === 200 && t.includes('Post Uji'), 'h1: view ke-31+ dari IP yang sama tetap tampil normal (tidak diblokir)'); }
+assert(Number(env.DB.posts.find(x => x.slug === 'post-uji').views) === h1Before + 30, 'h1: view di atas limit 30/jam tidak menambah counter lagi');
+assert(env.DB.viewEvents.length === h1EventsBefore + 30, 'h1: view di atas limit tidak menambah riwayat view_events');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

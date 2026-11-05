@@ -50,6 +50,11 @@ export async function ensureSchema(env) {
       const cInfo = await env.DB.prepare(`PRAGMA table_info(cms_comments)`).all();
       const cHave = new Set((cInfo.results || []).map(r => r.name));
       if (!cHave.has('parent_id')) await env.DB.prepare(`ALTER TABLE cms_comments ADD COLUMN parent_id INTEGER`).run();
+      // H4 (5 Nov 2026): kolom penanda IP berubah pada refresh token.
+      const rInfo = await env.DB.prepare(`PRAGMA table_info(cms_refresh_tokens)`).all();
+      const rHave = new Set((rInfo.results || []).map(r => r.name));
+      if (!rHave.has('ip_changed')) await env.DB.prepare(`ALTER TABLE cms_refresh_tokens ADD COLUMN ip_changed INTEGER NOT NULL DEFAULT 0`).run();
+      if (!rHave.has('prev_ip')) await env.DB.prepare(`ALTER TABLE cms_refresh_tokens ADD COLUMN prev_ip TEXT NOT NULL DEFAULT ''`).run();
       if (!cHave.has('pinned')) await env.DB.prepare(`ALTER TABLE cms_comments ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`).run();
       await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('site_title', 'WorkerCMS')`).run();
       await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`).run();
@@ -75,13 +80,30 @@ export async function getEnabledPlugins(env) {
   return pluginDefs.filter(p => map.get(p.id) !== false);
 }
 
+// H6 (5 Nov 2026): prune berkala tabel rate-limit — sebelumnya hanya INSERT,
+// tidak pernah dihapus, jadi tumbuh tanpa batas. Baris rate-limit kedaluwarsa
+// (>24 jam; jendela terpanjang 1 jam) dan percobaan login lama (>1 jam;
+// jendela login 15 menit) dihapus. Dipanggil dari checkRateLimit di
+// security.js, paling sering 1x/jam per isolate.
+export async function pruneRateTables(env) {
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  await env.DB.prepare(`DELETE FROM cms_rate_limits WHERE window_start < ?`).bind(dayAgo).run();
+  await env.DB.prepare(`DELETE FROM cms_login_attempts WHERE created_at < ?`).bind(hourAgo).run();
+}
+
 export async function doBackup(env) {
   if (!env.BACKUP_DB) throw new Error('Binding BACKUP_DB belum dipasang di Worker');
   const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at ASC`).all();
   const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at ASC`).all();
-  const settings = await env.DB.prepare(`SELECT * FROM cms_settings ORDER BY key ASC`).all();
+  // H2 (5 Nov 2026): backup TIDAK menyalin rahasia ke BACKUP_DB bersama —
+  // kunci ImgBB ('imgbb_api_keys'/'imgbb_api_key'), 'csrf_secret' (H5), dan
+  // hash/salt password (komentator + post) dikosongkan. Setelah restore,
+  // isi ulang kunci ImgBB di /kendali/settings; csrf_secret dibuat ulang
+  // otomatis saat login berikut; komentator perlu reset password.
+  const settings = await env.DB.prepare(`SELECT key, value FROM cms_settings WHERE key NOT IN ('imgbb_api_keys', 'imgbb_api_key', 'csrf_secret') ORDER BY key ASC`).all();
   const plugins = await env.DB.prepare(`SELECT * FROM cms_plugins ORDER BY id ASC`).all();
-  const users = await env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at ASC`).all();
+  const users = await env.DB.prepare(`SELECT id, username, created_at FROM cms_users ORDER BY created_at ASC`).all();
   const votes = await env.DB.prepare(`SELECT * FROM cms_comment_votes ORDER BY comment_id ASC`).all();
   const loadtests = await env.DB.prepare(`SELECT * FROM cms_loadtest_runs ORDER BY created_at ASC`).all();
   const dracinKeys = await env.DB.prepare(`SELECT * FROM dracin_api_keys ORDER BY created_at ASC`).all();
@@ -120,13 +142,13 @@ export async function doBackup(env) {
     bak.prepare(`DELETE FROM cms_backup_dracin_api_usage`),
   ];
   for (const p of (posts.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views, tags, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(p.id, p.slug, p.title, p.body, p.category, p.status, p.created_at, p.updated_at, p.body_mode || 'text', p.visibility || 'public', p.publish_at || p.created_at || '', p.post_password_hash || '', p.post_password_salt || '', Number(p.views) || 0, p.tags || '', now));
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views, tags, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(p.id, p.slug, p.title, p.body, p.category, p.status, p.created_at, p.updated_at, p.body_mode || 'text', p.visibility || 'public', p.publish_at || p.created_at || '', '', '', Number(p.views) || 0, p.tags || '', now));
   }
   for (const c of (comments.results || [])) {
     stmts.push(bak.prepare(`INSERT INTO cms_backup_comments (id, post_id, name, text, status, created_at, parent_id, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(c.id, c.post_id, c.name, c.text, c.status, c.created_at, c.parent_id ?? null, now));
   }
   for (const u of (users.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_users (id, username, password_hash, salt, created_at, backup_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(u.id, u.username, u.password_hash, u.salt, u.created_at, now));
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_users (id, username, password_hash, salt, created_at, backup_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(u.id, u.username, '', '', u.created_at, now));
   }
   for (const v of (votes.results || [])) {
     stmts.push(bak.prepare(`INSERT INTO cms_backup_votes (comment_id, user_key, vote, backup_at) VALUES (?, ?, ?, ?)`).bind(v.comment_id, v.user_key, v.vote, now));
