@@ -424,11 +424,16 @@ assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun')
 r = await callDown('GET', '/post/post-uji'); t = await r.text();
 assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1'), 'failsafe halaman lain: halaman pemeliharaan Inggris, tanpa detail teknis');
 
-// 10. Tema v2 ala WordPress: 4 tema, responsif lintas platform
-assert(Object.keys(themes).join(',') === 'terang,gelap,majalah,minimal', 'tema: 4 tema tersedia (terang, gelap, majalah, minimal)');
+// 10. Tema v2 ala WordPress: 6 tema, responsif lintas platform
+assert(Object.keys(themes).join(',') === 'terang,gelap,majalah,minimal,renando,glass', 'tema: 6 tema tersedia (terang, gelap, majalah, minimal, renando, glass)');
 assert(themes.gelap.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('#05070d'), 'tema gelap: identitas default dipertahankan');
 assert(themes.majalah.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('Georgia'), 'tema majalah: font serif berbeda dari terang/gelap');
 assert(themes.minimal.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('border-radius:8px'), 'tema minimal: radius kartu berbeda');
+const renandoHtml = themes.renando.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' });
+assert(renandoHtml.includes('#0a0a0a') && renandoHtml.includes('renandoUp'), 'tema renando: latar pekat + animasi naik');
+const glassHtml = themes.glass.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' });
+assert(glassHtml.includes('glass-dock') && glassHtml.includes('backdrop-filter') && glassHtml.includes('glass-gooey'), 'tema glass: dock kaca + blur + filter gooey');
+assert((glassHtml.match(/class="glass-dock-item"/g) || []).length === 2 && glassHtml.includes('href="/"') && glassHtml.includes('href="/akun"'), 'tema glass: hanya 2 ikon nyata (Beranda + Akun), tanpa tombol palsu');
 const terangHtml = themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' });
 assert(terangHtml.includes('width=device-width') && terangHtml.includes('@media (max-width:600px)') && terangHtml.includes('min-height:44px'), 'tema responsif: viewport + breakpoint HP + target sentuh 44px');
 
