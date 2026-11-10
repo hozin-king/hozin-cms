@@ -25,11 +25,11 @@
 // Situs lama yang ada di root harus dipindah ke subdomain dulu bila root mau jadi CMS ini.
 import { themes } from './themes.js';
 import { pluginDefs } from './plugins.js';
-import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex, parseTags, tagSlug, sha256Hex, b64url } from './util.js';
-import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie } from './auth.js';
+import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex, parseTags, tagSlug, readCappedBody } from './util.js';
+import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie, isValidCommenterPassword, COMMENTER_PASSWORD_MIN, COMMENTER_PASSWORD_MAX } from './auth.js';
 import { checkRateLimit } from './security.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
-import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle } from './store.js';
+import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
 import { editorCard } from './editor.js';
 import { hasLink, hasDirtyWord, hasJudol } from './plugins.js';
 // Balasan otomatis komentar (perintah pemilik 31 Okt 2026): model TEKS Dahono
@@ -38,9 +38,6 @@ import { hasLink, hasDirtyWord, hasJudol } from './plugins.js';
 // komentar masuk berstatus pending dan belum tampil). Satu komentar = maks 1 balasan,
 // nama jelas bot (bukan Admin), tidak membalas balasan bot sendiri, dan kegagalan
 // Dahono TIDAK PERNAH menggagalkan persetujuan komentar (fail-silent).
-// H3 (5 Nov 2026): balasan masuk status pending (ditinjau admin dulu) dan wajib
-// lolos filter blokir yang sama seperti komentar biasa — tidak pernah tampil
-// langsung sebagai approved.
 // Kunci WAJIB secret Worker DAHONO_API_KEY — jangan pernah ditulis di kode/repo
 // (repo ini publik). Toggle di Pengaturan: auto_reply_enabled ('1' = aktif).
 const AUTO_REPLY_BOT_NAME = 'Balasan Otomatis';
@@ -68,208 +65,53 @@ async function generateAutoReply(env, postTitle, commentText) {
 }
 const ADSENSE_CSP = "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://pagead2.googlesyndication.com; frame-src https://googleads.g.doubleclick.net https://tpc.googlesyndication.com https://pagead2.googlesyndication.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
 
-// ---- API Dracin (pipeline katalog metadata) ----
-// Batasan keras: endpoint ini HANYA menyimpan metadata katalog (judul,
-// cover, sinopsis, bahasa, hitungan episode). TIDAK ADA stream URL yang
-// disimpan di tabel mana pun, dan TIDAK ADA identitas perangkat/pengguna.
-// Tabel usage hanya mencatat lokasi kasar dari request.cf (negara/provinsi/
-// kota) — TIDAK ADA kolom IP dan TIDAK ADA kolom user-agent, jadi keduanya
-// tidak pernah bisa bocor lewat backup maupun Super Panel.
-// Perbandingan hash kunci: Workers tidak menyediakan timingSafeEqual
-// (itu API Node), jadi dipakai loop manual waktu-konstan di bawah —
-// catatannya ada di laporan, bukan disembunyikan sebagai "timing-safe".
-function dracinJson(obj, status) {
-  return new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
-}
-function timingSafeHexEqual(a, b) {
-  const x = String(a || ''), y = String(b || '');
-  const n = Math.max(x.length, y.length);
-  let diff = x.length ^ y.length;
-  for (let i = 0; i < n; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);
-  return diff === 0;
-}
-function dracinLoc(request) {
-  const cf = request.cf || {};
-  const clean = v => String(v || '').slice(0, 100);
-  return { country: clean(cf.country), region: clean(cf.region), city: clean(cf.city) };
-}
-async function dracinKey(request, env) {
-  const m = /^Bearer\s+(.+)$/.exec(String(request.headers.get('authorization') || '').trim());
-  if (!m) return null;
-  const hash = await sha256Hex(m[1]);
-  const row = await env.DB.prepare(`SELECT * FROM dracin_api_keys WHERE key_hash = ?`).bind(hash).first();
-  if (!row || Number(row.active) !== 1) return null;
-  if (!timingSafeHexEqual(String(row.key_hash), hash)) return null;
-  return row;
-}
-async function logDracinUsage(env, request, keyId, endpoint, status) {
-  try {
-    const loc = dracinLoc(request);
-    await env.DB.prepare(`INSERT INTO dracin_api_usage (ts, key_id, endpoint, method, status, country, region, city) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(Date.now(), keyId || '', endpoint, request.method, status, loc.country, loc.region, loc.city).run();
-  } catch (e) {}
-}
-// Validasi ketat satu judul (sync + CRUD judul memakai bentuk yang sama).
-// Kolom tak dikenal diabaikan (bukan ditolak) supaya produser yang
-// menambah kolom metadata baru tidak langsung gagal sync. Mengembalikan
-// objek ternormalisasi, atau null bila ada tipe/nilai yang tidak sah.
-function validDracinTitle(t) {
-  if (!t || typeof t !== 'object' || Array.isArray(t)) return null;
-  const isStr = (v, max) => typeof v === 'string' && v.length <= max;
-  const isCount = v => Number.isInteger(v) && v >= 0 && v <= 1000000;
-  if (!isStr(t.platform, 100) || !t.platform) return null;
-  if (!isStr(t.title_id, 200) || !t.title_id) return null;
-  if (!isStr(t.title, 500) || !t.title) return null;
-  if (t.cover_url !== undefined && !isStr(t.cover_url, 1000)) return null;
-  if (t.synopsis !== undefined && !isStr(t.synopsis, 5000)) return null;
-  if (t.language !== undefined && !isStr(t.language, 20)) return null;
-  for (const f of ['episode_count', 'free_count', 'locked_count']) if (t[f] !== undefined && !isCount(t[f])) return null;
-  let episodes = null;
-  if (t.episodes !== undefined) {
-    if (!Array.isArray(t.episodes) || t.episodes.length > 2000) return null;
-    episodes = [];
-    for (const e of t.episodes) {
-      if (!e || typeof e !== 'object' || Array.isArray(e)) return null;
-      if (!Number.isInteger(e.idx) || e.idx < 0 || e.idx > 100000) return null;
-      if (!isStr(e.item_id, 200) || !e.item_id) return null;
-      if (e.duration_s !== undefined && (typeof e.duration_s !== 'number' || !isFinite(e.duration_s) || e.duration_s < 0)) return null;
-      if (e.locked !== undefined && !(e.locked === 0 || e.locked === 1 || e.locked === true || e.locked === false)) return null;
-      episodes.push({ idx: e.idx, item_id: e.item_id, duration_s: e.duration_s || 0, locked: e.locked === 1 || e.locked === true ? 1 : 0 });
-    }
-  }
-  return {
-    platform: t.platform, title_id: t.title_id, title: t.title,
-    cover_url: t.cover_url || '', synopsis: t.synopsis || '', language: t.language || '',
-    episode_count: t.episode_count || 0, free_count: t.free_count || 0, locked_count: t.locked_count || 0,
-    episodes,
-  };
-}
-async function upsertDracinTitle(env, v, now) {
-  await env.DB.prepare(`INSERT INTO dracin_catalog (platform, title_id, title, cover_url, synopsis, language, episode_count, free_count, locked_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(platform, title_id) DO UPDATE SET title = excluded.title, cover_url = excluded.cover_url, synopsis = excluded.synopsis, language = excluded.language, episode_count = excluded.episode_count, free_count = excluded.free_count, locked_count = excluded.locked_count, updated_at = excluded.updated_at`).bind(v.platform, v.title_id, v.title, v.cover_url, v.synopsis, v.language, v.episode_count, v.free_count, v.locked_count, now).run();
-  if (v.episodes) {
-    for (const e of v.episodes) {
-      await env.DB.prepare(`INSERT OR REPLACE INTO dracin_episodes (platform, title_id, idx, item_id, duration_s, locked) VALUES (?, ?, ?, ?, ?, ?)`).bind(v.platform, v.title_id, e.idx, e.item_id, e.duration_s, e.locked).run();
-    }
-  }
-  return v.episodes ? v.episodes.length : 0;
-}
-// Satu-satunya jalur /api/dracin/*: mengembalikan { res, keyId } supaya
-// pemanggil bisa mencatat usage SEKALI untuk semua cabang (termasuk 401/
-// 403/429/404) — tidak ada cabang yang lolos tanpa tercatat.
-async function routeDracin(request, env, url) {
-  const path = url.pathname;
-  const needKey = async scopes => {
-    const k = await dracinKey(request, env);
-    if (!k) return { err: dracinJson({ ok: false, error: 'unauthorized' }, 401), key: null };
-    if (!scopes.includes(k.scope)) return { err: dracinJson({ ok: false, error: 'forbidden' }, 403), key: k };
-    return { err: null, key: k };
-  };
-  // Baca publik: kunci valid -> bucket per kunci; tanpa kunci / kunci
-  // tidak valid -> tetap boleh baca (metadata publik) dengan bucket
-  // bersama per IP, supaya satu IP nakal tidak menghabiskan kuota kunci.
-  if (request.method === 'GET' && path === '/api/dracin/catalog') {
-    const k = await dracinKey(request, env);
-    const bucket = k ? 'dracin-read:' + k.id : 'dracin-read-pub:' + clientIp(request);
-    if (!(await checkRateLimit(env, bucket, 300, 60 * 60 * 1000))) return { res: dracinJson({ ok: false, error: 'rate limit' }, 429), keyId: k ? k.id : '' };
-    const platform = String(url.searchParams.get('platform') || '').slice(0, 100);
-    const dub = url.searchParams.get('dub') === '1' || url.searchParams.get('dub') === 'true';
-    const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get('limit') || '50', 10) || 50));
-    const offset = Math.min(10000, Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0));
-    const conds = [], args = [];
-    if (platform) { conds.push('platform = ?'); args.push(platform); }
-    if (dub) { conds.push('language = ?'); args.push('id'); }
-    let sql = `SELECT * FROM dracin_catalog`;
-    if (conds.length) sql += ' WHERE ' + conds.join(' AND ');
-    sql += ` ORDER BY updated_at DESC LIMIT ? OFFSET ?`;
-    args.push(limit, offset);
-    const rows = await env.DB.prepare(sql).bind(...args).all();
-    return { res: dracinJson({ ok: true, titles: rows.results || [] }), keyId: k ? k.id : '' };
-  }
-  if (request.method === 'GET' && path === '/api/dracin/seeds') {
-    const k = await dracinKey(request, env);
-    const bucket = k ? 'dracin-read:' + k.id : 'dracin-read-pub:' + clientIp(request);
-    if (!(await checkRateLimit(env, bucket, 300, 60 * 60 * 1000))) return { res: dracinJson({ ok: false, error: 'rate limit' }, 429), keyId: k ? k.id : '' };
-    const rows = await env.DB.prepare(`SELECT * FROM dracin_seeds WHERE enabled = 1 ORDER BY platform ASC, query ASC`).all();
-    return { res: dracinJson({ ok: true, seeds: rows.results || [] }), keyId: k ? k.id : '' };
-  }
-  if (path === '/api/dracin/sync' || path === '/api/dracin/titles' || path === '/api/dracin/seeds') {
-    if ((path === '/api/dracin/sync' && request.method !== 'POST') || ((path === '/api/dracin/titles' || path === '/api/dracin/seeds') && !['POST', 'PUT', 'DELETE'].includes(request.method))) return { res: dracinJson({ ok: false, error: 'tidak ditemukan' }, 404), keyId: '' };
-    const scopes = path === '/api/dracin/sync' ? ['sync', 'admin'] : ['admin'];
-    const auth = await needKey(scopes);
-    if (auth.err) return { res: auth.err, keyId: auth.key ? auth.key.id : '' };
-    const key = auth.key;
-    if (path === '/api/dracin/sync') {
-      if (!(await checkRateLimit(env, 'dracin-sync:' + key.id, 60, 60 * 60 * 1000))) return { res: dracinJson({ ok: false, error: 'rate limit' }, 429), keyId: key.id };
-      if (Number(request.headers.get('content-length') || '0') > 200000) return { res: dracinJson({ ok: false, error: 'payload terlalu besar' }, 413), keyId: key.id };
-      let data = null;
-      try {
-        const text = await request.text();
-        if (text.length > 200000) return { res: dracinJson({ ok: false, error: 'payload terlalu besar' }, 413), keyId: key.id };
-        data = JSON.parse(text);
-      } catch (e) { return { res: dracinJson({ ok: false, error: 'payload bukan JSON' }, 400), keyId: key.id }; }
-      if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.titles) || data.titles.length > 500) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-      const now = Date.now();
-      let epCount = 0;
-      for (const raw of data.titles) {
-        const v = validDracinTitle(raw);
-        if (!v) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-        epCount += await upsertDracinTitle(env, v, now);
-      }
-      return { res: dracinJson({ ok: true, titles: data.titles.length, episodes: epCount }), keyId: key.id };
-    }
-    let data = null;
-    try { data = JSON.parse(await request.text()); } catch (e) { return { res: dracinJson({ ok: false, error: 'payload bukan JSON' }, 400), keyId: key.id }; }
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-    if (path === '/api/dracin/titles') {
-      if (request.method === 'POST') {
-        const v = validDracinTitle(data);
-        if (!v) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-        await upsertDracinTitle(env, v, Date.now());
-        return { res: dracinJson({ ok: true, title_id: v.title_id }, 201), keyId: key.id };
-      }
-      if (request.method === 'PUT') {
-        if (typeof data.platform !== 'string' || !data.platform || typeof data.title_id !== 'string' || !data.title_id) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-        const old = await env.DB.prepare(`SELECT * FROM dracin_catalog WHERE platform = ? AND title_id = ?`).bind(data.platform, data.title_id).first();
-        if (!old) return { res: dracinJson({ ok: false, error: 'tidak ditemukan' }, 404), keyId: key.id };
-        const merged = validDracinTitle({ ...old, ...data, platform: old.platform, title_id: old.title_id, episodes: data.episodes });
-        if (!merged) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-        await upsertDracinTitle(env, merged, Date.now());
-        return { res: dracinJson({ ok: true }), keyId: key.id };
-      }
-      if (request.method === 'DELETE') {
-        if (typeof data.platform !== 'string' || !data.platform || typeof data.title_id !== 'string' || !data.title_id) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-        await env.DB.prepare(`DELETE FROM dracin_episodes WHERE platform = ? AND title_id = ?`).bind(data.platform, data.title_id).run();
-        await env.DB.prepare(`DELETE FROM dracin_catalog WHERE platform = ? AND title_id = ?`).bind(data.platform, data.title_id).run();
-        return { res: dracinJson({ ok: true }), keyId: key.id };
-      }
-    }
-    if (path === '/api/dracin/seeds') {
-      if (request.method === 'POST') {
-        if (typeof data.platform !== 'string' || !data.platform || data.platform.length > 100 || typeof data.query !== 'string' || !data.query || data.query.length > 500) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-        if (data.enabled !== undefined && !(data.enabled === 0 || data.enabled === 1 || data.enabled === true || data.enabled === false)) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-        await env.DB.prepare(`INSERT OR REPLACE INTO dracin_seeds (platform, query, enabled) VALUES (?, ?, ?)`).bind(data.platform, data.query, data.enabled === 0 || data.enabled === false ? 0 : 1).run();
-        return { res: dracinJson({ ok: true }, 201), keyId: key.id };
-      }
-      if (request.method === 'PUT') {
-        if (typeof data.platform !== 'string' || !data.platform || typeof data.query !== 'string' || !data.query || !(data.enabled === 0 || data.enabled === 1 || data.enabled === true || data.enabled === false)) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-        const old = await env.DB.prepare(`SELECT * FROM dracin_seeds WHERE platform = ? AND query = ?`).bind(data.platform, data.query).first();
-        if (!old) return { res: dracinJson({ ok: false, error: 'tidak ditemukan' }, 404), keyId: key.id };
-        await env.DB.prepare(`UPDATE dracin_seeds SET enabled = ? WHERE platform = ? AND query = ?`).bind(data.enabled === 1 || data.enabled === true ? 1 : 0, data.platform, data.query).run();
-        return { res: dracinJson({ ok: true }), keyId: key.id };
-      }
-      if (request.method === 'DELETE') {
-        if (typeof data.platform !== 'string' || !data.platform || typeof data.query !== 'string' || !data.query) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
-        await env.DB.prepare(`DELETE FROM dracin_seeds WHERE platform = ? AND query = ?`).bind(data.platform, data.query).run();
-        return { res: dracinJson({ ok: true }), keyId: key.id };
-      }
-    }
-  }
-  return { res: dracinJson({ ok: false, error: 'tidak ditemukan' }, 404), keyId: '' };
-}
-
 
 function adminNav(current) {
   const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup']];
   return '<nav style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-bottom:16px">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' style="font-weight:800;text-decoration:underline"' : '') + '>' + label + '</a>').join('') + '</nav>';
+}
+
+// Notifikasi sekali jalan untuk aksi admin: redirect membawa
+// ?notice=<slug>, halaman tujuan menampilkan pesan tetap (allowlist,
+// tanpa detail error sensitif). Slug yang tidak dikenal diabaikan.
+const ADMIN_NOTICES = {
+  'pengaturan-disimpan': 'Pengaturan disimpan.',
+  'komentar-disetujui': 'Komentar disetujui.',
+  'komentar-dihapus': 'Komentar dihapus.',
+  'komentar-disematkan': 'Komentar disematkan.',
+  'komentar-dilepas': 'Sematan komentar dilepas.',
+  'komentar-diubah': 'Komentar diubah.',
+  'plugin-disimpan': 'Plugin disimpan.',
+  'post-dibuat': 'Post dibuat.',
+  'post-diubah': 'Post diubah.',
+  'post-dihapus': 'Post dihapus.',
+  'akun-dihapus': 'Akun komentator dihapus.',
+  'kunci-ditambah': 'Kunci ImgBB ditambah.',
+  'kunci-dihapus': 'Kunci ImgBB dihapus.',
+  'event-disimpan': 'Event PC Builder disimpan.',
+  'sesi-dicabut': 'Sesi dicabut.',
+  'backup-dibuat': 'Backup dibuat — lihat riwayat di bawah.',
+};
+function noticeHtml(url) {
+  const msg = ADMIN_NOTICES[url.searchParams.get('notice') || ''];
+  return msg ? `<div class="card" role="status" style="border-color:#22c55e"><p><b>Berhasil:</b> ${esc(msg)}</p></div>` : '';
+}
+function withNotice(location, slug) {
+  return location + (location.includes('?') ? '&' : '?') + 'notice=' + slug;
+}
+
+// Pagination daftar admin: batasi di QUERY (LIMIT/OFFSET), bukan dengan
+// mengambil semua lalu menyembunyikan di browser. Ukuran halaman 20.
+const ADMIN_PAGE_SIZE = 20;
+function parseAdminPage(url) {
+  const p = parseInt(url.searchParams.get('page') || '1', 10);
+  return Number.isFinite(p) && p > 0 ? p : 1;
+}
+function pageNav(base, page, totalPages) {
+  if (totalPages <= 1) return '';
+  const prev = page > 1 ? `<a href="${base}?page=${page - 1}">← Sebelumnya</a>` : '';
+  const next = page < totalPages ? `<a href="${base}?page=${page + 1}">Berikutnya →</a>` : '';
+  return `<p>Halaman ${page} dari ${totalPages} · ${prev}${prev && next ? ' · ' : ''}${next}</p>`;
 }
 
 // Nama pengguna admin = email pemilik, PATEN (perintah pemilik 30 Okt 2026).
@@ -370,12 +212,26 @@ async function handleFetch(request, env) {
     const path = url.pathname;
     let nowIso = new Date().toISOString();
     // Penjaga ukuran body: tolak POST raksasa sebelum dibaca penuh (anti
-    // banjir POST). Batas 200 KB jauh di atas post/komentar normal.
+    // banjir POST). Batas 200 KB jauh di atas post/komentar normal; upload
+    // gambar 6 MB (ImgBB membatasi file 5 MB, sisanya overhead form).
+    // Content-Length yang tidak ada / tidak valid / negatif TIDAK dipercaya:
+    // body dibaca lewat stream dengan batas yang sama, lalu request dibangun
+    // ulang dari byte yang sudah dibatasi — jadi body besar tidak pernah
+    // dibaca penuh ke memori sebelum limit diterapkan.
     if (request.method === 'POST') {
-      const cl = Number(request.headers.get('content-length') || '0');
+      const clRaw = request.headers.get('content-length');
+      const cl = clRaw === null ? NaN : Number(clRaw);
       const upLimit = path === '/kendali/upload-image' ? 6000000 : 200000;
-      if (cl > upLimit) {
-        return html(themes.terang.render({ siteTitle: esc(envSiteTitle(env) || 'WorkerCMS'), pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
+      if (!Number.isNaN(cl) && cl >= 0) {
+        if (cl > upLimit) {
+          return html(themes.terang.render({ siteTitle: esc(envSiteTitle(env) || 'WorkerCMS'), pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
+        }
+      } else {
+        const capped = await readCappedBody(request, upLimit);
+        if (capped === null) {
+          return html(themes.terang.render({ siteTitle: esc(envSiteTitle(env) || 'WorkerCMS'), pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
+        }
+        request = new Request(request, { body: capped });
       }
     }
     await ensureSchema(env);
@@ -441,17 +297,6 @@ async function handleFetch(request, env) {
       return ltJson({ ok: true, id }, 201);
     }
 
-    // ---- API Dracin: semua /api/dracin/* lewat satu pintu ini, supaya
-    // usage tercatat untuk SETIAP request (termasuk 401/403/429/404).
-    // Pengecualian spek "halaman statistik itu sendiri": kartu statistik
-    // di Super Panel bukan endpoint /api/dracin/*, jadi tidak tercatat
-    // sebagai hit API (ia membaca tabel usage, bukan menambahnya).
-    if (path.startsWith('/api/dracin/')) {
-      const d = await routeDracin(request, env, url);
-      await logDracinUsage(env, request, d.keyId, path, d.res.status);
-      return d.res;
-    }
-
     // ---- Publik: beranda (hanya post publik yang sudah terbit) ----
     if (request.method === 'GET' && path === '/') {
       // Anti overload: 10 post per halaman, ambil 11 untuk tahu ada halaman
@@ -485,20 +330,6 @@ async function handleFetch(request, env) {
       return html(await renderPage(env, 'Beranda', content), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
     }
 
-    // ---- Publik: halaman uptime (tautan dari footer "Online sejak ...") ----
-    // Halaman ini dirender Worker itu sendiri, jadi bila halaman ini terbuka
-    // berarti Worker sedang merespons. Sengaja TIDAK menampilkan persentase
-    // uptime (mis. 99,9%) karena tidak ada riwayat monitoring eksternal yang
-    // dicatat — yang ditampilkan hanya status saat ini + hitungan hari sejak
-    // 1 Januari 2024 WIB, keduanya bisa diverifikasi dari halaman ini sendiri.
-    if (request.method === 'GET' && path === '/uptime') {
-      const startMs = Date.UTC(2023, 11, 31, 17, 0, 0); // 1 Jan 2024 00:00 WIB
-      const days = Math.max(0, Math.floor((Date.now() - startMs) / 86400000));
-      const checkedWib = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><p><a class="read-more" href="/">← Beranda</a></p>`;
-      return html(await renderPage(env, 'Status Situs', content), 200);
-    }
-
     // ---- Publik: arsip tag (hanya post publik yang sudah terbit) ----
     // Tag dicocokkan di JS lewat tagSlug, bukan LIKE SQL, supaya tag
     // "hp" tidak ikut menarik post bertag "hape" atau sejenisnya.
@@ -506,7 +337,7 @@ async function handleFetch(request, env) {
     if (request.method === 'GET' && tagMatch) {
       const wanted = tagMatch[1];
       const [rows, plugins] = await Promise.all([
-        env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(nowIso).all(),
+        env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC LIMIT 200`).bind(nowIso).all(),
         getEnabledPlugins(env),
       ]);
       const matched = (rows.results || []).filter(p => parseTags(p.tags || '').some(t => tagSlug(t) === wanted));
@@ -580,17 +411,10 @@ async function handleFetch(request, env) {
         // perangkat per hari (cookie) supaya refresh tidak menggelembungkan.
         // Traffic load test TIDAK dihitung: request dengan header
         // X-Load-Test: 1 melewati penambah views + riwayat view_events.
-        // H1 (audit 31 Okt 2026): cookie saja tidak cukup — penghapus cookie
-        // bisa menulis 2x ke D1 per request sampai kuota tulis habis. Karena
-        // itu penulisan view juga dibatasi per IP (30/jam, via checkRateLimit
-        // yang sudah ada): di atas limit, halaman tetap tampil normal, hanya
-        // penambah views + view_events yang dilewati. Biaya tambahannya 1
-        // tulis rate-limit per view yang dihitung — jauh lebih murah daripada
-        // view spam yang tak terbatas. Admin sudah dikecualikan di atas.
         let viewCookie = null;
         if (!admin && request.headers.get('x-load-test') !== '1') {
           const viewName = 'cms_view_' + String(post.id).replace(/[^A-Za-z0-9_-]/g, '_');
-          if (!parseCookies(request)[viewName] && (await checkRateLimit(env, 'view:' + clientIp(request), 30, 60 * 60 * 1000))) {
+          if (!parseCookies(request)[viewName]) {
             await env.DB.prepare(`UPDATE cms_posts SET views = views + 1 WHERE id = ?`).bind(post.id).run();
             post.views = (Number(post.views) || 0) + 1;
             viewCookie = viewName + '=1; Path=/; Max-Age=86400';
@@ -809,7 +633,7 @@ async function handleFetch(request, env) {
       // di tengah, tab Login / Daftar (bukan dua kartu besar bertumpuk),
       // teks penjelasan dipersingkat jadi satu baris, checkbox Ingat saya
       // sebaris dengan labelnya (bukan melayang sendiri seperti sebelumnya).
-      const content = `${pesan}<div class="card" style="max-width:440px;margin:0 auto"><div style="display:flex;gap:8px;margin-bottom:16px"><button type="button" id="tabLoginBtn" style="flex:1">Login</button><button type="button" id="tabDaftarBtn" style="flex:1;background:transparent;border:1px solid;color:inherit">Daftar</button></div><div id="loginForm"><h2 style="margin-top:0">Login</h2><form method="post" action="/akun/login"><label>Nama pengguna / email</label><input name="username" maxlength="64" required><label>Password</label><input type="password" name="password" required><label class="remember"><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini</label><button type="submit" style="width:100%">Masuk</button></form><p style="text-align:center"><button type="button" id="toDaftarLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Belum punya akun? Daftar</button></p></div><div id="daftarForm" style="display:none"><h2 style="margin-top:0">Buat Akun</h2><p class="meta" style="text-transform:none;letter-spacing:0">Akun hanya untuk berkomentar dan like/dislike, bukan akun admin.</p><form method="post" action="/akun/daftar"><label>Nama pengguna</label><input name="username" maxlength="20" placeholder="huruf kecil, angka, _ , 3–20 karakter" required><label>Password (minimal 8 karakter)</label><input type="password" name="password" required><button type="submit" style="width:100%">Daftar</button></form><p style="text-align:center"><button type="button" id="toLoginLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Sudah punya akun? Login</button></p></div><script>(function(){var lb=document.getElementById('tabLoginBtn'),db=document.getElementById('tabDaftarBtn'),lf=document.getElementById('loginForm'),df=document.getElementById('daftarForm');function showLogin(){lf.style.display='block';df.style.display='none';lb.style.background='';lb.style.border='';lb.style.color='';db.style.background='transparent';db.style.border='1px solid';db.style.color='inherit'}function showDaftar(){lf.style.display='none';df.style.display='block';db.style.background='';db.style.border='';db.style.color='';lb.style.background='transparent';lb.style.border='1px solid';lb.style.color='inherit'}lb.onclick=showLogin;db.onclick=showDaftar;document.getElementById('toDaftarLink').onclick=showDaftar;document.getElementById('toLoginLink').onclick=showLogin;})();<\/script><noscript><style>#daftarForm{display:block!important}</style></noscript></div>`;
+      const content = `${pesan}<div class="card" style="max-width:440px;margin:0 auto"><div style="display:flex;gap:8px;margin-bottom:16px"><button type="button" id="tabLoginBtn" style="flex:1">Login</button><button type="button" id="tabDaftarBtn" style="flex:1;background:transparent;border:1px solid;color:inherit">Daftar</button></div><div id="loginForm"><h2 style="margin-top:0">Login</h2><form method="post" action="/akun/login"><label>Nama pengguna / email</label><input name="username" maxlength="64" required><label>Password</label><input type="password" name="password" required><label class="remember"><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini</label><button type="submit" style="width:100%">Masuk</button></form><p style="text-align:center"><button type="button" id="toDaftarLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Belum punya akun? Daftar</button></p></div><div id="daftarForm" style="display:none"><h2 style="margin-top:0">Buat Akun</h2><p class="meta" style="text-transform:none;letter-spacing:0">Akun hanya untuk berkomentar dan like/dislike, bukan akun admin.</p><form method="post" action="/akun/daftar"><label>Nama pengguna</label><input name="username" maxlength="20" placeholder="huruf kecil, angka, _ , 3–20 karakter" required><label>Password (8–128 karakter)</label><input type="password" name="password" maxlength="128" required><button type="submit" style="width:100%">Daftar</button></form><p style="text-align:center"><button type="button" id="toLoginLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Sudah punya akun? Login</button></p></div><script>(function(){var lb=document.getElementById('tabLoginBtn'),db=document.getElementById('tabDaftarBtn'),lf=document.getElementById('loginForm'),df=document.getElementById('daftarForm');function showLogin(){lf.style.display='block';df.style.display='none';lb.style.background='';lb.style.border='';lb.style.color='';db.style.background='transparent';db.style.border='1px solid';db.style.color='inherit'}function showDaftar(){lf.style.display='none';df.style.display='block';db.style.background='';db.style.border='';db.style.color='';lb.style.background='transparent';lb.style.border='1px solid';lb.style.color='inherit'}lb.onclick=showLogin;db.onclick=showDaftar;document.getElementById('toDaftarLink').onclick=showDaftar;document.getElementById('toLoginLink').onclick=showLogin;})();<\/script><noscript><style>#daftarForm{display:block!important}</style></noscript></div>`;
       return html(await renderPage(env, 'Akun', content));
     }
     if (path === '/akun/daftar' && request.method === 'POST') {
@@ -820,8 +644,8 @@ async function handleFetch(request, env) {
       const form = await request.formData();
       const username = String(form.get('username') || '').trim().toLowerCase();
       const password = String(form.get('password') || '');
-      if (!/^[a-z0-9_]{3,20}$/.test(username) || password.length < 8) {
-        return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password tidak valid. Nama: 3–20 karakter (huruf kecil, angka, _). Password: minimal 8 karakter.</p><p><a href="/akun">Kembali</a></p></div>'), 400);
+      if (!/^[a-z0-9_]{3,20}$/.test(username) || !isValidCommenterPassword(password)) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password tidak valid. Nama: 3–20 karakter (huruf kecil, angka, _). Password: ' + COMMENTER_PASSWORD_MIN + '–' + COMMENTER_PASSWORD_MAX + ' karakter.</p><p><a href="/akun">Kembali</a></p></div>'), 400);
       }
       // Nama 'admin' dicadangkan: tidak boleh didaftarkan sebagai akun
       // komentator, supaya tidak ada yang menyamar jadi admin. Email admin
@@ -878,6 +702,13 @@ async function handleFetch(request, env) {
       if (!(await checkRateLimit(env, 'akun:' + ip, 5, 15 * 60 * 1000))) {
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Terlalu banyak percobaan. Coba lagi 15 menit.</p></div>'), 429);
       }
+      // Batas panjang hanya untuk komentator, SETELAH cabang admin di atas
+      // (login admin memakai ADMIN_TOKEN yang panjangnya tidak dibatasi).
+      // Ditolak dengan pesan gagal generik yang sama, tanpa menjalankan
+      // PBKDF2 — supaya password raksasa tidak membebani CPU Worker.
+      if (!isValidCommenterPassword(password)) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
+      }
       const user = await env.DB.prepare(`SELECT * FROM cms_users WHERE username = ?`).bind(username).first();
       const ok = user && await verifyPassword(password, user.salt, user.password_hash);
       if (!ok) {
@@ -917,12 +748,18 @@ async function handleFetch(request, env) {
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
       if (path === '/kendali') {
+        // Prune retensi analitik (bertahap, maks 500/pemanggilan): gagal
+        // prune tidak merusak dashboard — tanpa Cron, ini satu-satunya
+        // pemicu prune. Kebijakan retensi di store.js.
+        try { await pruneAnalytics(env); await pruneRateTables(env); } catch (e) {}
         const [posts, comments, users, pluginRows, viewEvents] = await Promise.all([
           env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all(),
           env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all(),
           env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all(),
           env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all(),
-          env.DB.prepare(`SELECT post_id, viewed_at FROM cms_view_events ORDER BY viewed_at DESC`).all(),
+          // Hanya 30 hari terakhir: dashboard hanya menampilkan jendela
+          // hari ini/7 hari; mengambil semua riwayat membebani D1.
+          env.DB.prepare(`SELECT post_id, viewed_at FROM cms_view_events WHERE viewed_at >= ? ORDER BY viewed_at DESC`).bind(new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString()).all(),
         ]);
         const postList = posts.results || [];
         const commentList = comments.results || [];
@@ -960,9 +797,14 @@ async function handleFetch(request, env) {
         return html(await renderPage(env, 'Admin', content));
       }
       if (path === '/kendali/posts') {
-        const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC`).all();
+        const page = parseAdminPage(url);
+        const [countRow, posts] = await Promise.all([
+          env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_posts`).first(),
+          env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(ADMIN_PAGE_SIZE, (page - 1) * ADMIN_PAGE_SIZE).all(),
+        ]);
+        const totalPages = Math.max(1, Math.ceil((Number(countRow && countRow.n) || 0) / ADMIN_PAGE_SIZE));
         const postRows = (posts.results || []).map(p => `<div class="card"><b>${esc(p.title)}</b> (${esc(visibilityLabel(p, new Date().toISOString()))} · ${viewEye(Number(p.views) || 0)} · ${esc(p.body_mode || 'text')}) <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a> <form method="post" action="/kendali/posts/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(p.id)}"><button type="submit">Hapus</button></form></div>`).join('') || '<p>Belum ada post.</p>';
-        const content = `<h2>Post</h2>${nav}<p><a href="/kendali/posts/new">+ Post Baru</a></p>${postRows}`;
+        const content = `<h2>Post</h2>${nav}${noticeHtml(url)}<p><a href="/kendali/posts/new">+ Post Baru</a></p>${postRows}${pageNav('/kendali/posts', page, totalPages)}`;
         return html(await renderPage(env, 'Post', content));
       }
       if (path === '/kendali/posts/new') {
@@ -971,26 +813,39 @@ async function handleFetch(request, env) {
         return html(await renderPage(env, 'Post Baru', content));
       }
       if (path === '/kendali/comments') {
-        const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
+        const page = parseAdminPage(url);
+        const [countRow, comments] = await Promise.all([
+          env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_comments`).first(),
+          env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(ADMIN_PAGE_SIZE, (page - 1) * ADMIN_PAGE_SIZE).all(),
+        ]);
+        const totalPages = Math.max(1, Math.ceil((Number(countRow && countRow.n) || 0) / ADMIN_PAGE_SIZE));
         const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]${Number(c.pinned) === 1 ? ' 📌 Disematkan' : ''}<p>${esc(c.text)}</p><form method="post" action="/kendali/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/kendali/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form>${c.status === 'approved' && !c.parent_id ? (Number(c.pinned) === 1 ? ` <form method="post" action="/kendali/comments/unpin" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Lepas Sematan</button></form>` : ` <form method="post" action="/kendali/comments/pin" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Sematkan</button></form>`) : ''}<details><summary>Edit komentar (admin)</summary><form method="post" action="/kendali/comments/update">${csrfField}<input type="hidden" name="id" value="${c.id}"><textarea name="text" maxlength="2000" required>${esc(c.text)}</textarea><button type="submit">Simpan Edit</button></form></details></div>`).join('') || '<p>Belum ada komentar.</p>';
-        const content = `<h2>Komentar</h2>${nav}${commentRows}`;
+        const content = `<h2>Komentar</h2>${nav}${noticeHtml(url)}${commentRows}${pageNav('/kendali/comments', page, totalPages)}`;
         return html(await renderPage(env, 'Komentar', content));
       }
       if (path === '/kendali/users') {
-        const users = await env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC`).all();
+        const page = parseAdminPage(url);
+        const [countRow, users] = await Promise.all([
+          env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_users`).first(),
+          env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(ADMIN_PAGE_SIZE, (page - 1) * ADMIN_PAGE_SIZE).all(),
+        ]);
+        const totalPages = Math.max(1, Math.ceil((Number(countRow && countRow.n) || 0) / ADMIN_PAGE_SIZE));
         const userRows = (users.results || []).map(u => `<div class="card"><b>${esc(u.username)}</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}<form method="post" action="/kendali/users/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(u.id)}"><button type="submit">Hapus Akun</button></form></div>`).join('') || '<p>Belum ada akun komentator.</p>';
-        const content = `<h2>Akun Komentator</h2>${nav}${userRows}`;
+        const content = `<h2>Akun Komentator</h2>${nav}${noticeHtml(url)}${userRows}${pageNav('/kendali/users', page, totalPages)}`;
         return html(await renderPage(env, 'Akun Komentator', content));
       }
       if (path === '/kendali/plugins') {
         const pluginRows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();
         const pMap = new Map((pluginRows.results || []).map(r => [r.id, Number(r.enabled)]));
-        const pluginToggles = pluginDefs.map(pd => `<div class="card"><label style="display:flex;align-items:center;gap:12px;cursor:pointer"><span style="flex:1"><b>${esc(pd.name)}</b> — ${esc(pd.description)}</span><span class="tgl"><input type="checkbox" name="plugin_${pd.id}" value="1" ${pMap.get(pd.id) !== 0 ? 'checked' : ''} class="plugin-toggle" data-plugin="${pd.id}"><span class="tgl-track"><span class="tgl-knob"></span></span></span></label></div>`).join('');
-        const content = `<h2>Plugin</h2>${nav}<style>.tgl input{position:absolute;opacity:0;width:0;height:0}.tgl-track{display:inline-block;width:52px;height:28px;border-radius:14px;background:#64748b;position:relative;flex:none;transition:background .2s}.tgl-knob{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:left .2s}.tgl input:checked + .tgl-track{background:#22c55e}.tgl input:checked + .tgl-track .tgl-knob{left:27px}</style><form method="post" action="/kendali/plugins/save">${csrfField}${pluginToggles}<p id="pluginDirty" style="display:none">Ada perubahan belum disimpan.</p><button type="submit" id="pluginSaveBtn" disabled>Simpan Plugin</button></form><script>(function(){var boxes=document.querySelectorAll('.plugin-toggle');var init={};boxes.forEach(function(b){init[b.dataset.plugin]=b.checked});function check(){var dirty=false;boxes.forEach(function(b){if(b.checked!==init[b.dataset.plugin])dirty=true});document.getElementById('pluginSaveBtn').disabled=!dirty;document.getElementById('pluginDirty').style.display=dirty?'block':'none'}boxes.forEach(function(b){b.addEventListener('change',check)});})();<\/script>`;
+        const pluginToggles = pluginDefs.map(pd => `<div class="card"><label style="display:flex;align-items:center;gap:12px;cursor:pointer;min-height:44px"><span style="flex:1"><b>${esc(pd.name)}</b> — ${esc(pd.description)}</span><span class="tgl"><input type="checkbox" name="plugin_${pd.id}" value="1" ${pMap.get(pd.id) !== 0 ? 'checked' : ''} class="plugin-toggle" data-plugin="${pd.id}"><span class="tgl-track"><span class="tgl-knob"></span></span></span></label></div>`).join('');
+        const content = `<h2>Plugin</h2>${nav}${noticeHtml(url)}<style>.tgl input{position:absolute;opacity:0;width:0;height:0}.tgl-track{display:inline-block;width:52px;height:28px;border-radius:14px;background:#64748b;position:relative;flex:none;transition:background .2s}.tgl-knob{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:left .2s}.tgl input:checked + .tgl-track{background:#22c55e}.tgl input:checked + .tgl-track .tgl-knob{left:27px}.tgl input:focus-visible + .tgl-track{outline:2px solid #2563eb;outline-offset:2px}</style><form method="post" action="/kendali/plugins/save">${csrfField}${pluginToggles}<p id="pluginDirty" style="display:none">Ada perubahan belum disimpan.</p><button type="submit" id="pluginSaveBtn" disabled>Simpan Plugin</button></form><script>(function(){var boxes=document.querySelectorAll('.plugin-toggle');var init={};boxes.forEach(function(b){init[b.dataset.plugin]=b.checked});function check(){var dirty=false;boxes.forEach(function(b){if(b.checked!==init[b.dataset.plugin])dirty=true});document.getElementById('pluginSaveBtn').disabled=!dirty;document.getElementById('pluginDirty').style.display=dirty?'block':'none'}boxes.forEach(function(b){b.addEventListener('change',check)});})();<\/script>`;
         return html(await renderPage(env, 'Plugin', content));
       }
       if (path === '/kendali/super') {
-        const [siteTitleS, themeS, imgbbS, adsenseS, usersN, postsN, pluginsS, pcbActive, pcbMsg, viewEventsS, loadtestS, dracinKeysS, dracinUsageCountS, dracinUsageS] = await Promise.all([
+        // Prune retensi analitik (lihat /kendali): gagal prune tidak
+        // merusak halaman.
+        try { await pruneAnalytics(env); await pruneRateTables(env); } catch (e) {}
+        const [siteTitleS, themeS, imgbbS, adsenseS, usersN, postsN, pluginsS, pcbActive, pcbMsg, viewEventsS, loadtestS, topPosts, postAgg] = await Promise.all([
           getSetting(env, 'site_title', 'WorkerCMS'),
           getSetting(env, 'theme', 'terang'),
           getImgbbKeys(env).then(a => a.length),
@@ -1000,11 +855,12 @@ async function handleFetch(request, env) {
           getEnabledPlugins(env),
           getSetting(env, 'pcbuilder_event_active', '0'),
           getSetting(env, 'pcbuilder_event_text', ''),
-          env.DB.prepare(`SELECT post_id, viewed_at FROM cms_view_events ORDER BY viewed_at DESC`).all(),
+          // Hanya 30 hari terakhir: kartu Traffic hanya menampilkan
+          // jendela hari ini/7/30 hari.
+          env.DB.prepare(`SELECT post_id, viewed_at FROM cms_view_events WHERE viewed_at >= ? ORDER BY viewed_at DESC`).bind(new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString()).all(),
           env.DB.prepare(`SELECT * FROM cms_loadtest_runs ORDER BY created_at DESC LIMIT 10`).all(),
-          env.DB.prepare(`SELECT * FROM dracin_api_keys ORDER BY created_at DESC`).all(),
-          env.DB.prepare(`SELECT COUNT(*) AS n FROM dracin_api_usage`).all(),
-          env.DB.prepare(`SELECT * FROM dracin_api_usage ORDER BY ts DESC LIMIT 5000`).all(),
+          env.DB.prepare(`SELECT * FROM cms_posts ORDER BY views DESC LIMIT 20`).all(),
+          env.DB.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(views), 0) AS v FROM cms_posts`).first(),
         ]);
         // Hitung pending dari daftar komentar (lebih andal di semua DB daripada COUNT mock)
         const allCm = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC`).all();
@@ -1023,7 +879,8 @@ async function handleFetch(request, env) {
         const nowTraffic = Date.now();
         const todayTraffic = wibDay(nowTraffic);
         const yesterdayTraffic = wibDay(nowTraffic - 24 * 3600 * 1000);
-        const trafficTotal = (postsN.results || []).reduce((a, p) => a + (Number(p.views) || 0), 0);
+        const trafficTotal = Number(postAgg && postAgg.v) || 0;
+        const postCount = Number(postAgg && postAgg.n) || 0;
         const perDayTraffic = new Map();
         const perPostTraffic = new Map();
         for (const e of trafficEvents) {
@@ -1057,11 +914,12 @@ async function handleFetch(request, env) {
           return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0"><span style="min-width:92px;font-size:13px">${d}</span>${bar}<span style="font-size:13px"><b>${n}</b> views</span></div>`;
         }).join('');
         const byPostId = new Map((postsN.results || []).map(p => [String(p.id), p]));
-        const postTrafficRows = [...(postsN.results || [])].sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0)).map(p => {
+        // Per-post dibatasi 20 teratas (query LIMIT 20), bukan semua post.
+        const postTrafficRows = (topPosts.results || []).map(p => {
           const t = perPostTraffic.get(String(p.id)) || { total: 0, d7: 0, d30: 0, today: 0 };
           return `<p><a href="/post/${esc(p.slug)}">${esc(p.title)}</a> — total <b>${Number(p.views) || 0}</b> · hari ini ${t.today} · 7 hari ${t.d7} · 30 hari ${t.d30}</p>`;
         }).join('') || '<p>Belum ada post.</p>';
-        const trafficCard = `<div class="card"><h3>Traffic Lengkap</h3><p><b>${trafficTotal} views total</b> (counter post) · hari ini (WIB) ${perDayTraffic.get(todayTraffic) || 0} · kemarin ${perDayTraffic.get(yesterdayTraffic) || 0} · 7 hari ${traffic7} · 30 hari ${traffic30}</p><p>Catatan: angka per-hari dan per-post 7/30 hari hanya dari riwayat views yang dicatat sejak 30 Okt 2026. Views lama sebelum tanggal itu hanya ada di total counter, tidak bisa dipecah per hari.</p><h4>Per Hari (30 hari terakhir, WIB)</h4>${dayChart}<h4>Per Post (semua post, urut total tertinggi)</h4>${postTrafficRows}</div>`;
+        const trafficCard = `<details class="card" open><summary>Traffic Lengkap</summary><p><b>${trafficTotal} views total</b> (counter post) · hari ini (WIB) ${perDayTraffic.get(todayTraffic) || 0} · kemarin ${perDayTraffic.get(yesterdayTraffic) || 0} · 7 hari ${traffic7} · 30 hari ${traffic30}</p><p>Catatan: angka per-hari dan per-post 7/30 hari hanya dari riwayat views yang dicatat sejak 30 Okt 2026. Views lama sebelum tanggal itu hanya ada di total counter, tidak bisa dipecah per hari. Riwayat views disimpan ${VIEW_EVENTS_RETENTION_DAYS} hari lalu dihapus otomatis (prune saat dashboard dibuka); counter total views per post tetap utuh.</p><h3>Per Hari (30 hari terakhir, WIB)</h3>${dayChart}<h3>Per Post (20 teratas dari ${postCount} post, urut total tertinggi)</h3>${postTrafficRows}</details>`;
         // Hasil load test: 10 run terbaru, terbaru di atas. Tanggal WIB
         // (geser +7 jam dari ISO UTC, sama seperti hitung traffic di atas).
         // failed_rate disimpan sebagai fraksi (0–1), tampil sebagai persen.
@@ -1077,49 +935,8 @@ async function handleFetch(request, env) {
           const pathHtml = paths.map(pp => `<p style="margin-left:16px">${esc(pp.path)} — status ${esc(pp.status)} · p95 ${esc(pp.p95_ms)} ms · gagal ${pct(pp.failed_rate)} · checks ${pp.checks_passed ? 'lulus' : 'gagal'}</p>`).join('');
           return `<div><p><b>${wibStamp(rr.created_at)}</b> — ${Number(rr.passed) === 1 ? 'Lulus' : 'Gagal'} · ${esc(rr.vu)} VU · ${esc(rr.duration_s)} detik · p95 ${esc(rr.p95_ms)} ms · gagal ${pct(rr.failed_rate)}</p>${pathHtml}</div>`;
         }).join('') || '<p>Belum ada hasil load test.</p>';
-        const loadtestCard = `<div class="card"><h3>Hasil Load Test</h3><p>10 run terbaru, terbaru di atas. Dikirim aplikasi load test lewat token khusus (bukan token admin).</p>${loadtestRows}</div>`;
-        // Kartu API Dracin: gaya sama persis dengan kartu Traffic (HTML/CSS
-        // murni, batang per-hari dari div). Rincian per kunci/endpoint/
-        // hari/negara→kota dihitung dari 5000 hit terakhir; total dari
-        // COUNT penuh. Terakhir dipakai per kunci = hit usage terbaru
-        // untuk kunci itu (tidak ada kolom last_used di tabel kunci —
-        // sengaja, supaya satu sumber kebenaran saja). Kunci mentah
-        // TIDAK PERNAH tampil di sini, hanya nama/scope/status.
-        const dracinKeys = dracinKeysS.results || [];
-        const dracinUsage = dracinUsageS.results || [];
-        const dracinTotal = (dracinUsageCountS.results || [])[0] ? Number(dracinUsageCountS.results[0].n) || 0 : dracinUsage.length;
-        const dracinKeyName = new Map(dracinKeys.map(k => [String(k.id), k]));
-        const dracinPerKey = new Map(), dracinPerEp = new Map(), dracinPerDay = new Map(), dracinPerLoc = new Map(), dracinLast = new Map();
-        for (const u of dracinUsage) {
-          const kid = String(u.key_id || '');
-          dracinPerKey.set(kid, (dracinPerKey.get(kid) || 0) + 1);
-          dracinPerEp.set(String(u.endpoint || ''), (dracinPerEp.get(String(u.endpoint || '')) || 0) + 1);
-          const dd = wibDay(Number(u.ts) || 0);
-          if (dd && dd !== 'NaN-NaN-NaN') dracinPerDay.set(dd, (dracinPerDay.get(dd) || 0) + 1);
-          const locKey = (u.country || '–') + ' → ' + (u.city || '–');
-          dracinPerLoc.set(locKey, (dracinPerLoc.get(locKey) || 0) + 1);
-          if (!dracinLast.has(kid) || Number(u.ts) > Number(dracinLast.get(kid))) dracinLast.set(kid, Number(u.ts));
-        }
-        const dracinDayData = [];
-        for (let i = 0; i < 30; i++) {
-          const d = wibDay(nowTraffic - i * 24 * 3600 * 1000);
-          dracinDayData.push([d, dracinPerDay.get(d) || 0]);
-        }
-        const dracinDayMax = Math.max(1, ...dracinDayData.map(([, n]) => n));
-        const dracinDayChart = dracinDayData.map(([d, n]) => {
-          const w = Math.round((n / dracinDayMax) * 100);
-          const bar = n > 0 ? `<span style="display:inline-block;height:18px;background:#3b82f6;border-radius:4px;min-width:18px;width:${w}%"></span>` : `<span style="display:inline-block;height:18px"></span>`;
-          return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0"><span style="min-width:92px;font-size:13px">${d}</span>${bar}<span style="font-size:13px"><b>${n}</b> hits</span></div>`;
-        }).join('');
-        const dracinKeyRows = dracinKeys.map(k => {
-          const last = dracinLast.get(String(k.id));
-          const lastTxt = last ? wibStamp(new Date(last).toISOString()) : 'belum pernah';
-          return `<p><b>${esc(k.name)}</b> · scope ${esc(k.scope)} · ${Number(k.active) === 1 ? 'aktif' : 'dicabut'} · ${dracinPerKey.get(String(k.id)) || 0} hits · terakhir dipakai ${esc(lastTxt)}${Number(k.active) === 1 ? ` <form method="post" action="/kendali/super/dracin-keys" style="display:inline">${csrfField}<input type="hidden" name="action" value="revoke"><input type="hidden" name="id" value="${esc(k.id)}"><button type="submit">Cabut</button></form>` : ''}</p>`;
-        }).join('') || '<p>Belum ada kunci API.</p>';
-        const dracinEpRows = [...dracinPerEp.entries()].sort((a, b) => b[1] - a[1]).map(([ep, n]) => `<p>${esc(ep)} — <b>${n}</b> hits</p>`).join('') || '<p>Belum ada hit.</p>';
-        const dracinLocRows = [...dracinPerLoc.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20).map(([loc, n]) => `<p>${esc(loc)} — <b>${n}</b> hits</p>`).join('') || '<p>Belum ada data lokasi.</p>';
-        const dracinCard = `<div class="card"><h3>API Dracin</h3><p><b>${dracinTotal} hits total</b> (rincian di bawah dari 5000 hit terakhir). Catatan: usage hanya mencatat negara/provinsi/kota dari request.cf — tidak ada IP, tidak ada user-agent, tidak ada stream URL yang disimpan.</p><h4>Per Kunci</h4>${dracinKeyRows}<p>Hit tanpa kunci (baca publik): <b>${dracinPerKey.get('') || 0}</b></p><h4>Per Endpoint</h4>${dracinEpRows}<h4>Per Hari (30 hari terakhir, WIB)</h4>${dracinDayChart}<h4>Per Negara → Kota (20 teratas)</h4>${dracinLocRows}<h4>Buat Kunci Baru</h4><p>Kunci mentah hanya tampil SEKALI di halaman setelah dibuat — simpan langsung, karena sesudah itu tidak bisa dilihat lagi (yang tersimpan hanya hash SHA-256).</p><form method="post" action="/kendali/super/dracin-keys">${csrfField}<input type="hidden" name="action" value="create"><label>Nama kunci</label><input name="name" maxlength="100" placeholder="mis. sync-server-1" required><label>Scope</label><select name="scope"><option value="sync">sync (kirim katalog)</option><option value="read">read (baca saja)</option><option value="admin">admin (sync + kelola judul/seed)</option></select><button type="submit">Buat Kunci</button></form></div>`;
-        const content = `<h2>Super Panel</h2>${nav}<div class="card"><h3>Situs</h3><p>Judul: <b>${esc(envSiteTitle(env) || siteTitleS)}</b> · Tema: ${esc(themeS)} · ImgBB: ${imgbbS} kunci · AdSense: ${adsenseS ? 'sudah diset' : 'belum diset'}</p><form method="post" action="/kendali/settings">${csrfField}<input type="hidden" name="return_to" value="/kendali/super"><label>Judul situs</label><input name="site_title" value="${esc(envSiteTitle(env) || siteTitleS)}"><label>Tema</label><select name="theme">${Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeS ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select><button type="submit">Simpan Judul & Tema</button></form><p><a href="/kendali/settings">Pengaturan lengkap (foto profil, iklan, AdSense, kunci ImgBB)</a></p></div><div class="card"><h3>Komentar & Keamanan</h3><p>${pendingCount} komentar menunggu · ${(usersN.results || []).length} akun komentator · ${(postsN.results || []).length} post · <a href="/kendali/comments">Moderasi Komentar</a> · <a href="/kendali/users">Akun</a></p>${pluginList}<p><a href="/kendali/plugins">Semua plugin</a> · <a href="/kendali/backup">Backup</a> · <a href="/kendali/sessions">Sesi</a></p></div>${trafficCard}${loadtestCard}${dracinCard}<div class="card"><h3>Event PC Builder (game)</h3><p>Status: <b>${pcbActive === '1' ? 'Aktif — game memberi diskon 10%' : 'Nonaktif — game tidak memberi diskon'}</b></p><p>Game v1.0.3 hanya membaca on/off diskon dari endpoint ini; pesan kustom di bawah hanya catatan admin, belum tampil di game.</p><form method="post" action="/kendali/super/pcbuilder">${csrfField}<label>Event aktif?</label><select name="pcbuilder_active"><option value="1" ${pcbActive === '1' ? 'selected' : ''}>Aktif (diskon 10%)</option><option value="0" ${pcbActive !== '1' ? 'selected' : ''}>Nonaktif</option></select><label>Pesan event (catatan admin, maks 200 karakter)</label><input name="pcbuilder_message" value="${esc(pcbMsg)}" placeholder="mis. Event akhir pekan"><button type="submit">Simpan Event PC Builder</button></form><p>Endpoint game: <code>/api/pcbuilder-events</code></p></div>`;
+        const loadtestCard = `<details class="card"><summary>Hasil Load Test</summary><p>10 run terbaru, terbaru di atas. Dikirim aplikasi load test lewat token khusus (bukan token admin).</p>${loadtestRows}</details>`;
+        const content = `<h2>Super Panel</h2>${nav}${noticeHtml(url)}<style>details.card>summary{cursor:pointer;font-weight:700;font-size:17px;margin-bottom:6px;list-style-position:inside}</style><details class="card"><summary>Situs</summary><p>Judul: <b>${esc(envSiteTitle(env) || siteTitleS)}</b> · Tema: ${esc(themeS)} · ImgBB: ${imgbbS} kunci · AdSense: ${adsenseS ? 'sudah diset' : 'belum diset'}</p><form method="post" action="/kendali/settings">${csrfField}<input type="hidden" name="return_to" value="/kendali/super"><label>Judul situs</label><input name="site_title" value="${esc(envSiteTitle(env) || siteTitleS)}"><label>Tema</label><select name="theme">${Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeS ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select><button type="submit">Simpan Judul & Tema</button></form><p><a href="/kendali/settings">Pengaturan lengkap (foto profil, iklan, AdSense, kunci ImgBB)</a></p></details><details class="card"><summary>Komentar & Keamanan</summary><p>${pendingCount} komentar menunggu · ${(usersN.results || []).length} akun komentator · ${(postsN.results || []).length} post · <a href="/kendali/comments">Moderasi Komentar</a> · <a href="/kendali/users">Akun</a></p>${pluginList}<p><a href="/kendali/plugins">Semua plugin</a> · <a href="/kendali/backup">Backup</a> · <a href="/kendali/sessions">Sesi</a></p></details>${trafficCard}${loadtestCard}<details class="card"><summary>Event PC Builder (game)</summary><p>Status: <b>${pcbActive === '1' ? 'Aktif — game memberi diskon 10%' : 'Nonaktif — game tidak memberi diskon'}</b></p><p>Game v1.0.3 hanya membaca on/off diskon dari endpoint ini; pesan kustom di bawah hanya catatan admin, belum tampil di game.</p><form method="post" action="/kendali/super/pcbuilder">${csrfField}<label>Event aktif?</label><select name="pcbuilder_active"><option value="1" ${pcbActive === '1' ? 'selected' : ''}>Aktif (diskon 10%)</option><option value="0" ${pcbActive !== '1' ? 'selected' : ''}>Nonaktif</option></select><label>Pesan event (catatan admin, maks 200 karakter)</label><input name="pcbuilder_message" value="${esc(pcbMsg)}" placeholder="mis. Event akhir pekan"><button type="submit">Simpan Event PC Builder</button></form><p>Endpoint game: <code>/api/pcbuilder-events</code></p></details>`;
         return html(await renderPage(env, 'Super Panel', content));
       }
       if (path === '/kendali/settings') {
@@ -1138,23 +955,23 @@ async function handleFetch(request, env) {
         ]);
         const siteTitle = envTitle || siteTitleDb;
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
-        const content = `<h2>Pengaturan</h2>${nav}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><h4>Balasan Otomatis Komentar (model teks Dahono gratis)</h4><p>Kalau aktif, saat admin menyetujui komentar komentator, Worker meminta balasan singkat ke Dahono lalu menyimpannya sebagai balasan pending atas nama “Balasan Otomatis” untuk ditinjau admin (1 balasan per komentar, tidak membalas balasan bot; balasan yang kena filter blokir tidak disimpan). Kunci Dahono WAJIB secret Worker <code>DAHONO_API_KEY</code> — bukan kolom ini, dan tidak pernah ditulis di repo. Status secret: <b>${env.DAHONO_API_KEY ? 'sudah diset' : 'belum diset — balasan tidak akan terkirim sampai secret diset'}</b>.</p><label><input type="checkbox" name="auto_reply" value="1" ${autoReplyEnabled === '1' ? 'checked' : ''}> Aktifkan balasan otomatis</label><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Upload Gambar via ImgBB — banyak kunci</h3><p>Upload memilih satu kunci secara acak, kalau gagal otomatis coba kunci lain. Status di bawah dari upload terakhir, bukan ping live: 🟢 = upload terakhir berhasil, 🔴 = gagal terakhir, ⚪ = belum pernah dicoba. Kunci tidak pernah tampil penuh, hanya 4 karakter awal + akhir.</p>${imgbbKeys.length ? imgbbKeys.map((e, i) => `<p>${keyDot(e)} Kunci ${i + 1}: ${esc(maskKey(e.k))}${e.ok ? ` · terakhir berhasil ${esc(String(e.ok).slice(0, 16))}` : ''}${e.fail ? ` · terakhir gagal ${esc(String(e.fail).slice(0, 16))}${e.fail_reason ? ` (${esc(e.fail_reason)})` : ''}` : ''} <form method="post" action="/kendali/imgbb/delete" style="display:inline">${csrfField}<input type="hidden" name="index" value="${i}"><button type="submit">Hapus</button></form></p>`).join('') : '<p>Belum ada kunci ImgBB.</p>'}<form method="post" action="/kendali/imgbb/add">${csrfField}<label>Tambah kunci API ImgBB baru (dari imgbb.com, menu API)</label><input type="password" name="new_key" autocomplete="new-password" placeholder="tempel kunci baru di sini"><button type="submit">Tambah Kunci</button></form></div>`;
+        const content = `<h2>Pengaturan</h2>${nav}${noticeHtml(url)}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><h4>Balasan Otomatis Komentar (model teks Dahono gratis)</h4><p>Kalau aktif, saat admin menyetujui komentar komentator, Worker meminta balasan singkat ke Dahono lalu menyimpannya sebagai balasan atas nama “Balasan Otomatis” (1 balasan per komentar, tidak membalas balasan bot). Kunci Dahono WAJIB secret Worker <code>DAHONO_API_KEY</code> — bukan kolom ini, dan tidak pernah ditulis di repo. Status secret: <b>${env.DAHONO_API_KEY ? 'sudah diset' : 'belum diset — balasan tidak akan terkirim sampai secret diset'}</b>.</p><label><input type="checkbox" name="auto_reply" value="1" ${autoReplyEnabled === '1' ? 'checked' : ''}> Aktifkan balasan otomatis</label><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Upload Gambar via ImgBB — banyak kunci</h3><p>Upload memilih satu kunci secara acak, kalau gagal otomatis coba kunci lain. Status di bawah dari upload terakhir, bukan ping live: 🟢 = upload terakhir berhasil, 🔴 = gagal terakhir, ⚪ = belum pernah dicoba. Kunci tidak pernah tampil penuh, hanya 4 karakter awal + akhir.</p>${imgbbKeys.length ? imgbbKeys.map((e, i) => `<p>${keyDot(e)} Kunci ${i + 1}: ${esc(maskKey(e.k))}${e.ok ? ` · terakhir berhasil ${esc(String(e.ok).slice(0, 16))}` : ''}${e.fail ? ` · terakhir gagal ${esc(String(e.fail).slice(0, 16))}${e.fail_reason ? ` (${esc(e.fail_reason)})` : ''}` : ''} <form method="post" action="/kendali/imgbb/delete" style="display:inline">${csrfField}<input type="hidden" name="index" value="${i}"><button type="submit">Hapus</button></form></p>`).join('') : '<p>Belum ada kunci ImgBB.</p>'}<form method="post" action="/kendali/imgbb/add">${csrfField}<label>Tambah kunci API ImgBB baru (dari imgbb.com, menu API)</label><input type="password" name="new_key" autocomplete="new-password" placeholder="tempel kunci baru di sini"><button type="submit">Tambah Kunci</button></form></div>`;
         return html(await renderPage(env, 'Pengaturan', content, { siteTitle, themeId }));
       }
       if (path === '/kendali/sessions') {
         const dashNowIso = new Date().toISOString();
         const [sessionRows, currentRefresh] = await Promise.all([
-          env.DB.prepare(`SELECT id, device, ip, ip_changed, prev_ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens WHERE revoked = 0 AND expires_at > ? ORDER BY last_used_at DESC`).bind(dashNowIso).all(),
+          env.DB.prepare(`SELECT id, device, ip, created_at, last_used_at, expires_at FROM cms_refresh_tokens WHERE revoked = 0 AND expires_at > ? ORDER BY last_used_at DESC LIMIT 50`).bind(dashNowIso).all(),
           getRefreshRow(request, env),
         ]);
-        const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)}${s.ip_changed ? ` · ⚠️ IP berubah dari ${esc(s.prev_ip || '')}` : ''} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/kendali/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
-        const content = `<h2>Sesi & Perangkat</h2>${nav}<div class="card"><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri). Sesi yang dipakai dari IP berbeda dari saat login ditandai ⚠️; kalau IP dan perangkat sama-sama berubah, semua sesi langsung dicabut.</p><form method="post" action="/kendali/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
+        const sessionRowsHtml = (sessionRows.results || []).map(s => `<div class="card"><b>${esc(s.device || 'Perangkat')}</b> · ${esc(s.ip)} · terakhir ${esc(s.last_used_at)} · sampai ${esc(s.expires_at)}${currentRefresh && s.id === currentRefresh.id ? ' · <b>(perangkat ini)</b>' : ''}<form method="post" action="/kendali/sessions/revoke" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(s.id)}"><button type="submit">Cabut</button></form></div>`).join('') || '<p>Tidak ada sesi aktif.</p>';
+        const content = `<h2>Sesi & Perangkat</h2>${nav}${noticeHtml(url)}<div class="card"><p>Token akses berlaku 1 jam, diperpanjang otomatis oleh token refresh. Refresh yang sudah diputar lalu dipakai lagi akan mencabut semua sesi (tanda token dicuri).</p><form method="post" action="/kendali/logout-all">${csrfField}<button type="submit">Keluar dari Semua Perangkat</button></form><h4>Sesi aktif</h4>${sessionRowsHtml}</div>`;
         return html(await renderPage(env, 'Sesi & Perangkat', content));
       }
       if (path === '/kendali/backup') {
         const backupRuns = await env.DB.prepare(`SELECT * FROM cms_backup_runs ORDER BY created_at DESC LIMIT 10`).all();
         const backupRows = (backupRuns.results || []).map(r => `<div class="card"><b>${esc(r.status)}</b> · ${esc(r.created_at)} · ${r.posts} post, ${r.comments} komentar${r.error ? `<p>Error: ${esc(r.error)}</p>` : ''}</div>`).join('') || '<p>Belum ada backup.</p>';
-        const content = `<h2>Backup</h2>${nav}<div class="card"><h3>Backup ke Stopwatch</h3><p>Database stopwatch khusus dipakai sebagai tempat backup CMS. Salinan tidak pernah ditulis dari jalur lain — hanya tombol ini yang menulis ke sana.</p><p><b>Yang tidak ikut disalin:</b> kunci ImgBB, kunci CSRF, dan password (komentator + post) — setelah restore, isi ulang kunci ImgBB di Pengaturan dan komentator perlu reset password.</p><form method="post" action="/kendali/backup">${csrfField}<button type="submit">Buat Backup Sekarang</button></form><h4>Riwayat Backup</h4>${backupRows}</div>`;
+        const content = `<h2>Backup</h2>${nav}${noticeHtml(url)}<div class="card"><h3>Backup ke Stopwatch</h3><p>Database stopwatch khusus dipakai sebagai tempat backup CMS. Salinan tidak pernah ditulis dari jalur lain — hanya tombol ini yang menulis ke sana.</p><form method="post" action="/kendali/backup">${csrfField}<button type="submit">Buat Backup Sekarang</button></form><h4>Riwayat Backup</h4>${backupRows}</div>`;
         return html(await renderPage(env, 'Backup', content));
       }
     }
@@ -1231,7 +1048,7 @@ async function handleFetch(request, env) {
         const cid = Number(form.get('id') || 0);
         const text = String(form.get('text') || '').trim().slice(0, 2000);
         if (cid && text) await env.DB.prepare(`UPDATE cms_comments SET text = ? WHERE id = ?`).bind(text, cid).run();
-        return redirect('/kendali/comments');
+        return redirect(withNotice('/kendali/comments', 'komentar-diubah'));
       }
       if (path === '/kendali/comments/pin') {
         const cid = Number(form.get('id') || 0);
@@ -1240,19 +1057,19 @@ async function handleFetch(request, env) {
           await env.DB.prepare(`UPDATE cms_comments SET pinned = 0 WHERE post_id = ? AND id != ?`).bind(comment.post_id, cid).run();
           await env.DB.prepare(`UPDATE cms_comments SET pinned = 1 WHERE id = ?`).bind(cid).run();
         }
-        return redirect('/kendali/comments');
+        return redirect(withNotice('/kendali/comments', 'komentar-disematkan'));
       }
       if (path === '/kendali/comments/unpin') {
         const cid = Number(form.get('id') || 0);
         if (cid) await env.DB.prepare(`UPDATE cms_comments SET pinned = 0 WHERE id = ?`).bind(cid).run();
-        return redirect('/kendali/comments');
+        return redirect(withNotice('/kendali/comments', 'komentar-dilepas'));
       }
       if (path === '/kendali/plugins/save') {
         for (const pd of pluginDefs) {
           const on = form.get('plugin_' + pd.id) !== null ? 1 : 0;
           await env.DB.prepare(`UPDATE cms_plugins SET enabled = ? WHERE id = ?`).bind(on, pd.id).run();
         }
-        return redirect('/kendali/plugins');
+        return redirect(withNotice('/kendali/plugins', 'plugin-disimpan'));
       }
       if (path === '/kendali/imgbb/add') {
         const nk = String(form.get('new_key') || '').trim();
@@ -1260,41 +1077,20 @@ async function handleFetch(request, env) {
           const arr = await getImgbbKeys(env);
           if (!arr.some(e => e.k === nk)) { arr.push({ k: nk, ok: '', fail: '', fail_reason: '' }); await saveImgbbKeys(env, arr); }
         }
-        return redirect('/kendali/settings');
+        return redirect(withNotice('/kendali/settings', 'kunci-ditambah'));
       }
       if (path === '/kendali/imgbb/delete') {
         const idx = Number(form.get('index') || -1);
         const arr = await getImgbbKeys(env);
         if (idx >= 0 && idx < arr.length) { arr.splice(idx, 1); await saveImgbbKeys(env, arr); }
-        return redirect('/kendali/settings');
+        return redirect(withNotice('/kendali/settings', 'kunci-dihapus'));
       }
       if (path === '/kendali/super/pcbuilder') {
         const active = String(form.get('pcbuilder_active') || '0') === '1' ? '1' : '0';
         const msg = String(form.get('pcbuilder_message') || '').trim().slice(0, 200);
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('pcbuilder_event_active', ?)`).bind(active).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('pcbuilder_event_text', ?)`).bind(msg).run();
-        return redirect('/kendali/super');
-      }
-      if (path === '/kendali/super/dracin-keys') {
-        const action = String(form.get('action') || '');
-        if (action === 'revoke') {
-          await env.DB.prepare(`UPDATE dracin_api_keys SET active = 0 WHERE id = ?`).bind(String(form.get('id') || '')).run();
-          return redirect('/kendali/super');
-        }
-        if (action === 'create') {
-          const name = String(form.get('name') || '').trim().slice(0, 100) || 'Kunci Dracin';
-          const scopeRaw = String(form.get('scope') || 'read');
-          const scope = ['sync', 'read', 'admin'].includes(scopeRaw) ? scopeRaw : 'read';
-          // Token mentah 32 byte acak; yang disimpan HANYA hash SHA-256-nya.
-          // Halaman ini adalah satu-satunya tempat token mentah tampil.
-          const raw = b64url(crypto.getRandomValues(new Uint8Array(32)));
-          const hash = await sha256Hex(raw);
-          const id = 'dk-' + Date.now().toString(36) + '-' + randomHex(4);
-          await env.DB.prepare(`INSERT INTO dracin_api_keys (id, name, key_hash, scope, active, created_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(id, name, hash, scope, 1, Date.now()).run();
-          const content = `<h2>Kunci API Dracin Baru</h2>${adminNav('/kendali/super')}<div class="card"><h3>Simpan kunci ini sekarang — hanya tampil sekali</h3><p>Nama: <b>${esc(name)}</b> · Scope: <b>${esc(scope)}</b></p><p style="word-break:break-all"><code>${esc(raw)}</code></p><p>Pakai sebagai header <code>Authorization: Bearer &lt;kunci&gt;</code>. Setelah halaman ini ditutup, kunci tidak bisa dilihat lagi — yang tersimpan di database hanya hash-nya. Bila hilang, cabut kunci ini dari Super Panel lalu buat yang baru.</p><p><a href="/kendali/super">← Kembali ke Super Panel</a></p></div>`;
-          return html(await renderPage(env, 'Kunci API Dracin Baru', content));
-        }
-        return redirect('/kendali/super');
+        return redirect(withNotice('/kendali/super', 'event-disimpan'));
       }
       if (path === '/kendali/backup') {
         const now = new Date().toISOString();
@@ -1304,7 +1100,7 @@ async function handleFetch(request, env) {
         } catch (e) {
           await env.DB.prepare(`INSERT INTO cms_backup_runs (created_at, status, posts, comments, error) VALUES (?, 'GAGAL', 0, 0, ?)`).bind(now, String(e && e.message ? e.message : e).slice(0, 300)).run();
         }
-        return redirect('/kendali/backup');
+        return redirect(withNotice('/kendali/backup', 'backup-dibuat'));
       }
       if (path === '/kendali/logout-all') {
         await revokeAllRefresh(env);
@@ -1315,7 +1111,7 @@ async function handleFetch(request, env) {
         const current = await getRefreshRow(request, env);
         await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(id).run();
         if (current && current.id === id) return redirectWithCookies('/kendali', clearAuthCookies());
-        return redirect('/kendali/sessions');
+        return redirect(withNotice('/kendali/sessions', 'sesi-dicabut'));
       }
       if (path === '/kendali/settings') {
         const siteTitle = String(form.get('site_title') || '').trim().slice(0, 100) || 'WorkerCMS';
@@ -1347,7 +1143,7 @@ async function handleFetch(request, env) {
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_slot', ?)`).bind(adsenseSlot).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('auto_reply_enabled', ?)`).bind(String(form.get('auto_reply') || '') === '1' ? '1' : '0').run();
         const retS = String(form.get('return_to') || '');
-        return redirect(retS.startsWith('/kendali/') ? retS : '/kendali/settings');
+        return redirect(withNotice(retS.startsWith('/kendali/') ? retS : '/kendali/settings', 'pengaturan-disimpan'));
       }
       if (path === '/kendali/posts') {
         const title = String(form.get('title') || '').trim().slice(0, 200);
@@ -1380,7 +1176,10 @@ async function handleFetch(request, env) {
           const clash = await env.DB.prepare(`SELECT id FROM cms_posts WHERE slug = ?`).bind(slug).first();
           if (clash) slug = slug + '-' + Date.now().toString(36).slice(-4);
           await env.DB.prepare(`INSERT INTO cms_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views, tags) VALUES (?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?, ?, 0, ?)`).bind(id, slug, title, body, category, now, now, bodyMode, visibility, publishAt, pwHash, pwSalt, tags).run();
+          return redirect(withNotice('/kendali/posts', 'post-dibuat'));
         }
+        // Judul/isi kosong: tidak ada yang dibuat, kembali tanpa notifikasi
+        // sukses (bukan klaim palsu).
         return redirect('/kendali/posts');
       }
       if (path === '/kendali/posts/update') {
@@ -1421,12 +1220,15 @@ async function handleFetch(request, env) {
         else body = body.slice(0, 50000);
         if (title && body) {
           await env.DB.prepare(`UPDATE cms_posts SET title = ?, body = ?, category = ?, updated_at = ?, body_mode = ?, visibility = ?, publish_at = ?, post_password_hash = ?, post_password_salt = ?, tags = ? WHERE id = ?`).bind(title, body, category, now, bodyMode, visibility, publishAt, pwHash, pwSalt, tags, postId).run();
+          return redirect(withNotice('/kendali/posts', 'post-diubah'));
         }
+        // Judul/isi kosong: tidak ada yang diubah, kembali tanpa
+        // notifikasi sukses.
         return redirect('/kendali/posts');
       }
       if (path === '/kendali/users/delete') {
         await env.DB.prepare(`DELETE FROM cms_users WHERE id = ?`).bind(String(form.get('id') || '')).run();
-        return redirect('/kendali/users');
+        return redirect(withNotice('/kendali/users', 'akun-dihapus'));
       }
       if (path === '/kendali/posts/delete') {
         const postId = String(form.get('id') || '');
@@ -1436,7 +1238,7 @@ async function handleFetch(request, env) {
         }
         await env.DB.prepare(`DELETE FROM cms_comments WHERE post_id = ?`).bind(postId).run();
         await env.DB.prepare(`DELETE FROM cms_posts WHERE id = ?`).bind(postId).run();
-        return redirect('/kendali/posts');
+        return redirect(withNotice('/kendali/posts', 'post-dihapus'));
       }
       if (path === '/kendali/comments/approve') {
         const cid = Number(form.get('id'));
@@ -1456,24 +1258,17 @@ async function handleFetch(request, env) {
             if (!already) {
               const post = comment.post_id ? await env.DB.prepare(`SELECT * FROM cms_posts WHERE id = ?`).bind(comment.post_id).first() : null;
               const reply = await generateAutoReply(env, post ? post.title : '', comment.text);
-              // H3 (5 Nov 2026): balasan bot WAJIB lolos filter blokir yang
-              // sama seperti komentar biasa, dan masuk sebagai 'pending'
-              // (ditinjau admin dulu) — bukan 'approved' langsung.
-              if (reply) {
-                const blockIds = new Set((await getEnabledPlugins(env)).map(p => p.id));
-                const blocked = (blockIds.has('blokir-link') && hasLink(reply)) || (blockIds.has('blokir-kotor') && hasDirtyWord(reply)) || (blockIds.has('blokir-judol') && hasJudol(reply));
-                if (!blocked) await env.DB.prepare(`INSERT INTO cms_comments (post_id, name, text, status, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?)`).bind(comment.post_id, AUTO_REPLY_BOT_NAME, reply, 'pending', new Date().toISOString(), cid).run();
-              }
+              if (reply) await env.DB.prepare(`INSERT INTO cms_comments (post_id, name, text, status, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?)`).bind(comment.post_id, AUTO_REPLY_BOT_NAME, reply, 'approved', new Date().toISOString(), cid).run();
             }
           }
         } catch (e) {}
-        return redirect('/kendali/comments');
+        return redirect(withNotice('/kendali/comments', 'komentar-disetujui'));
       }
       if (path === '/kendali/comments/delete') {
         const cid = Number(form.get('id'));
         await env.DB.prepare(`DELETE FROM cms_comment_votes WHERE comment_id = ?`).bind(cid).run();
         await env.DB.prepare(`DELETE FROM cms_comments WHERE id = ?`).bind(cid).run();
-        return redirect('/kendali/comments');
+        return redirect(withNotice('/kendali/comments', 'komentar-dihapus'));
       }
       if (path === '/kendali/plugins/toggle') {
         const id = String(form.get('id') || '');
@@ -1481,7 +1276,7 @@ async function handleFetch(request, env) {
           await env.DB.prepare(`UPDATE cms_plugins SET enabled = ? WHERE id = ?`).bind(Number(form.get('enabled')) ? 1 : 0, id).run();
         }
         const retP = String(form.get('return_to') || '');
-        return redirect(retP.startsWith('/kendali/') ? retP : '/kendali/plugins');
+        return redirect(withNotice(retP.startsWith('/kendali/') ? retP : '/kendali/plugins', 'plugin-disimpan'));
       }
     }
     // Jalur /admin lama sudah pensiun: siapa pun yang menebak /admin atau

@@ -13,11 +13,23 @@ sini adalah modul JS khusus WorkerCMS (lihat `plugins.js` dan
 > database — jadi instalasi sendiri bisa memakai nama apa pun tanpa
 > mengubah kode.
 
-## Fitur v2.2 (edge cache + UI lebih bersih)
+## Fitur v2.2 (UI lebih bersih)
 
-- **Load kilat:** halaman publik (beranda + post) di-cache di edge Cloudflare (60s + stale-while-revalidate). Cache hit target <50ms TTFB.
 - Tema lebih bersih (aksen solid, responsif mobile/tablet/desktop), meta description + Open Graph dasar.
 - Related posts sudah di-escape dengan benar.
+
+> **Koreksi jujur (audit Nov 2026):** versi README sebelumnya mengklaim
+> halaman publik di-cache di edge Cloudflare (60 dtk + stale-while-
+> revalidate, target <50 ms TTFB). **Klaim itu salah — kode tidak pernah
+> mengimplementasikan edge caching** (tidak ada `caches.default`,
+> `cf.cache*`, atau header Cache-Control di halaman publik, dan tidak
+> ada `wrangler.toml`/Cache Rules di repo). Halaman publik sengaja
+> TIDAK di-cache: setiap tampilan post menghitung views dan
+> visibilitas (private/terjadwal/password) + komentar segar harus
+> benar di tiap request. Bila pemilik mau edge cache, jalurnya lewat
+> Cache Rules di dashboard Cloudflare (di luar repo) — dengan
+> pengecualian agar halaman terkunci/terjadwal dan counter views
+> tidak ikut ter-cache. Sampai itu dipasang, jangan klaim ada cache.
 
 ## Fitur v2 (teruji lokal, `node test.mjs`)
 
@@ -26,6 +38,10 @@ sini adalah modul JS khusus WorkerCMS (lihat `plugins.js` dan
   kutipan/gambar/video/audio; drag & drop pakai mouse di PC, tombol
   Naik/Turun di HP), dan HTML (sanitasi daftar putih server-side:
   script/iframe/onclick/`javascript:` dibuang, video/audio diizinkan).
+  Jujur: sanitasi ini berbasis regex, bukan parser HTML penuh — cukup
+  untuk situs satu admin (post hanya bisa dibuat admin yang login),
+  tapi jangan klaim tahan semua input; baterai vektor serangan diuji
+  di `test.mjs`.
 - **Visibilitas post:** Publik, Private (hanya admin, pengunjung 404),
   Link saja (tidak di beranda, bisa dibuka lewat link), Password
   (PBKDF2, metadata dulu — judul/isi/komentar/terkait **tidak dimuat
@@ -39,8 +55,8 @@ sini adalah modul JS khusus WorkerCMS (lihat `plugins.js` dan
 - **View post:** hanya ikon mata + angka (👁 N), sekali per perangkat
   per hari (cookie), admin tidak dihitung.
 - **Tema (4, data-driven):** Terang, Gelap, Majalah (serif, lebar 780),
-  Minimal (radius 8, aksen solid). Ganti dari `/admin` Pengaturan.
-  Responsif HP/tablet/PC: viewport, breakpoint 600px, tombol 44px,
+  Minimal (radius 8, aksen solid). Ganti dari `/kendali` Pengaturan.
+  Responsif HP/tablet/PC: viewport, breakpoint 640px, tombol 44px,
   input 16px anti-zoom iOS, gambar/video tidak luber.
 - **Plugin:** Waktu Baca, Bagikan (WhatsApp/X), Post Terkait.
   Aktif/nonaktif dari panel admin. Tambah plugin = tambah entri di
@@ -66,7 +82,7 @@ sini adalah modul JS khusus WorkerCMS (lihat `plugins.js` dan
 
 - **Satu admin saja:** hanya pemilik dengan `ADMIN_TOKEN`. Tidak ada
   akun editor, penulis, atau pendaftar publik. Tidak ada endpoint
-  publik untuk membuat post — post hanya lewat `/admin/*` dengan
+  publik untuk membuat post — post hanya lewat `/kendali/*` dengan
   sesi + CSRF.
 - **Sistem token login:** token akses HMAC 1 jam (stateless) +
   token refresh opaque di D1 (hanya hash SHA-256 yang disimpan,
@@ -79,7 +95,35 @@ sini adalah modul JS khusus WorkerCMS (lihat `plugins.js` dan
   yang dicabut seketika adalah kemampuan memperpanjang sesi.
 - **Rate-limit login:** 5x gagal dari satu IP dalam 15 menit → 429.
   Rate-limit POST lain (komentar, akun, unlock, vote) di D1, tidak
-  untuk GET supaya tidak membakar kuota.
+  untuk GET supaya tidak membakar kuota. Rate limit D1 atomik: satu
+  statement UPSERT menaikkan counter hanya bila masih di bawah batas,
+  jadi dua request bersamaan tidak bisa sama-sama lolos di atas batas,
+  dan request yang ditolak tidak menambah counter.
+- **Password komentator:** 8–128 karakter (daftar ditolak 400 bila di
+  luar itu; login di luar itu ditolak 403 generik tanpa menjalankan
+  PBKDF2). Login admin memakai `ADMIN_TOKEN` dan tidak dibatasi aturan
+  ini. Password tidak di-trim. Batas ini tidak berlaku untuk password
+  post (tetap minimal 8).
+- **Retensi analitik:** riwayat views (`cms_view_events`) disimpan 90
+  hari, bucket rate-limit + jejak gagal login 24 jam, dihapus bertahap
+  (maks 500 baris per pemanggilan) saat admin membuka dashboard atau
+  Super Panel. Tanpa Cron di Worker ini, prune hanya jalan di momen
+  itu. Counter total views di `cms_posts` tidak pernah dihapus.
+  Dashboard + Super Panel hanya mengambil view events 30 hari
+  terakhir. Post, komentar, user, pengaturan, plugin, vote, loadtest,
+  dan backup tidak pernah dihapus prune.
+- **Batas ukuran request:** body POST maks 200 KB (lebih → 413),
+  upload gambar 6 MB. Batas tetap berlaku meski header Content-Length
+  tidak ada / tidak bisa dipercaya: body dibaca lewat stream dengan
+  batas yang sama, lalu request dibangun ulang dari byte yang sudah
+  dibatasi — body besar tidak pernah dibaca penuh sebelum limit
+  diterapkan. Endpoint load test punya batas sendiri 20 KB.
+- **Sesi admin:** rotasi refresh punya jeda tenggang 10 detik — dua
+  request bersamaan dengan token akses kedaluwarsa sama-sama bisa
+  memutar token refresh lama tanpa memicu pencabutan massal palsu.
+  Di luar jeda itu, pakai ulang refresh yang sudah diputar tetap
+  dianggap pencurian dan mencabut semua sesi. IP + User-Agent hanya
+  ditampilkan di halaman Sesi, bukan bukti identitas perangkat.
 - **CSRF:** semua aksi admin POST wajib token CSRF. Aksi tanpa CSRF
   ditolak 403 (diuji). Token CSRF admin sengaja stabil (HMAC),
   supaya form tidak basi setelah rotasi akses.

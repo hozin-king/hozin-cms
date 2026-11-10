@@ -80,6 +80,37 @@ export function clientIp(request) {
   return request.headers.get('cf-connecting-ip') || (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 }
 
+// Baca body request dengan batas (streaming, tanpa buffer penuh):
+// kembalikan Uint8Array bila total <= maxBytes, null bila melampaui.
+// Dipakai saat Content-Length tidak ada / tidak bisa dipercaya —
+// membaca lewat stream lalu membatalkan (cancel) begitu batas terlampaui,
+// jadi body besar tidak pernah dibaca penuh ke memori sebelum limit
+// diterapkan. Dipakai handleFetch di worker.js sebelum formData()/text().
+export async function readCappedBody(request, maxBytes) {
+  const stream = request.body;
+  if (!stream) return new Uint8Array(0);
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) return null;
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try { await reader.cancel(); } catch (e) {}
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
+}
+
 export function stripTags(s) {
   return String(s ?? '').replace(/<[^>]*>/g, '');
 }

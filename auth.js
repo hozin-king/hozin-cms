@@ -19,21 +19,12 @@ export function sessionExp(request) {
   return exp || '';
 }
 
-// H5 (5 Nov 2026): token CSRF TIDAK LAGI diturunkan dari ADMIN_TOKEN.
-// Kunci CSRF sendiri ('csrf_secret') disimpan di cms_settings, dibuat acak
-// saat pertama dipakai, dan diputar tiap login admin (issueTokens) — jadi
-// token CSRF lama mati saat login baru. Tetap tidak diikat ke masa berlaku
-// token akses: token akses diputar tiap jam, dan form dashboard yang sudah
-// dimuat harus tetap sah setelah rotasi.
-async function getCsrfSecret(env) {
-  const row = await env.DB.prepare(`SELECT value FROM cms_settings WHERE key = ?`).bind('csrf_secret').first();
-  if (row && row.value) return String(row.value);
-  const secret = randomHex(32);
-  await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('csrf_secret', ?)`).bind(secret).run();
-  return secret;
-}
+// CSRF sengaja TIDAK diikat ke masa berlaku token akses: token akses diputar
+// tiap jam, dan form dashboard yang sudah dimuat harus tetap sah setelah
+// rotasi. Karena hanya ada satu admin, token CSRF tetap yang hanya diketahui
+// admin yang login sudah cukup melawan pemalsuan lintas situs.
 export async function csrfToken(env) {
-  return env.ADMIN_TOKEN ? await hmacHex(await getCsrfSecret(env), 'csrf') : '';
+  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'csrf') : '';
 }
 
 export function accessCookie(env, exp) {
@@ -50,10 +41,12 @@ export async function issueTokens(env, request, remember) {
   const ttl = remember ? REFRESH_REMEMBER_TTL_MS : REFRESH_TTL_MS;
   const iso = new Date(now).toISOString();
   const expires = new Date(now + ttl).toISOString();
+  // device (User-Agent) dan ip HANYA disimpan untuk ditampilkan di halaman
+  // Sesi (/kendali/sessions) — keduanya sinyal tampilan saja, TIDAK PERNAH
+  // dipakai sebagai bukti identitas perangkat dalam keputusan auth apa pun
+  // (keduanya mudah dipalsukan / berubah di tengah jalan).
   const device = (request.headers.get('user-agent') || '').slice(0, 80);
-  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember, ip_changed, prev_ip) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?, 0, '')`).bind(id, hash, device, clientIp(request), iso, iso, expires, remember ? 1 : 0).run();
-  // H5: putar kunci CSRF tiap login — token CSRF dari sesi lama mati.
-  await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('csrf_secret', ?)`).bind(randomHex(32)).run();
+  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(id, hash, device, clientIp(request), iso, iso, expires, remember ? 1 : 0).run();
   const refresh = `cms_refresh=${raw}; Path=/kendali; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
   return [access, refresh];
 }
@@ -71,14 +64,40 @@ export function setCookieInHeader(header, name, value) {
   parts.push(`${name}=${value}`);
   return parts.join('; ');
 }
+// Jeda tenggang pemakaian ulang refresh (10 detik): dua request yang
+// datang bersamaan dengan token akses kedaluwarsa bisa sama-sama membaca
+// token refresh lama sebelum salah satunya memutarnya. Tanpa jeda ini,
+// request kedua dianggap pencurian dan mencabut SEMUA sesi (logout massal
+// palsu). Dalam jeda ini, token lama yang sudah diputar masih boleh
+// dipakai SEKALI untuk memutar token penggantinya (rantai maks 5 lompatan).
+// Trade-off: jendela 10 detik melemahkan deteksi reuse di dalam jendela
+// itu; di luar jendela, pemakaian ulang tetap dianggap pencurian dan
+// mencabut semua sesi seperti sebelumnya.
+const REFRESH_REUSE_GRACE_MS = 10 * 1000;
+
 // Putar refresh token. Kembalikan {request, cookies} bila berhasil, null bila
 // refresh tidak sah/kedaluwarsa/dicabut. Error D1 dilempar ke fallback 503,
 // bukan ditelan, supaya kegagalan database terlihat jelas, bukan login palsu.
 export async function tryRefresh(request, env) {
   const raw = parseCookies(request).cms_refresh || '';
   if (!raw || !env.ADMIN_TOKEN) return null;
-  const row = await getRefreshRow(request, env);
+  let row = await getRefreshRow(request, env);
   if (!row) return null;
+  // Ikuti rantai pengganti selama setiap lompatan masih segar (dibuat
+  // dalam jeda tenggang) dan belum kedaluwarsa — maks 5 lompatan, supaya
+  // tiga request bersamaan pun bisa memutar berurutan tanpa memicu
+  // pencabutan massal palsu. Rantai yang putus (pengganti basi /
+  // kedaluwarsa / tidak ada) berhenti di token revoked -> pencurian.
+  let hops = 0;
+  while (row.revoked && row.replaced_by && hops < 5) {
+    const next = await env.DB.prepare(`SELECT * FROM cms_refresh_tokens WHERE id = ?`).bind(row.replaced_by).first();
+    if (!next) break;
+    if (String(next.expires_at) <= new Date().toISOString()) break;
+    const age = Date.now() - new Date(String(next.created_at || '')).getTime();
+    if (!Number.isFinite(age) || age > REFRESH_REUSE_GRACE_MS) break;
+    row = next;
+    hops++;
+  }
   if (row.revoked) {
     // Refresh yang sudah diputar lalu dipakai lagi = token dicuri (kasus di
     // video: token bocor dipakai penyerang). Cabut semua sesi, paksa login ulang.
@@ -89,19 +108,6 @@ export async function tryRefresh(request, env) {
     await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1 WHERE id = ?`).bind(row.id).run();
     return null;
   }
-  // H4 (5 Nov 2026): refresh diikat IP + perangkat (kolom ip/device sudah
-  // ada, tapi tidak pernah dibandingkan). IP DAN perangkat sama-sama beda
-  // = sinyal pencurian: cabut semua sesi. Hanya IP beda (umum di HP yang
-  // pindah jaringan) = izinkan, tapi tandai di sesi baru supaya admin
-  // melihat peringatan di halaman Sesi & Perangkat.
-  const curIp = clientIp(request);
-  const curDevice = (request.headers.get('user-agent') || '').slice(0, 80);
-  const ipChanged = curIp !== (row.ip || '');
-  const deviceChanged = curDevice !== (row.device || '');
-  if (ipChanged && deviceChanged) {
-    await revokeAllRefresh(env);
-    return null;
-  }
   const now = Date.now();
   const newRaw = b64url(crypto.getRandomValues(new Uint8Array(32)));
   const newHash = await sha256Hex(newRaw);
@@ -110,7 +116,7 @@ export async function tryRefresh(request, env) {
   const iso = new Date(now).toISOString();
   const expires = new Date(now + ttl).toISOString();
   await env.DB.prepare(`UPDATE cms_refresh_tokens SET revoked = 1, replaced_by = ? WHERE id = ?`).bind(newId, row.id).run();
-  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember, ip_changed, prev_ip) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?, ?, ?)`).bind(newId, newHash, curDevice, curIp, iso, iso, expires, row.remember ? 1 : 0, ipChanged ? 1 : 0, ipChanged ? (row.ip || '') : '').run();
+  await env.DB.prepare(`INSERT INTO cms_refresh_tokens (id, token_hash, device, ip, created_at, last_used_at, expires_at, revoked, replaced_by, remember) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '', ?)`).bind(newId, newHash, row.device || '', row.ip || '', iso, iso, expires, row.remember ? 1 : 0).run();
   const access = await accessCookie(env, String(now + ACCESS_TTL_MS));
   const refresh = `cms_refresh=${newRaw}; Path=/kendali; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`;
   const headers = new Headers(request.headers);
@@ -133,6 +139,18 @@ export function clearAuthCookies() {
   ];
 }
 
+// Batas panjang password AKUN KOMENTATOR (bukan admin, bukan password post):
+// terlalu pendek gampang ditebak, terlalu panjang membebani PBKDF2 dan
+// bisa dipakai membanjiri CPU Worker. Diterapkan di rute daftar/login
+// komentator di worker.js, SETELAH cabang admin — login admin memakai
+// ADMIN_TOKEN yang panjangnya tidak dibatasi aturan ini.
+// Password TIDAK di-trim: spasi di awal/akhir adalah bagian password.
+export const COMMENTER_PASSWORD_MIN = 8;
+export const COMMENTER_PASSWORD_MAX = 128;
+export function isValidCommenterPassword(pw) {
+  return typeof pw === 'string' && pw.length >= COMMENTER_PASSWORD_MIN && pw.length <= COMMENTER_PASSWORD_MAX;
+}
+
 export async function hashPassword(password, saltHex) {
   const salt = new Uint8Array(saltHex.match(/.{2}/g).map(h => parseInt(h, 16)));
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
@@ -147,7 +165,7 @@ export async function verifyPassword(password, saltHex, hashHex) {
   return diff === 0;
 }
 export async function userCsrf(env, userId) {
-  return env.ADMIN_TOKEN ? await hmacHex(await getCsrfSecret(env), 'user-csrf:' + userId) : '';
+  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'user-csrf:' + userId) : '';
 }
 export async function getCommenter(request, env) {
   if (!env.ADMIN_TOKEN) return null;
