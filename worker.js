@@ -29,7 +29,7 @@ import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientI
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie, isValidCommenterPassword, COMMENTER_PASSWORD_MIN, COMMENTER_PASSWORD_MAX } from './auth.js';
 import { checkRateLimit } from './security.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
-import { ensureSchema, getSetting, getEnabledPlugins, doBackup, renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
+import { ensureSchema, getSetting, getAllSettings, getEnabledPlugins, doBackup, renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
 import { editorCard } from './editor.js';
 import { hasLink, hasDirtyWord, hasJudol } from './plugins.js';
 // Balasan otomatis komentar (perintah pemilik 31 Okt 2026): model TEKS Dahono
@@ -353,6 +353,17 @@ function maskKey(k) {
   if (t.length <= 8) return t.slice(0, 2) + '****';
   return t.slice(0, 4) + '****' + t.slice(-4);
 }
+// 11 Nov 2026 (performa): opsi renderPage dari peta pengaturan yang
+// sudah diambil SEKALI (getAllSettings) — supaya renderPage tidak
+// mengulang 3 query getSetting sesudah halaman selesai query (gelombang
+// D1 kedua). Precedence judul: env SITE_TITLE > DB > default.
+function pageOpts(settingsMap, env) {
+  return {
+    siteTitle: envSiteTitle(env) || settingsMap.get('site_title') || 'WorkerCMS',
+    themeId: settingsMap.get('theme') || 'terang',
+    siteAvatar: settingsMap.get('site_avatar') || '',
+  };
+}
 function keyDot(e) {
   if (e.fail && (!e.ok || String(e.fail) > String(e.ok))) return '🔴';
   if (e.ok) return '🟢';
@@ -552,15 +563,18 @@ async function handleFetch(request, env) {
       const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1);
       const offset = (page - 1) * 10;
       // Percepat: query independen ini jalan barengan, bukan berurutan.
-      const [rows, plugins, adImage, adLink, adText, adsenseClient, adsenseSlot] = await Promise.all([
+      // 11 Nov 2026: 5 getSetting iklan + 3 getSetting renderPage diganti
+      // SATU getAllSettings — halaman publik tinggal 1 gelombang D1.
+      const [rows, plugins, settingsMap] = await Promise.all([
         env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC LIMIT 11 OFFSET ?`).bind(nowIso, offset).all(),
         getEnabledPlugins(env),
-        getSetting(env, 'ad_image', ''),
-        getSetting(env, 'ad_link', ''),
-        getSetting(env, 'ad_text', ''),
-        getSetting(env, 'adsense_client', ''),
-        getSetting(env, 'adsense_slot', ''),
+        getAllSettings(env),
       ]);
+      const adImage = settingsMap.get('ad_image') || '';
+      const adLink = settingsMap.get('ad_link') || '';
+      const adText = settingsMap.get('ad_text') || '';
+      const adsenseClient = settingsMap.get('adsense_client') || '';
+      const adsenseSlot = settingsMap.get('adsense_slot') || '';
       const allPosts = rows.results || [];
       const hasNext = allPosts.length > 10;
       const posts = allPosts.slice(0, 10);
@@ -574,7 +588,7 @@ async function handleFetch(request, env) {
       const content = adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot) + (posts.length
         ? posts.map(p => postCard(p, plugins, admin)).join('')
         : '<div class="card"><p>Belum ada post.</p></div>') + nav + fab;
-      return html(await renderPage(env, 'Beranda', content), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
+      return html(await renderPage(env, 'Beranda', content, pageOpts(settingsMap, env)), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
     }
 
     // ---- Publik: arsip tag (hanya post publik yang sudah terbit) ----
@@ -583,16 +597,17 @@ async function handleFetch(request, env) {
     const tagMatch = path.match(/^\/tag\/([A-Za-z0-9-]+)$/);
     if (request.method === 'GET' && tagMatch) {
       const wanted = tagMatch[1];
-      const [rows, plugins] = await Promise.all([
+      const [rows, plugins, settingsMap] = await Promise.all([
         env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC LIMIT 200`).bind(nowIso).all(),
         getEnabledPlugins(env),
+        getAllSettings(env),
       ]);
       const matched = (rows.results || []).filter(p => parseTags(p.tags || '').some(t => tagSlug(t) === wanted));
       const label = matched.length ? parseTags(matched[0].tags || '').find(t => tagSlug(t) === wanted) || wanted : wanted;
       const content = `<h2>Tag: ${esc(label)}</h2>` + (matched.length
         ? matched.map(p => postCard(p, plugins, admin)).join('')
         : '<div class="card"><p>Belum ada post dengan tag ini.</p></div>') + `<p><a href="/">← Beranda</a></p>`;
-      return html(await renderPage(env, 'Tag: ' + label, content), 200);
+      return html(await renderPage(env, 'Tag: ' + label, content, pageOpts(settingsMap, env)), 200);
     }
 
     // ---- Post terkunci: buka kunci (rate-limit per IP + post) ----
@@ -676,28 +691,43 @@ async function handleFetch(request, env) {
         if (!admin && request.headers.get('x-load-test') !== '1') {
           const viewName = 'cms_view_' + String(post.id).replace(/[^A-Za-z0-9_-]/g, '_');
           if (!parseCookies(request)[viewName]) {
-            await env.DB.prepare(`UPDATE cms_posts SET views = views + 1 WHERE id = ?`).bind(post.id).run();
+            // 11 Nov 2026 (performa): UPDATE + INSERT view dalam SATU
+            // batch (1 round-trip D1) — sebelumnya 2 tulis berurutan.
+            // Urutan INSERT dulu: batch berhenti di statement yang gagal,
+            // jadi bila INSERT gagal, UPDATE belum jalan dan catch di bawah
+            // tetap menaikkan counter sekali (semantik lama: counter jalan
+            // walau riwayat event gagal).
+            try {
+              await env.DB.batch([
+                env.DB.prepare(`INSERT INTO cms_view_events (post_id, viewed_at) VALUES (?, ?)`).bind(post.id, nowIso),
+                env.DB.prepare(`UPDATE cms_posts SET views = views + 1 WHERE id = ?`).bind(post.id),
+              ]);
+            } catch (e) {
+              await env.DB.prepare(`UPDATE cms_posts SET views = views + 1 WHERE id = ?`).bind(post.id).run();
+            }
             post.views = (Number(post.views) || 0) + 1;
             viewCookie = viewName + '=1; Path=/; Max-Age=86400';
             // Riwayat views harian untuk dashboard (mulai rilis ini; data lama
             // tidak direkonstruksi — total lama tetap dari counter cms_posts).
-            try { await env.DB.prepare(`INSERT INTO cms_view_events (post_id, viewed_at) VALUES (?, ?)`).bind(post.id, nowIso).run(); } catch (e) {}
           }
         }
         // Percepat: query independen detail post jalan barengan, bukan berurutan.
+        // 11 Nov 2026: 5 getSetting iklan + 3 getSetting renderPage diganti
+        // SATU getAllSettings — detail post tinggal 1 gelombang D1.
         const myKey = admin ? 'admin' : (commenter ? 'u:' + commenter.id : null);
-        const [plugins, comments, rel, voteRows, myRows, adImage, adLink, adText, adsenseClient, adsenseSlot] = await Promise.all([
+        const [plugins, comments, rel, voteRows, myRows, settingsMap] = await Promise.all([
           getEnabledPlugins(env),
           env.DB.prepare(`SELECT * FROM cms_comments WHERE post_id = ? AND status = 'approved' ORDER BY created_at ASC`).bind(post.id).all(),
           env.DB.prepare(`SELECT * FROM cms_posts WHERE category = ? AND status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC`).bind(post.category, nowIso).all(),
           env.DB.prepare(`SELECT comment_id, vote, COUNT(*) AS n FROM cms_comment_votes GROUP BY comment_id, vote`).all(),
           myKey ? env.DB.prepare(`SELECT comment_id, vote FROM cms_comment_votes WHERE user_key = ?`).bind(myKey).all() : Promise.resolve({ results: [] }),
-          getSetting(env, 'ad_image', ''),
-          getSetting(env, 'ad_link', ''),
-          getSetting(env, 'ad_text', ''),
-          getSetting(env, 'adsense_client', ''),
-          getSetting(env, 'adsense_slot', ''),
+          getAllSettings(env),
         ]);
+        const adImage = settingsMap.get('ad_image') || '';
+        const adLink = settingsMap.get('ad_link') || '';
+        const adText = settingsMap.get('ad_text') || '';
+        const adsenseClient = settingsMap.get('adsense_client') || '';
+        const adsenseSlot = settingsMap.get('adsense_slot') || '';
         const metaHtml = plugins.map(p => p.postMeta ? p.postMeta(post) : '').join('');
         const footers = plugins.map(p => p.postFooter ? p.postFooter(post, { related: rel.results || [], baseUrl: url.origin }) : '').join('');
         const notice = url.searchParams.get('komentar') === 'menunggu' ? '<div class="card"><p>Komentar dikirim, menunggu persetujuan admin.</p></div>' : '';
@@ -723,7 +753,7 @@ async function handleFetch(request, env) {
         const bodyHtml = post.body_mode === 'html' ? sanitizeHtml(post.body) : para(post.body);
         const detailTags = tagLinks(post);
         const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${metaHtml}</p>${detailTags ? `<p class="meta">${detailTags}</p>` : ''}${bodyHtml}</article>${adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
-        const res = html(await renderPage(env, post.title, content), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
+        const res = html(await renderPage(env, post.title, content, pageOpts(settingsMap, env)), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
         if (viewCookie) {
           const h = new Headers(res.headers);
           h.append('set-cookie', viewCookie);

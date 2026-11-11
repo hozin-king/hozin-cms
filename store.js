@@ -45,7 +45,11 @@ export async function ensureSchema(env) {
         // Index untuk query dashboard (filter 30 hari) + prune retensi.
         `CREATE INDEX IF NOT EXISTS idx_cms_view_events_viewed_at ON cms_view_events (viewed_at)`,
       ];
-      for (const sql of ddl) await env.DB.prepare(sql).run();
+      // 11 Nov 2026 (performa): DDL dieksekusi via SATU batch, bukan
+      // ~30 round-trip D1 berurutan — di isolate dingin tiap round-trip
+      // 80–150 ms, jadi versi lama bikin TTFB 3–4,5 detik di situs sepi
+      // (isolate hampir selalu dingin). Batch D1 = 1 round-trip.
+      await env.DB.batch(ddl.map(sql => env.DB.prepare(sql)));
       const info = await env.DB.prepare(`PRAGMA table_info(cms_posts)`).all();
       const have = new Set((info.results || []).map(r => r.name));
       const missing = {
@@ -62,18 +66,17 @@ export async function ensureSchema(env) {
         views: `ALTER TABLE cms_posts ADD COLUMN views INTEGER NOT NULL DEFAULT 0`,
         tags: `ALTER TABLE cms_posts ADD COLUMN tags TEXT NOT NULL DEFAULT ''`,
       };
-      for (const [col, sql] of Object.entries(missing)) {
-        if (!have.has(col)) await env.DB.prepare(sql).run();
-      }
+      const alters = Object.entries(missing).filter(([col]) => !have.has(col)).map(([, sql]) => env.DB.prepare(sql));
       const cInfo = await env.DB.prepare(`PRAGMA table_info(cms_comments)`).all();
       const cHave = new Set((cInfo.results || []).map(r => r.name));
-      if (!cHave.has('parent_id')) await env.DB.prepare(`ALTER TABLE cms_comments ADD COLUMN parent_id INTEGER`).run();
-      if (!cHave.has('pinned')) await env.DB.prepare(`ALTER TABLE cms_comments ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`).run();
-      await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('site_title', 'WorkerCMS')`).run();
-      await env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`).run();
-      for (const p of pluginDefs) {
-        await env.DB.prepare(`INSERT OR IGNORE INTO cms_plugins (id, enabled) VALUES (?, 1)`).bind(p.id).run();
-      }
+      if (!cHave.has('parent_id')) alters.push(env.DB.prepare(`ALTER TABLE cms_comments ADD COLUMN parent_id INTEGER`));
+      if (!cHave.has('pinned')) alters.push(env.DB.prepare(`ALTER TABLE cms_comments ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`));
+      if (alters.length) await env.DB.batch(alters);
+      await env.DB.batch([
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('site_title', 'WorkerCMS')`),
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`),
+        ...pluginDefs.map(p => env.DB.prepare(`INSERT OR IGNORE INTO cms_plugins (id, enabled) VALUES (?, 1)`).bind(p.id)),
+      ]);
       const existing = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_posts`).first();
       if (existing && Number(existing.n) === 0) {
         const now = new Date().toISOString();
@@ -113,6 +116,14 @@ export async function pruneRateTables(env) {
 export async function getSetting(env, key, fallback) {
   const row = await env.DB.prepare(`SELECT value FROM cms_settings WHERE key = ?`).bind(key).first();
   return row ? row.value : fallback;
+}
+// 11 Nov 2026 (performa): SATU query untuk semua pengaturan — halaman
+// publik tadinya memanggil getSetting 5–8x (2 gelombang D1 berurutan:
+// Promise.all halaman + Promise.all renderPage). Tabel settings kecil
+// (puluhan baris), jadi SELECT * jauh lebih murah daripada N round-trip.
+export async function getAllSettings(env) {
+  const rows = await env.DB.prepare(`SELECT * FROM cms_settings ORDER BY key ASC`).all();
+  return new Map((rows.results || []).map(r => [r.key, r.value]));
 }
 export async function getEnabledPlugins(env) {
   const rows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();

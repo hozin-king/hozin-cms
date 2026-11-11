@@ -30,7 +30,7 @@ class MockDB {
     this.viewEventSeq = 0; this.attemptSeq = 0;
   }
   prepare(sql) { return new Stmt(this, sql); }
-  async batch(stmts) { for (const s of stmts) await s.run(); }
+  async batch(stmts) { this.batchCalls = (this.batchCalls || 0) + 1; for (const s of stmts) await s.run(); }
   exec(sql, a, mode) {
     const s = sql.replace(/\s+/g, ' ').trim();
     if (s.startsWith('CREATE TABLE')) return [];
@@ -269,7 +269,7 @@ function assert(cond, label) { console.log((cond ? 'OK  ' : 'GAGAL ') + label); 
 let r = await call('GET', '/'); let t = await r.text();
 assert(t.includes('Selamat Datang di WorkerCMS'), 'beranda: post sambutan tampil');
 assert(t.includes('menit baca'), 'beranda: plugin waktu baca aktif');
-assert(t.includes('id="copyr"') && t.includes('Online sejak 1 Januari 2024') && !t.includes('id="uptime"'), 'beranda: footer copyright + uptime sederhana (teks statis, tanpa detik berjalan)');
+assert(t.includes('id="copyr"') && t.includes('<a href="/uptime">Uptime</a>') && !t.includes('id="uptime"'), 'beranda: footer copyright + tautan Uptime (tanpa detik berjalan)');
 
 // 2. Login terpadu di form biasa /akun: nama 'admin' + token admin
 // (salah -> 403 generik, benar -> token akses + refresh + dashboard super-admin)
@@ -422,7 +422,11 @@ assert(terangHtml.includes('width=device-width') && terangHtml.includes('@media 
 // 11. Editor post: HTML disanitasi, teks di-escape, header keamanan, honeypot, rate-limit komentar
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post HTML', category: 'Tekno', body: '<script>alert(1)</script><p>Halo <b>Dunia</b></p><a href="javascript:alert(1)">x</a><img src="https://x.test/a.png" onerror="alert(1)"><video controls src="https://x.test/v.mp4"></video>', body_mode: 'html' }, cookie);
 r = await call('GET', '/post/post-html'); t = await r.text();
-assert(t.includes('<p>Halo <b>Dunia</b></p>') && t.includes('<video') && !t.includes('<script>alert(1)') && !t.includes('javascript:') && !t.includes('onerror'), 'mode HTML: tag aman lolos, script/javascript/onerror dibuang');
+// Cek HANYA isi <main> (konten post hasil sanitasi): shell halaman sendiri
+// sah memuat script tepercaya (tombol Salin blok kode, deteksi bahasa
+// 'javascript:'), jadi string itu tidak boleh dihitung sebagai bocor.
+const mainHtml = t.split('<main>')[1].split('</main>')[0];
+assert(mainHtml.includes('<p>Halo <b>Dunia</b></p>') && mainHtml.includes('<video') && !mainHtml.includes('<script>alert(1)') && !mainHtml.includes('javascript:') && !mainHtml.includes('onerror'), 'mode HTML: tag aman lolos, script/javascript/onerror dibuang');
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post Teks', category: 'Tekno', body: 'Ada <b>tebal</b> palsu.' }, cookie);
 r = await call('GET', '/post/post-teks'); t = await r.text();
 assert(t.includes('&lt;b&gt;') && !t.includes('Ada <b>tebal</b>'), 'mode teks: HTML di-escape');
@@ -946,6 +950,18 @@ r = await call('POST', '/kendali/backup', { csrf: csrf37 }, cookie); assert(r.st
 const bakKeys = (env.BACKUP_DB.backupSettings || []).map(x => x.key);
 assert(!bakKeys.includes('imgbb_api_keys') && !bakKeys.includes('csrf_secret'), 'backup H2: kunci ImgBB + csrf_secret tidak disalin');
 assert(bakKeys.includes('site_title'), 'backup H2: pengaturan biasa tetap disalin');
-// 37b. Anti-bocor <pre> (11 Nov 2026): blok kode panjang tidak boleh memaksa lebar halaman HP
-assert(themes.terang.render({ siteTitle: 'T', pageTitle: 'P', content: '' }).includes('pre{max-width:100%') && themes.terang.render({ siteTitle: 'T', pageTitle: 'P', content: '' }).includes('pre-wrap'), 'tema: blok <pre> dibatasi lebarnya (anti-bocor halaman HP)');
+// 37b. Code viewer <pre> (11 Nov 2026): kode satu baris + geser horizontal,
+// BUKAN patah mid-word; tombol Salin + label bahasa tersaji (port live v44).
+const htmlTerang = themes.terang.render({ siteTitle: 'T', pageTitle: 'P', content: '' });
+assert(htmlTerang.includes('pre{max-width:100%;overflow-x:auto') && htmlTerang.includes('white-space:pre;') && !htmlTerang.includes('pre-wrap'), 'tema: blok <pre> code viewer satu baris + geser horizontal');
+assert(htmlTerang.includes('copy-btn') && htmlTerang.includes('Salin'), 'tema: tombol Salin blok kode tersaji');
+// Regresi 11 Nov 2026: penutup <\/script> di copyScript sempat ganda
+// (\\), sehingga tag script tidak tertutup dan tombol Salin tidak jalan.
+assert(!htmlTerang.includes('<\\/script>'), 'tema: tidak ada penutup script ber-backslash (copyScript harus jalan)');
+// 37c. Footer (11 Nov 2026): teks "Online sejak..." diganti tautan Uptime ke /uptime
+assert(htmlTerang.includes('<a href="/uptime">Uptime</a>'), 'tema: footer berisi tautan Uptime ke /uptime');
+// 37d. Performa (11 Nov 2026): ensureSchema + hitung views WAJIB lewat
+// batch D1 — tanpa ini isolate dingin butuh ~30 round-trip berurutan
+// (TTFB 3–4,5 detik di situs sepi). Mock menghitung pemakaian batch.
+assert(env.DB.batchCalls >= 1, 'performa: ensureSchema memakai DB.batch (bukan puluhan prepare berurutan)');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
