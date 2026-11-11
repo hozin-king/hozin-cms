@@ -75,6 +75,7 @@ export async function ensureSchema(env) {
       await env.DB.batch([
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('site_title', 'WorkerCMS')`),
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`),
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('navbar', 'modern')`),
         ...pluginDefs.map(p => env.DB.prepare(`INSERT OR IGNORE INTO cms_plugins (id, enabled) VALUES (?, 1)`).bind(p.id)),
       ]);
       const existing = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_posts`).first();
@@ -233,18 +234,21 @@ export async function renderPage(env, pageTitle, content, opts = {}) {
   let siteTitle = opts.siteTitle;
   let themeId = opts.themeId;
   let siteAvatar = opts.siteAvatar;
-  if (!siteTitle || !themeId || siteAvatar === undefined) {
+  let navbarId = opts.navbarId;
+  if (!siteTitle || !themeId || siteAvatar === undefined || !navbarId) {
     const envTitle = envSiteTitle(env);
-    const [siteTitleDb, themeDb, avatarDb] = await Promise.all([
+    const [siteTitleDb, themeDb, avatarDb, navbarDb] = await Promise.all([
       envTitle || siteTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
       themeId ? Promise.resolve('') : getSetting(env, 'theme', 'terang'),
       siteAvatar !== undefined ? Promise.resolve('') : getSetting(env, 'site_avatar', ''),
+      navbarId ? Promise.resolve('') : getSetting(env, 'navbar', 'modern'),
     ]);
     if (!siteTitle) siteTitle = envTitle || siteTitleDb;
     if (!themeId) themeId = themeDb;
     if (siteAvatar === undefined) siteAvatar = avatarDb;
+    if (!navbarId) navbarId = navbarDb;
   }
   if (typeof siteAvatar !== 'string' || !siteAvatar.startsWith('https://') || /["'<\s]/.test(siteAvatar)) siteAvatar = '';
   const theme = themes[themeId] || themes.terang;
-  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content, siteAvatar, metaDesc: opts.metaDesc || '' });
+  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content, siteAvatar, metaDesc: opts.metaDesc || '', navbar: navbarId });
 }

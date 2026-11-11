@@ -418,6 +418,12 @@ assert(themes.majalah.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: 
 assert(themes.minimal.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' }).includes('border-radius:8px'), 'tema minimal: radius kartu berbeda');
 const terangHtml = themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' });
 assert(terangHtml.includes('width=device-width') && terangHtml.includes('@media (max-width:600px)') && terangHtml.includes('min-height:44px'), 'tema responsif: viewport + breakpoint HP + target sentuh 44px');
+// 10b. Navbar modern (11 Nov 2026): klasik default tidak berubah,
+// modern memuat pill + tab bar + palette + endpoint postingan.
+const klasikHtml = themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '' });
+assert(!klasikHtml.includes('nav-pill') && !klasikHtml.includes('tabbar') && !klasikHtml.includes('palette'), 'navbar klasik: render default tanpa pill/tab/palette');
+const modernHtml = themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '', navbar: 'modern' });
+assert(modernHtml.includes('nav-pill') && modernHtml.includes('tabbar') && modernHtml.includes('palette') && modernHtml.includes('/api/nav-posts') && modernHtml.includes('href="/akun"') && modernHtml.includes('href="/bio"'), 'navbar modern: pill + tab bar + palette + endpoint tampil, link Akun/Bio ada');
 
 // 11. Editor post: HTML disanitasi, teks di-escape, header keamanan, honeypot, rate-limit komentar
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post HTML', category: 'Tekno', body: '<script>alert(1)</script><p>Halo <b>Dunia</b></p><a href="javascript:alert(1)">x</a><img src="https://x.test/a.png" onerror="alert(1)"><video controls src="https://x.test/v.mp4"></video>', body_mode: 'html' }, cookie);
@@ -589,6 +595,9 @@ assert(r.headers.get('content-type') && r.headers.get('content-type').includes('
 assert(t.includes('/post/selamat-datang') && !t.includes('/post/post-private') && !t.includes('/post/post-kunci'), 'sitemap: hanya post publik, bukan private/password');
 r = await call('GET', '/robots.txt'); t = await r.text();
 assert(t.includes('Disallow: /kendali/') && t.includes('/sitemap.xml'), 'robots: larang admin + tunjuk sitemap');
+r = await call('GET', '/api/nav-posts'); t = await r.text();
+const navPosts = JSON.parse(t);
+assert(r.status === 200 && navPosts.ok === true && Array.isArray(navPosts.posts) && navPosts.posts.some(p => p.slug === 'selamat-datang') && !navPosts.posts.some(p => p.slug === 'post-private'), 'nav-posts: daftar post publik untuk Command Palette');
 r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
 assert(t.includes('AdSense: ID penayang'), 'pengaturan: kolom AdSense tampil');
 r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: 'ca-pub-1234567890123456', adsense_slot: '1234567890' }, cookie); assert(r.status === 303, 'pengaturan AdSense tersimpan');
