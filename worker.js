@@ -274,9 +274,49 @@ async function routeDracin(request, env, url) {
   return { res: dracinJson({ ok: false, error: 'tidak ditemukan' }, 404), keyId: '' };
 }
 
+// 11 Nov 2026 — redesign visual admin: CSS admin (hanya halaman /kendali,
+// ikut bersama nav di setiap halaman admin; themes.js tidak disentuh).
+// Visual saja: semua data, tautan, dan aksi tetap sama. Warna memakai
+// tint abu-abu tembus pandang + aksen biru situs supaya cocok di tema
+// gelap maupun terang.
+const ADMIN_CSS = `<style>
+.adm-nav{position:sticky;top:0;z-index:20;display:flex;gap:8px;overflow-x:auto;padding:10px 8px;margin:0 -4px 18px;background:rgba(128,128,128,.14);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);border:1px solid rgba(128,128,128,.18);border-radius:14px;scrollbar-width:none}
+.adm-nav::-webkit-scrollbar{display:none}
+.adm-nav a{flex:none;display:inline-flex;align-items:center;padding:9px 14px;border-radius:999px;background:rgba(128,128,128,.10);border:1px solid rgba(128,128,128,.16);color:inherit;text-decoration:none;font-size:14px;font-weight:600;white-space:nowrap;min-height:44px;box-sizing:border-box}
+.adm-nav a.on{background:#3b82f6;border-color:#3b82f6;color:#fff}
+.adm-head{display:flex;gap:14px;align-items:flex-start;margin:2px 0 6px}
+.adm-head-mark{flex:none;width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:800;box-shadow:0 4px 14px rgba(59,130,246,.35)}
+.adm-head h2{margin:0;font-size:24px;line-height:1.25}
+.adm-role{margin:6px 0 0;font-size:14px;line-height:1.55}
+.adm-badge{display:inline-block;padding:2px 10px;border-radius:999px;background:rgba(59,130,246,.16);color:#3b82f6;font-weight:800;font-size:13px}
+.adm-muted{opacity:.68}
+.adm-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+@media(min-width:640px){.adm-stats{grid-template-columns:repeat(4,1fr)}}
+.adm-stat{display:block;padding:14px;border-radius:12px;background:rgba(128,128,128,.08);border:1px solid rgba(128,128,128,.14);color:inherit;text-decoration:none}
+a.adm-stat:hover{border-color:rgba(59,130,246,.5)}
+.adm-stat-num{display:block;font-size:26px;font-weight:800;line-height:1.1}
+.adm-stat-label{display:block;font-size:13px;font-weight:700;margin-top:4px}
+.adm-stat-sub{display:block;font-size:12px;opacity:.65;margin-top:2px;line-height:1.45}
+.adm-stat-sub a{color:#3b82f6;text-decoration:none;font-weight:700}
+.adm-row{display:flex;gap:12px;align-items:flex-start;padding:12px 0}
+.adm-row+.adm-row{border-top:1px solid rgba(128,128,128,.14)}
+.adm-rank{flex:none;width:26px;height:26px;border-radius:50%;background:rgba(59,130,246,.16);color:#3b82f6;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;margin-top:1px}
+.adm-row-body{flex:1;min-width:0}
+.adm-row-title{font-weight:700;color:inherit;text-decoration:none;line-height:1.4;overflow-wrap:anywhere}
+.adm-row-title:hover{color:#3b82f6}
+.adm-row-meta{font-size:13px;opacity:.68;margin-top:3px;line-height:1.5}
+.adm-edit{flex:none;font-size:13px;font-weight:700;color:#3b82f6;text-decoration:none;padding:7px 12px;border-radius:999px;background:rgba(59,130,246,.12);white-space:nowrap}
+.card{border-radius:14px;box-shadow:0 4px 18px rgba(0,0,0,.10)}
+.card h3{margin:0 0 12px;font-size:17px}
+button{font:inherit;background:#3b82f6;color:#fff;border:0;border-radius:10px;padding:10px 16px;font-weight:700;min-height:44px;cursor:pointer}
+form[action$="/delete"] button{background:#dc2626}
+label{display:block;font-weight:600;font-size:14px;margin:14px 0 4px}
+input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;border:1px solid rgba(128,128,128,.32);background:rgba(128,128,128,.06);color:inherit;font:inherit}
+</style>`;
+
 function adminNav(current) {
   const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup']];
-  return '<nav style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-bottom:16px">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' style="font-weight:800;text-decoration:underline"' : '') + '>' + label + '</a>').join('') + '</nav>';
+  return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
 // Notifikasi sekali jalan untuk aksi admin: redirect membawa
@@ -1095,9 +1135,9 @@ async function handleFetch(request, env) {
         const byId = new Map(postList.map(p => [String(p.id), p]));
         const commentCount = new Map();
         for (const c of commentList) if (c.status === 'approved') commentCount.set(String(c.post_id), (commentCount.get(String(c.post_id)) || 0) + 1);
-        const postLink = p => `<a href="/post/${esc(p.slug)}">${esc(p.title)}</a>`;
+        const postLink = p => `<a class="adm-row-title" href="/post/${esc(p.slug)}">${esc(p.title)}</a>`;
         const topViews = [...postList].sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0)).slice(0, 5);
-        const topViewsHtml = topViews.map((p, i) => `<p><b>${i + 1}.</b> ${postLink(p)} — ${viewEye(Number(p.views) || 0)} · ${esc(p.category)} · ${esc(String(p.created_at || '').slice(0, 10))} · ${commentCount.get(String(p.id)) || 0} komentar · <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a></p>`).join('') || '<p>Belum ada post.</p>';
+        const topViewsHtml = topViews.map((p, i) => `<div class="adm-row"><span class="adm-rank">${i + 1}</span><div class="adm-row-body">${postLink(p)}<div class="adm-row-meta">${viewEye(Number(p.views) || 0)} · ${esc(p.category)} · ${esc(String(p.created_at || '').slice(0, 10))} · ${commentCount.get(String(p.id)) || 0} komentar</div></div><a class="adm-edit" href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a></div>`).join('') || '<p>Belum ada post.</p>';
         // Views 7 hari terakhir dari riwayat (WIB, mulai dicatat rilis ini saja).
         const nowMs = Date.now();
         const sevenAgo = new Date(nowMs - 7 * 24 * 3600 * 1000).toISOString();
@@ -1109,15 +1149,15 @@ async function handleFetch(request, env) {
         const viewsToday = events.filter(e => wibDate(new Date(String(e.viewed_at || '')).getTime()) === todayWib).length;
         const perPost7 = new Map();
         for (const e of recent) perPost7.set(String(e.post_id), (perPost7.get(String(e.post_id)) || 0) + 1);
-        const top7 = [...perPost7.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([pid, n]) => byId.get(pid)).filter(Boolean).map((p, i) => `<p><b>${i + 1}.</b> ${postLink(p)} — ${perPost7.get(String(p.id))} views 7 hari terakhir · ${viewEye(Number(p.views) || 0)} total</p>`).join('');
+        const top7 = [...perPost7.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([pid, n]) => byId.get(pid)).filter(Boolean).map((p, i) => `<div class="adm-row"><span class="adm-rank">${i + 1}</span><div class="adm-row-body">${postLink(p)}<div class="adm-row-meta">${perPost7.get(String(p.id))} views 7 hari terakhir · ${viewEye(Number(p.views) || 0)} total</div></div></div>`).join('');
         const top7Html = top7 || '<p>Belum ada data views 7 hari terakhir — riwayat views baru mulai dicatat dari rilis ini, jadi bagian ini terisi setelah ada pengunjung baru. Total views di atas tetap dari counter lama.</p>';
-        const topCommented = [...postList].map(p => ({ p, n: commentCount.get(String(p.id)) || 0 })).filter(x => x.n > 0).sort((a, b) => b.n - a.n).slice(0, 5).map((x, i) => `<p><b>${i + 1}.</b> ${postLink(x.p)} — ${x.n} komentar disetujui</p>`).join('') || '<p>Belum ada komentar disetujui.</p>';
-        const latest = postList.slice(0, 5).map(p => `<p>${postLink(p)} — ${viewEye(Number(p.views) || 0)} · ${esc(String(p.created_at || '').slice(0, 10))}</p>`).join('') || '<p>Belum ada post.</p>';
+        const topCommented = [...postList].map(p => ({ p, n: commentCount.get(String(p.id)) || 0 })).filter(x => x.n > 0).sort((a, b) => b.n - a.n).slice(0, 5).map((x, i) => `<div class="adm-row"><span class="adm-rank">${i + 1}</span><div class="adm-row-body">${postLink(x.p)}<div class="adm-row-meta">${x.n} komentar disetujui</div></div></div>`).join('') || '<p>Belum ada komentar disetujui.</p>';
+        const latest = postList.slice(0, 5).map(p => `<div class="adm-row"><div class="adm-row-body">${postLink(p)}<div class="adm-row-meta">${viewEye(Number(p.views) || 0)} · ${esc(String(p.created_at || '').slice(0, 10))}</div></div></div>`).join('') || '<p>Belum ada post.</p>';
         const commenterCount = new Map();
         for (const c of commentList) if (c.status === 'approved') commenterCount.set(c.name, (commenterCount.get(c.name) || 0) + 1);
-        const topCommenters = [...commenterCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, n], i) => `<p><b>${i + 1}.</b> ${esc(name)} — ${n} komentar</p>`).join('') || '<p>Belum ada komentator aktif.</p>';
-        const zeroViews = postList.filter(p => (Number(p.views) || 0) === 0).slice(0, 5).map(p => `<p>${postLink(p)} · <a href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a></p>`).join('');
-        const content = `<h2>Dashboard Admin</h2><p>Peran: <b>Super-Super-Admin (satu-satunya)</b> — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</p>${nav}<div class="card"><h3>Ringkasan</h3><p><b>${totalViews} views total</b> · ${views7} views 7 hari terakhir · ${viewsToday} views hari ini (WIB) · rata-rata ${avgViews} views/post</p><p><b>${postList.length} Post</b> · <a href="/kendali/posts">Lihat Post</a> · <a href="/kendali/posts/new">Post Baru</a></p><p><b>${commentList.length} Komentar</b> (${approvedComments} disetujui, ${pending} menunggu) · <a href="/kendali/comments">Moderasi Komentar</a></p><p><b>${(users.results || []).length} Akun komentator</b> · <a href="/kendali/users">Lihat Akun</a></p><p><b>${activePlugins} Plugin aktif</b> · <a href="/kendali/plugins">Lihat Plugin</a></p></div><div class="card"><h3>🔥 Post Terpopuler / Viral (views terbanyak sepanjang masa)</h3>${topViewsHtml}</div><div class="card"><h3>📈 Post Terpopuler 7 Hari Terakhir</h3>${top7Html}</div><div class="card"><h3>💬 Post Paling Banyak Dikomentari</h3>${topCommented}</div><div class="card"><h3>🆕 Post Terbaru</h3>${latest}</div><div class="card"><h3>👥 Komentator Teraktif</h3>${topCommenters}</div>${zeroViews ? `<div class="card"><h3>👀 Post Belum Pernah Dilihat</h3>${zeroViews}</div>` : ''}<form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>`;
+        const topCommenters = [...commenterCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, n], i) => `<div class="adm-row"><span class="adm-rank">${i + 1}</span><div class="adm-row-body"><span class="adm-row-title">${esc(name)}</span><div class="adm-row-meta">${n} komentar</div></div></div>`).join('') || '<p>Belum ada komentator aktif.</p>';
+        const zeroViews = postList.filter(p => (Number(p.views) || 0) === 0).slice(0, 5).map(p => `<div class="adm-row"><div class="adm-row-body">${postLink(p)}<div class="adm-row-meta">Belum pernah dilihat</div></div><a class="adm-edit" href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a></div>`).join('');
+        const content = `<div class="adm-head"><div class="adm-head-mark">H</div><div><h2>Dashboard Admin</h2><p class="adm-role">Peran: <span class="adm-badge">Super-Super-Admin</span> <span class="adm-muted">(satu-satunya) — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</span></p></div></div>${nav}<div class="card"><h3>Ringkasan</h3><div class="adm-stats"><div class="adm-stat"><span class="adm-stat-num">${totalViews}</span><span class="adm-stat-label">views total</span><span class="adm-stat-sub">rata-rata ${avgViews} views/post</span></div><div class="adm-stat"><span class="adm-stat-num">${views7}</span><span class="adm-stat-label">Views 7 hari terakhir</span></div><div class="adm-stat"><span class="adm-stat-num">${viewsToday}</span><span class="adm-stat-label">Views hari ini (WIB)</span></div><div class="adm-stat"><span class="adm-stat-num">${postList.length}</span><span class="adm-stat-label">Post</span><span class="adm-stat-sub"><a href="/kendali/posts">Lihat Post</a> · <a href="/kendali/posts/new">Post Baru</a></span></div><div class="adm-stat"><span class="adm-stat-num">${commentList.length}</span><span class="adm-stat-label">Komentar</span><span class="adm-stat-sub">${approvedComments} disetujui, ${pending} menunggu · <a href="/kendali/comments">Moderasi Komentar</a></span></div><div class="adm-stat"><span class="adm-stat-num">${(users.results || []).length}</span><span class="adm-stat-label">Akun komentator</span><span class="adm-stat-sub"><a href="/kendali/users">Lihat Akun</a></span></div><div class="adm-stat"><span class="adm-stat-num">${activePlugins}</span><span class="adm-stat-label">Plugin aktif</span><span class="adm-stat-sub"><a href="/kendali/plugins">Lihat Plugin</a></span></div></div></div><div class="card"><h3>🔥 Post Terpopuler / Viral (views terbanyak sepanjang masa)</h3>${topViewsHtml}</div><div class="card"><h3>📈 Post Terpopuler 7 Hari Terakhir</h3>${top7Html}</div><div class="card"><h3>💬 Post Paling Banyak Dikomentari</h3>${topCommented}</div><div class="card"><h3>🆕 Post Terbaru</h3>${latest}</div><div class="card"><h3>👥 Komentator Teraktif</h3>${topCommenters}</div>${zeroViews ? `<div class="card"><h3>👀 Post Belum Pernah Dilihat</h3>${zeroViews}</div>` : ''}<form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>`;
         return html(await renderPage(env, 'Admin', content));
       }
       if (path === '/kendali/posts') {
