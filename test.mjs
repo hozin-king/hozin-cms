@@ -983,4 +983,44 @@ assert(htmlTerang.includes('<a href="/uptime">Uptime</a>'), 'tema: footer berisi
 // batch D1 — tanpa ini isolate dingin butuh ~30 round-trip berurutan
 // (TTFB 3–4,5 detik di situs sepi). Mock menghitung pemakaian batch.
 assert(env.DB.batchCalls >= 1, 'performa: ensureSchema memakai DB.batch (bukan puluhan prepare berurutan)');
+// 38. Remote config Cerpen Hozin (v61, 11 Nov 2026): endpoint publik
+// /api/cerpen-config + pengaturan cerpen_config di /kendali/settings.
+r = await call('GET', '/api/cerpen-config'); t = await r.text();
+let cerpenCfg = JSON.parse(t);
+assert(r.status === 200 && r.headers.get('content-type').includes('application/json') && cerpenCfg.version === 1 && Array.isArray(cerpenCfg.tabs) && cerpenCfg.tabs.length === 4 && cerpenCfg.tabs[0].id === 'cerbung' && cerpenCfg.tabs[0].label === 'Cerita' && cerpenCfg.banner === '' && cerpenCfg.accent === '', 'cerpen-config: endpoint publik mengembalikan default saat belum diset');
+assert(r.headers.get('cache-control') === 'public, max-age=60', 'cerpen-config: header cache 60 detik');
+r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
+const csrf38 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+assert(t.includes('name="cerpen_config"') && t.includes('Remote Config — Cerpen Hozin'), 'cerpen-config: textarea + kartu tampil di Pengaturan');
+assert(csrf38.length > 10, 'cerpen-config: token CSRF baru untuk tes simpan');
+const cerpenValid = JSON.stringify({ version: 1, tabs: [{ id: 'komik', label: 'Komik Baru', visible: true }, { id: 'cerbung', label: 'Cerita', visible: true }, { id: 'berita', label: 'Berita', visible: false }, { id: 'koleksi', label: 'Koleksi', visible: true }], banner: 'Episode baru tiap hari!', accent: '#3b82f6' });
+r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', cerpen_config: '{bukan json' }, cookie);
+assert(r.status === 303 && (r.headers.get('location') || '').includes('cerpen-config-tidak-valid'), 'cerpen-config: JSON tidak valid ditolak + notice gagal');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(cerpenCfg.tabs.length === 4 && cerpenCfg.tabs[0].id === 'cerbung' && cerpenCfg.banner === '', 'cerpen-config: JSON tidak valid tidak menimpa nilai lama (tetap default)');
+r = await call('GET', '/kendali/settings?notice=cerpen-config-tidak-valid', null, cookie); t = await r.text();
+assert(t.includes('Gagal:') && t.includes('tidak valid'), 'cerpen-config: notice gagal tampil di halaman Pengaturan');
+r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', cerpen_config: JSON.stringify({ version: 1, tabs: [{ id: 'ngawur', label: 'X', visible: true }], banner: '', accent: '' }) }, cookie);
+assert(r.status === 303 && (r.headers.get('location') || '').includes('cerpen-config-tidak-valid'), 'cerpen-config: id tab di luar daftar ditolak');
+r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', cerpen_config: JSON.stringify({ version: 1, tabs: [], banner: '', accent: 'biru' }) }, cookie);
+assert(r.status === 303 && (r.headers.get('location') || '').includes('cerpen-config-tidak-valid'), 'cerpen-config: accent bukan #RRGGBB ditolak');
+r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', cerpen_config: JSON.stringify({ version: 1, tabs: [], banner: 'x'.repeat(141), accent: '' }) }, cookie);
+assert(r.status === 303 && (r.headers.get('location') || '').includes('cerpen-config-tidak-valid'), 'cerpen-config: banner >140 karakter ditolak');
+r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', cerpen_config: cerpenValid }, cookie);
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pengaturan-disimpan'), 'cerpen-config: config valid tersimpan');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(cerpenCfg.tabs[0].id === 'komik' && cerpenCfg.tabs[0].label === 'Komik Baru' && cerpenCfg.tabs[2].visible === false && cerpenCfg.banner === 'Episode baru tiap hari!' && cerpenCfg.accent === '#3b82f6', 'cerpen-config: config valid terbaca di endpoint (urutan + label + visible + banner + accent)');
+r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', cerpen_config: JSON.stringify({ version: 1, tabs: [{ id: 'cerbung', label: 'x'.repeat(31), visible: true }], banner: '', accent: '' }) }, cookie);
+assert(r.status === 303 && (r.headers.get('location') || '').includes('cerpen-config-tidak-valid'), 'cerpen-config: label >30 karakter ditolak');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(cerpenCfg.tabs[0].id === 'komik' && cerpenCfg.accent === '#3b82f6', 'cerpen-config: penolakan tidak menimpa config valid yang sudah tersimpan');
+// Regresi: form Super Panel (tanpa field cerpen_config) tetap menyimpan.
+r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', return_to: '/kendali/super' }, cookie);
+assert((r.headers.get('location') || '') === '/kendali/super?notice=pengaturan-disimpan', 'cerpen-config: form tanpa field cerpen_config tetap jalan (Super Panel)');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(cerpenCfg.tabs[0].id === 'komik', 'cerpen-config: simpan tanpa field tidak menghapus config');
+// Regresi: nilai rusak di DB -> endpoint tetap mengembalikan default.
+env.DB.settings.set('cerpen_config', '{rusak');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(cerpenCfg.version === 1 && cerpenCfg.tabs.length === 4 && cerpenCfg.tabs[0].id === 'cerbung', 'cerpen-config: nilai rusak di DB -> endpoint mengembalikan default');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
