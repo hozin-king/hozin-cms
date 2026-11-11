@@ -424,6 +424,7 @@ const klasikHtml = themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'X'
 assert(!klasikHtml.includes('nav-pill') && !klasikHtml.includes('tabbar') && !klasikHtml.includes('palette'), 'navbar klasik: render default tanpa pill/tab/palette');
 const modernHtml = themes.terang.render({ siteTitle: 'WorkerCMS', pageTitle: 'X', content: '', navbar: 'modern' });
 assert(modernHtml.includes('nav-pill') && modernHtml.includes('tabbar') && modernHtml.includes('palette') && modernHtml.includes('/api/nav-posts') && modernHtml.includes('href="/akun"') && modernHtml.includes('href="/bio"'), 'navbar modern: pill + tab bar + palette + endpoint tampil, link Akun/Bio ada');
+assert(modernHtml.includes('translateY(-18px)') && modernHtml.includes('button[data-palette-open]{flex:0 0 52px') && modernHtml.includes('scale(.96)') && !modernHtml.includes('padding-top:5px'), 'navbar modern: tombol Cari jadi bubble menonjol di tab bar, pill mengecil pakai transform (anti-lag)');
 
 // 11. Editor post: HTML disanitasi, teks di-escape, header keamanan, honeypot, rate-limit komentar
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post HTML', category: 'Tekno', body: '<script>alert(1)</script><p>Halo <b>Dunia</b></p><a href="javascript:alert(1)">x</a><img src="https://x.test/a.png" onerror="alert(1)"><video controls src="https://x.test/v.mp4"></video>', body_mode: 'html' }, cookie);
