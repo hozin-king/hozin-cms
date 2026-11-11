@@ -36,6 +36,12 @@ export async function ensureSchema(env) {
         `CREATE TABLE IF NOT EXISTS cms_view_events (id INTEGER PRIMARY KEY AUTOINCREMENT, post_id TEXT NOT NULL, viewed_at TEXT NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS cms_loadtest_runs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, vu INTEGER NOT NULL DEFAULT 0, duration_s INTEGER NOT NULL DEFAULT 0, p95_ms REAL NOT NULL DEFAULT 0, failed_rate REAL NOT NULL DEFAULT 0, passed INTEGER NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '')`,
         `CREATE TABLE IF NOT EXISTS cms_rate_limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, window_start TEXT NOT NULL)`,
+
+        `CREATE TABLE IF NOT EXISTS dracin_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL, scope TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS dracin_catalog (platform TEXT NOT NULL, title_id TEXT NOT NULL, title TEXT NOT NULL, cover_url TEXT NOT NULL DEFAULT '', synopsis TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT '', episode_count INTEGER NOT NULL DEFAULT 0, free_count INTEGER NOT NULL DEFAULT 0, locked_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (platform, title_id))`,
+        `CREATE TABLE IF NOT EXISTS dracin_episodes (platform TEXT NOT NULL, title_id TEXT NOT NULL, idx INTEGER NOT NULL, item_id TEXT NOT NULL, duration_s REAL NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (platform, title_id, idx))`,
+        `CREATE TABLE IF NOT EXISTS dracin_seeds (platform TEXT NOT NULL, query TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (platform, query))`,
+        `CREATE TABLE IF NOT EXISTS dracin_api_usage (ts INTEGER NOT NULL, key_id TEXT NOT NULL, endpoint TEXT NOT NULL, method TEXT NOT NULL, status INTEGER NOT NULL, country TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '')`,
         // Index untuk query dashboard (filter 30 hari) + prune retensi.
         `CREATE INDEX IF NOT EXISTS idx_cms_view_events_viewed_at ON cms_view_events (viewed_at)`,
       ];
@@ -118,11 +124,22 @@ export async function doBackup(env) {
   if (!env.BACKUP_DB) throw new Error('Binding BACKUP_DB belum dipasang di Worker');
   const posts = await env.DB.prepare(`SELECT * FROM cms_posts ORDER BY created_at ASC`).all();
   const comments = await env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at ASC`).all();
-  const settings = await env.DB.prepare(`SELECT * FROM cms_settings ORDER BY key ASC`).all();
+  // H2 (5 Nov 2026): backup TIDAK menyalin rahasia ke BACKUP_DB bersama —
+  // kunci ImgBB ('imgbb_api_keys'/'imgbb_api_key'), 'csrf_secret' (H5), dan
+  // hash/salt password (komentator + post) dikosongkan. Setelah restore,
+  // isi ulang kunci ImgBB di /kendali/settings; csrf_secret dibuat ulang
+  // otomatis saat login berikut; komentator perlu reset password.
+  const settings = await env.DB.prepare(`SELECT key, value FROM cms_settings WHERE key NOT IN ('imgbb_api_keys', 'imgbb_api_key', 'csrf_secret') ORDER BY key ASC`).all();
   const plugins = await env.DB.prepare(`SELECT * FROM cms_plugins ORDER BY id ASC`).all();
-  const users = await env.DB.prepare(`SELECT * FROM cms_users ORDER BY created_at ASC`).all();
+  const users = await env.DB.prepare(`SELECT id, username, created_at FROM cms_users ORDER BY created_at ASC`).all();
   const votes = await env.DB.prepare(`SELECT * FROM cms_comment_votes ORDER BY comment_id ASC`).all();
   const loadtests = await env.DB.prepare(`SELECT * FROM cms_loadtest_runs ORDER BY created_at ASC`).all();
+
+  const dracinKeys = await env.DB.prepare(`SELECT * FROM dracin_api_keys ORDER BY created_at ASC`).all();
+  const dracinCatalog = await env.DB.prepare(`SELECT * FROM dracin_catalog ORDER BY platform ASC, title_id ASC`).all();
+  const dracinEpisodes = await env.DB.prepare(`SELECT * FROM dracin_episodes ORDER BY platform ASC, title_id ASC, idx ASC`).all();
+  const dracinSeeds = await env.DB.prepare(`SELECT * FROM dracin_seeds ORDER BY platform ASC, query ASC`).all();
+  const dracinUsage = await env.DB.prepare(`SELECT * FROM dracin_api_usage ORDER BY ts ASC`).all();
   const now = new Date().toISOString();
   const bak = env.BACKUP_DB;
   for (const sql of [
@@ -133,6 +150,12 @@ export async function doBackup(env) {
     `CREATE TABLE IF NOT EXISTS cms_backup_users (id TEXT PRIMARY KEY, username TEXT NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL, backup_at TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS cms_backup_votes (comment_id INTEGER NOT NULL, user_key TEXT NOT NULL, vote INTEGER NOT NULL, backup_at TEXT NOT NULL, PRIMARY KEY (comment_id, user_key))`,
     `CREATE TABLE IF NOT EXISTS cms_backup_loadtest_runs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, vu INTEGER NOT NULL DEFAULT 0, duration_s INTEGER NOT NULL DEFAULT 0, p95_ms REAL NOT NULL DEFAULT 0, failed_rate REAL NOT NULL DEFAULT 0, passed INTEGER NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '', backup_at TEXT NOT NULL)`,
+
+    `CREATE TABLE IF NOT EXISTS cms_backup_dracin_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL, scope TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, backup_at TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS cms_backup_dracin_catalog (platform TEXT NOT NULL, title_id TEXT NOT NULL, title TEXT NOT NULL, cover_url TEXT NOT NULL DEFAULT '', synopsis TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT '', episode_count INTEGER NOT NULL DEFAULT 0, free_count INTEGER NOT NULL DEFAULT 0, locked_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, backup_at TEXT NOT NULL, PRIMARY KEY (platform, title_id))`,
+    `CREATE TABLE IF NOT EXISTS cms_backup_dracin_episodes (platform TEXT NOT NULL, title_id TEXT NOT NULL, idx INTEGER NOT NULL, item_id TEXT NOT NULL, duration_s REAL NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0, backup_at TEXT NOT NULL, PRIMARY KEY (platform, title_id, idx))`,
+    `CREATE TABLE IF NOT EXISTS cms_backup_dracin_seeds (platform TEXT NOT NULL, query TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, backup_at TEXT NOT NULL, PRIMARY KEY (platform, query))`,
+    `CREATE TABLE IF NOT EXISTS cms_backup_dracin_api_usage (ts INTEGER NOT NULL, key_id TEXT NOT NULL, endpoint TEXT NOT NULL, method TEXT NOT NULL, status INTEGER NOT NULL, country TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', backup_at TEXT NOT NULL)`,
   ]) await bak.prepare(sql).run();
   const stmts = [
     bak.prepare(`DELETE FROM cms_backup_posts`),
@@ -142,15 +165,21 @@ export async function doBackup(env) {
     bak.prepare(`DELETE FROM cms_backup_users`),
     bak.prepare(`DELETE FROM cms_backup_votes`),
     bak.prepare(`DELETE FROM cms_backup_loadtest_runs`),
+
+    bak.prepare(`DELETE FROM cms_backup_dracin_api_keys`),
+    bak.prepare(`DELETE FROM cms_backup_dracin_catalog`),
+    bak.prepare(`DELETE FROM cms_backup_dracin_episodes`),
+    bak.prepare(`DELETE FROM cms_backup_dracin_seeds`),
+    bak.prepare(`DELETE FROM cms_backup_dracin_api_usage`),
   ];
   for (const p of (posts.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views, tags, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(p.id, p.slug, p.title, p.body, p.category, p.status, p.created_at, p.updated_at, p.body_mode || 'text', p.visibility || 'public', p.publish_at || p.created_at || '', p.post_password_hash || '', p.post_password_salt || '', Number(p.views) || 0, p.tags || '', now));
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_posts (id, slug, title, body, category, status, created_at, updated_at, body_mode, visibility, publish_at, post_password_hash, post_password_salt, views, tags, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(p.id, p.slug, p.title, p.body, p.category, p.status, p.created_at, p.updated_at, p.body_mode || 'text', p.visibility || 'public', p.publish_at || p.created_at || '', '', '', Number(p.views) || 0, p.tags || '', now));
   }
   for (const c of (comments.results || [])) {
     stmts.push(bak.prepare(`INSERT INTO cms_backup_comments (id, post_id, name, text, status, created_at, parent_id, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(c.id, c.post_id, c.name, c.text, c.status, c.created_at, c.parent_id ?? null, now));
   }
   for (const u of (users.results || [])) {
-    stmts.push(bak.prepare(`INSERT INTO cms_backup_users (id, username, password_hash, salt, created_at, backup_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(u.id, u.username, u.password_hash, u.salt, u.created_at, now));
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_users (id, username, password_hash, salt, created_at, backup_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(u.id, u.username, '', '', u.created_at, now));
   }
   for (const v of (votes.results || [])) {
     stmts.push(bak.prepare(`INSERT INTO cms_backup_votes (comment_id, user_key, vote, backup_at) VALUES (?, ?, ?, ?)`).bind(v.comment_id, v.user_key, v.vote, now));
@@ -164,6 +193,22 @@ export async function doBackup(env) {
   for (const p of (plugins.results || [])) {
     stmts.push(bak.prepare(`INSERT INTO cms_backup_plugins (id, enabled, backup_at) VALUES (?, ?, ?)`).bind(p.id, p.enabled, now));
   }
+  for (const k of (dracinKeys.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_dracin_api_keys (id, name, key_hash, scope, active, created_at, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(k.id, k.name, k.key_hash, k.scope, k.active, k.created_at, now));
+  }
+  for (const t of (dracinCatalog.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_dracin_catalog (platform, title_id, title, cover_url, synopsis, language, episode_count, free_count, locked_count, updated_at, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(t.platform, t.title_id, t.title, t.cover_url || '', t.synopsis || '', t.language || '', Number(t.episode_count) || 0, Number(t.free_count) || 0, Number(t.locked_count) || 0, t.updated_at, now));
+  }
+  for (const e of (dracinEpisodes.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_dracin_episodes (platform, title_id, idx, item_id, duration_s, locked, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(e.platform, e.title_id, e.idx, e.item_id, Number(e.duration_s) || 0, Number(e.locked) || 0, now));
+  }
+  for (const s of (dracinSeeds.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_dracin_seeds (platform, query, enabled, backup_at) VALUES (?, ?, ?, ?)`).bind(s.platform, s.query, Number(s.enabled) || 0, now));
+  }
+  for (const u of (dracinUsage.results || [])) {
+    stmts.push(bak.prepare(`INSERT INTO cms_backup_dracin_api_usage (ts, key_id, endpoint, method, status, country, region, city, backup_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(u.ts, u.key_id, u.endpoint, u.method, u.status, u.country || '', u.region || '', u.city || '', now));
+  }
+
   await bak.batch(stmts);
   return { posts: (posts.results || []).length, comments: (comments.results || []).length };
 }

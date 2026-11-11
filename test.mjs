@@ -26,6 +26,7 @@ class MockDB {
   constructor() {
     this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = []; this.refreshTokens = []; this.viewEvents = [];
     this.users = new Map(); this.votes = []; this.rateLimits = new Map(); this.loadtestRuns = [];
+    this.dracinKeys = []; this.dracinCatalog = []; this.dracinEpisodes = []; this.dracinSeeds = []; this.dracinUsage = [];
     this.viewEventSeq = 0; this.attemptSeq = 0;
   }
   prepare(sql) { return new Stmt(this, sql); }
@@ -130,7 +131,8 @@ class MockDB {
     if (s.startsWith('DELETE FROM cms_backup')) return [];
     if (s.startsWith('INSERT INTO cms_backup_posts')) { this.backupPosts = (this.backupPosts || 0) + 1; return []; }
     if (s.startsWith('INSERT INTO cms_backup_comments')) { this.backupComments = (this.backupComments || 0) + 1; return []; }
-    if (s.startsWith('INSERT INTO cms_backup_settings') || s.startsWith('INSERT INTO cms_backup_plugins') || s.startsWith('INSERT INTO cms_backup_users') || s.startsWith('INSERT INTO cms_backup_votes')) return [];
+    if (s.startsWith('INSERT INTO cms_backup_settings')) { (this.backupSettings = this.backupSettings || []).push({ key: a[0], value: a[1], backup_at: a[2] }); return []; }
+    if (s.startsWith('INSERT INTO cms_backup_plugins') || s.startsWith('INSERT INTO cms_backup_users') || s.startsWith('INSERT INTO cms_backup_votes')) return [];
     if (s === 'SELECT COUNT(*) AS n FROM cms_posts') return [{ n: this.posts.length }];
     if (s === 'SELECT COUNT(*) AS n FROM cms_comments') return [{ n: this.comments.length }];
     if (s === 'SELECT COUNT(*) AS n FROM cms_users') return [{ n: this.users.size }];
@@ -198,6 +200,57 @@ class MockDB {
     if (s.startsWith('UPDATE cms_plugins SET enabled')) { this.plugins.set(a[1], a[0]); return []; }
     if (s.startsWith('DELETE FROM cms_posts')) { this.posts = this.posts.filter(p => p.id !== a[0]); return []; }
     if (s.startsWith('DELETE FROM cms_comments')) { this.comments = this.comments.filter(c => c.id !== a[0]); return []; }
+    // ---- Port 11 Nov 2026: API Dracin + H2 backup ----
+    if (s.startsWith('SELECT key, value FROM cms_settings WHERE key NOT IN')) {
+      const skip = new Set(['imgbb_api_keys', 'imgbb_api_key', 'csrf_secret']);
+      return [...this.settings.entries()].filter(([k]) => !skip.has(k)).map(([key, value]) => ({ key, value })).sort((x, y) => x.key.localeCompare(y.key));
+    }
+    if (s.startsWith('SELECT id, username, created_at FROM cms_users ORDER BY created_at ASC')) return [...this.users.values()].sort((x, y) => x.created_at.localeCompare(y.created_at)).map(u => ({ id: u.id, username: u.username, created_at: u.created_at }));
+    if (s.startsWith('SELECT * FROM dracin_api_keys WHERE key_hash')) return this.dracinKeys.filter(k => k.key_hash === a[0]);
+    if (s.startsWith('SELECT * FROM dracin_api_keys ORDER BY created_at DESC')) return [...this.dracinKeys].sort((x, y) => y.created_at - x.created_at);
+    if (s.startsWith('SELECT * FROM dracin_api_keys ORDER BY created_at ASC')) return [...this.dracinKeys].sort((x, y) => x.created_at - y.created_at);
+    if (s === 'SELECT COUNT(*) AS n FROM dracin_api_usage') return [{ n: this.dracinUsage.length }];
+    if (s.startsWith('SELECT * FROM dracin_api_usage ORDER BY ts DESC LIMIT 5000')) return [...this.dracinUsage].sort((x, y) => y.ts - x.ts).slice(0, 5000);
+    if (s.startsWith('SELECT * FROM dracin_api_usage ORDER BY ts ASC')) return [...this.dracinUsage].sort((x, y) => x.ts - y.ts);
+    if (s.startsWith('SELECT * FROM dracin_catalog ORDER BY updated_at DESC')) {
+      let rows = [...this.dracinCatalog].sort((x, y) => y.updated_at - x.updated_at);
+      let limit, offset;
+      if (s.includes('WHERE platform = ?')) { rows = rows.filter(t => t.platform === a[0]); limit = a[1]; offset = a[2]; }
+      else { limit = a[0]; offset = a[1]; }
+      return rows.slice(offset, offset + limit);
+    }
+    if (s.startsWith('SELECT * FROM dracin_catalog ORDER BY platform ASC, title_id ASC')) return [...this.dracinCatalog].sort((x, y) => (x.platform + x.title_id).localeCompare(y.platform + y.title_id));
+    if (s.startsWith('SELECT * FROM dracin_catalog WHERE platform')) return this.dracinCatalog.filter(t => t.platform === a[0] && t.title_id === a[1]);
+    if (s.startsWith('SELECT * FROM dracin_episodes ORDER BY platform ASC, title_id ASC, idx ASC')) return [...this.dracinEpisodes].sort((x, y) => (x.platform + x.title_id + x.idx).localeCompare(y.platform + y.title_id + y.idx));
+    if (s.startsWith('SELECT * FROM dracin_seeds WHERE enabled = 1')) return this.dracinSeeds.filter(x => Number(x.enabled) === 1).sort((x, y) => (x.platform + x.query).localeCompare(y.platform + y.query));
+    if (s.startsWith('SELECT * FROM dracin_seeds ORDER BY platform ASC, query ASC')) return [...this.dracinSeeds].sort((x, y) => (x.platform + x.query).localeCompare(y.platform + y.query));
+    if (s.startsWith('SELECT * FROM dracin_seeds WHERE platform')) return this.dracinSeeds.filter(x => x.platform === a[0] && x.query === a[1]);
+    if (s.startsWith('SELECT * FROM hacklab_lessons')) return [];
+    if (s.startsWith('INSERT INTO dracin_api_usage')) { this.dracinUsage.push({ ts: a[0], key_id: a[1], endpoint: a[2], method: a[3], status: a[4], country: a[5], region: a[6], city: a[7] }); return []; }
+    if (s.startsWith('INSERT INTO dracin_api_keys')) { this.dracinKeys.push({ id: a[0], name: a[1], key_hash: a[2], scope: a[3], active: a[4], created_at: a[5] }); return []; }
+    if (s.startsWith('UPDATE dracin_api_keys SET active = 0')) { const k = this.dracinKeys.find(x => x.id === a[0]); if (k) k.active = 0; return []; }
+    if (s.startsWith('INSERT INTO dracin_catalog')) {
+      const ex = this.dracinCatalog.find(t => t.platform === a[0] && t.title_id === a[1]);
+      const row = { platform: a[0], title_id: a[1], title: a[2], cover_url: a[3], synopsis: a[4], language: a[5], episode_count: a[6], free_count: a[7], locked_count: a[8], updated_at: a[9] };
+      if (ex) Object.assign(ex, row); else this.dracinCatalog.push(row);
+      return [];
+    }
+    if (s.startsWith('INSERT OR REPLACE INTO dracin_episodes')) {
+      const ex = this.dracinEpisodes.find(e => e.platform === a[0] && e.title_id === a[1] && e.idx === a[2]);
+      const row = { platform: a[0], title_id: a[1], idx: a[2], item_id: a[3], duration_s: a[4], locked: a[5] };
+      if (ex) Object.assign(ex, row); else this.dracinEpisodes.push(row);
+      return [];
+    }
+    if (s.startsWith('INSERT OR REPLACE INTO dracin_seeds')) {
+      const ex = this.dracinSeeds.find(x => x.platform === a[0] && x.query === a[1]);
+      if (ex) ex.enabled = a[2]; else this.dracinSeeds.push({ platform: a[0], query: a[1], enabled: a[2] });
+      return [];
+    }
+    if (s.startsWith('UPDATE dracin_seeds SET enabled')) { const x = this.dracinSeeds.find(v => v.platform === a[1] && v.query === a[2]); if (x) x.enabled = a[0]; return []; }
+    if (s.startsWith('DELETE FROM dracin_episodes')) { this.dracinEpisodes = this.dracinEpisodes.filter(e => !(e.platform === a[0] && e.title_id === a[1])); return []; }
+    if (s.startsWith('DELETE FROM dracin_catalog')) { this.dracinCatalog = this.dracinCatalog.filter(t => !(t.platform === a[0] && t.title_id === a[1])); return []; }
+    if (s.startsWith('DELETE FROM dracin_seeds')) { this.dracinSeeds = this.dracinSeeds.filter(x => !(x.platform === a[0] && x.query === a[1])); return []; }
+    if (s.startsWith('INSERT INTO cms_backup_dracin_')) { this.backupDracin = (this.backupDracin || 0) + 1; return []; }
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -858,4 +911,41 @@ r = await call('GET', '/kendali', null, refresh36); assert(r.status === 200, 'gr
 r = await call('GET', '/kendali', null, refresh36); assert(r.status === 200, 'grace rantai: pemakaian kedua (lompatan 1) berhasil');
 r = await call('GET', '/kendali', null, refresh36); assert(r.status === 200, 'grace rantai: pemakaian ketiga (lompatan 2) berhasil');
 assert(env.DB.refreshTokens.some(x => x.revoked === 0), 'grace rantai: tidak ada pencabutan massal');
+// 37. Port 11 Nov 2026: /bio + /uptime + HackLab + API Dracin + H2 backup
+// (fitur live v44 yang sempat hilang di deploy v45 lalu di-port ke repo)
+// callJson sudah didefinisikan di seksi 29 — dipakai ulang di sini.
+r = await call('GET', '/bio'); t = await r.text();
+assert(r.status === 200 && t.includes('Link Bio'), '/bio: halaman Link Bio tampil');
+r = await call('GET', '/uptime'); t = await r.text();
+assert(r.status === 200 && t.includes('Status Situs') && t.includes('Online sejak 1 Januari 2024'), '/uptime: halaman status tampil');
+r = await callJson('GET', '/api/hacklab/lessons', null);
+let j = await r.json();
+assert(r.status === 200 && Array.isArray(j.lessons) && j.lessons.length === 0, 'hacklab: katalog pelajaran kosong di mock');
+r = await callJson('GET', '/api/dracin/catalog', null);
+j = await r.json();
+assert(r.status === 200 && j.ok === true && Array.isArray(j.titles), 'dracin: katalog publik bisa dibaca tanpa kunci');
+r = await callJson('POST', '/api/dracin/sync', { titles: [] });
+assert(r.status === 401, 'dracin: sync tanpa kunci ditolak 401');
+r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
+assert(t.includes('API Dracin') && t.includes('Buat Kunci Baru'), 'super panel: kartu API Dracin tampil');
+const csrf37 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+r = await call('POST', '/kendali/super/dracin-keys', { csrf: csrf37, action: 'create', name: 'tes-sync', scope: 'sync' }, cookie);
+t = await r.text();
+const rawKey = (t.match(/<code>([^<]+)<\/code>/) || [])[1] || '';
+assert(r.status === 200 && rawKey.length > 20, 'dracin: kunci baru tampil sekali setelah dibuat');
+r = await callJson('POST', '/api/dracin/sync', { titles: [{ platform: 'tes', title_id: 't1', title: 'Judul Tes', episodes: [{ idx: 0, item_id: 'e0' }] }] }, { authorization: 'Bearer ' + rawKey });
+j = await r.json();
+assert(r.status === 200 && j.ok === true && j.titles === 1 && j.episodes === 1, 'dracin: sync 1 judul + 1 episode berhasil');
+r = await callJson('GET', '/api/dracin/catalog', null);
+j = await r.json();
+assert(j.titles.some(x => x.title_id === 't1' && x.title === 'Judul Tes'), 'dracin: judul hasil sync tampil di katalog');
+env.DB.settings.set('imgbb_api_keys', '["rahasia"]');
+env.DB.settings.set('csrf_secret', 'rahasia-csrf');
+env.BACKUP_DB.backupSettings = [];
+r = await call('POST', '/kendali/backup', { csrf: csrf37 }, cookie); assert(r.status === 303, 'backup H2: tombol backup redirect');
+const bakKeys = (env.BACKUP_DB.backupSettings || []).map(x => x.key);
+assert(!bakKeys.includes('imgbb_api_keys') && !bakKeys.includes('csrf_secret'), 'backup H2: kunci ImgBB + csrf_secret tidak disalin');
+assert(bakKeys.includes('site_title'), 'backup H2: pengaturan biasa tetap disalin');
+// 37b. Anti-bocor <pre> (11 Nov 2026): blok kode panjang tidak boleh memaksa lebar halaman HP
+assert(themes.terang.render({ siteTitle: 'T', pageTitle: 'P', content: '' }).includes('pre{max-width:100%') && themes.terang.render({ siteTitle: 'T', pageTitle: 'P', content: '' }).includes('pre-wrap'), 'tema: blok <pre> dibatasi lebarnya (anti-bocor halaman HP)');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

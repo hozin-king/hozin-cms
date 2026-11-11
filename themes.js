@@ -15,6 +15,12 @@ function baseCss(def) {
     `.post-cover{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:10px;display:block;margin-bottom:12px}` +
     `.read-more{display:inline-block;padding:9px 16px;border-radius:8px;background:${accent};color:#fff!important;font-weight:600;text-decoration:none;font-size:14px}` +
     `.fab{position:fixed;right:18px;bottom:22px;width:54px;height:54px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:26px;box-shadow:0 3px 10px rgba(0,0,0,.18);z-index:50;text-decoration:none;color:#fff;background:${accent}}` +
+    // Anti-bocor (11 Nov 2026 — port dari live v44): <pre> tanpa aturan
+    // overflow membuat satu baris kode panjang (mis. bookmarklet di post
+    // Swarm) memaksa lebar halaman di HP, sehingga kolom artikel jadi
+    // sempit. pre-wrap + break-all membungkus baris panjang di dalam kotak.
+    `pre{max-width:100%;overflow-x:auto;overflow-y:hidden;padding:12px 14px;border-radius:${radius}px;background:${card};border:1px solid ${border};font-size:13.5px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-all;tab-size:2;-webkit-overflow-scrolling:touch}` +
+    `pre code{display:block;overflow-wrap:anywhere;word-break:break-all;background:transparent;padding:0;font-size:inherit}` +
     `@media (max-width:640px){header{padding:10px 12px}main{padding:12px 10px}.card{padding:14px}button,.read-more{min-height:44px}}` +
     `@media (min-width:641px) and (max-width:900px){main,footer{max-width:680px;padding:16px 18px}}` +
     `@media (min-width:901px){main,footer{max-width:${maxWidth + 40}px;padding:24px 20px}}` +
