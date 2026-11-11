@@ -601,8 +601,14 @@ assert(r.status === 200 && navPosts.ok === true && Array.isArray(navPosts.posts)
 r = await call('GET', '/api/github-streak'); t = await r.text();
 const streak = JSON.parse(t);
 assert(typeof streak.ok === 'boolean' && (r.status === 200 || r.status === 502) && (r.status !== 200 || (typeof streak.totalContributions === 'number' && streak.currentStreak && typeof streak.currentStreak.length === 'number')), 'github-streak: proxy endpoint menjawab JSON (200 data / 502 fallback)');
+r = await call('GET', '/bio'); t = await r.text();
+assert(t.includes('Link donasi segera hadir'), 'bio: tanpa link donasi, tombol segera hadir');
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', theme: 'terang', donate_url: 'https://saweria.co/hozin' }, cookie); assert(r.status === 303, 'pengaturan: link donasi tersimpan');
+r = await call('GET', '/bio'); t = await r.text();
+assert(t.includes('https://saweria.co/hozin') && t.includes('Donasi sekarang'), 'bio: link donasi dari pengaturan tampil + tombol aktif');
 r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
 assert(t.includes('AdSense: ID penayang'), 'pengaturan: kolom AdSense tampil');
+assert(t.includes('name="donate_url"'), 'pengaturan: kolom link donasi tampil');
 r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: 'ca-pub-1234567890123456', adsense_slot: '1234567890' }, cookie); assert(r.status === 303, 'pengaturan AdSense tersimpan');
 r = await call('GET', '/'); t = await r.text();
 assert(t.includes('adsbygoogle') && t.includes('ca-pub-1234567890123456'), 'AdSense: unit tampil di beranda bila client diisi');

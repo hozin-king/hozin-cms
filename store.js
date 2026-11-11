@@ -76,6 +76,7 @@ export async function ensureSchema(env) {
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('site_title', 'WorkerCMS')`),
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`),
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('navbar', 'modern')`),
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('donate_url', '')`),
         ...pluginDefs.map(p => env.DB.prepare(`INSERT OR IGNORE INTO cms_plugins (id, enabled) VALUES (?, 1)`).bind(p.id)),
       ]);
       const existing = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_posts`).first();
