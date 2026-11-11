@@ -598,6 +598,9 @@ assert(t.includes('Disallow: /kendali/') && t.includes('/sitemap.xml'), 'robots:
 r = await call('GET', '/api/nav-posts'); t = await r.text();
 const navPosts = JSON.parse(t);
 assert(r.status === 200 && navPosts.ok === true && Array.isArray(navPosts.posts) && navPosts.posts.some(p => p.slug === 'selamat-datang') && !navPosts.posts.some(p => p.slug === 'post-private'), 'nav-posts: daftar post publik untuk Command Palette');
+r = await call('GET', '/api/github-streak'); t = await r.text();
+const streak = JSON.parse(t);
+assert(typeof streak.ok === 'boolean' && (r.status === 200 || r.status === 502) && (r.status !== 200 || (typeof streak.totalContributions === 'number' && streak.currentStreak && typeof streak.currentStreak.length === 'number')), 'github-streak: proxy endpoint menjawab JSON (200 data / 502 fallback)');
 r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
 assert(t.includes('AdSense: ID penayang'), 'pengaturan: kolom AdSense tampil');
 r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: 'ca-pub-1234567890123456', adsense_slot: '1234567890' }, cookie); assert(r.status === 303, 'pengaturan AdSense tersimpan');
