@@ -630,10 +630,11 @@ async function handleFetch(request, env) {
       return new Response(JSON.stringify(cfg), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=60' } });
     }
 
-    // ---- Publik: konten Cerpen Hozin dari D1 (aplikasi Android, v62, 12 Nov 2026) ----
+    // ---- Publik: konten Cerpen Hozin dari D1 (aplikasi Android, v63, 12 Nov 2026) ----
     // Aplikasi Cerpen mengambil daftar + isi dari sini (dulu dari file .enc
     // di repo GitHub). Isi episode/panel TETAP terenkripsi AES-256-GCM
     // (base64) — Worker hanya menyajikan, dekripsi di aplikasi.
+    // v63: tambah `all` (dump penuh satu panggilan untuk sync aplikasi).
     // Path muter tiap jam: /api/c/<12 hex>/cerpen/... dengan hash =
     // HMAC-SHA256(kunci-jalur, "YYYY-MM-DD-HH" WIB) 12 hex pertama.
     // Kunci-jalur = SHA-256(kunci-konten || "cerpen-api-v1") — diturunkan
@@ -729,6 +730,31 @@ async function handleFetch(request, env) {
             rows = await env.BACKUP_DB.prepare(`SELECT id, title, summary, source_name, source_url, image_url, topic, published_at, added_at FROM cerpen_news ORDER BY added_at DESC LIMIT ?`).bind(limit).all();
           }
           return cpJson({ news: rows.results || [] }, 200);
+        }
+        if (res === 'all') {
+          // Dump penuh untuk sync aplikasi (satu panggilan, bukan 400+).
+          // Batas D1: news 947 baris < 1000 — aplikasi memverifikasi
+          // jumlah baris lawan counts manifest, mismatch = gagal (fallback repo).
+          const s = await env.BACKUP_DB.prepare(`SELECT id, judul, genre, deskripsi, cover_url, status FROM cerpen_series ORDER BY judul ASC`).all();
+          const e = await env.BACKUP_DB.prepare(`SELECT series_id, season, no, judul, isi_cipher, word_count FROM cerpen_episodes ORDER BY series_id ASC, season ASC, no ASC`).all();
+          const k = await env.BACKUP_DB.prepare(`SELECT id, judul, genre, deskripsi, cover_url FROM cerpen_komik ORDER BY judul ASC`).all();
+          const ke = await env.BACKUP_DB.prepare(`SELECT komik_id, no, judul, panels_cipher, panels_count FROM cerpen_komik_episodes ORDER BY komik_id ASC, no ASC`).all();
+          const n = await env.BACKUP_DB.prepare(`SELECT id, title, summary, source_name, source_url, image_url, images_json, details_json, topic, published_at, added_at FROM cerpen_news ORDER BY added_at DESC`).all();
+          const mrows = await env.BACKUP_DB.prepare(`SELECT key, value FROM cerpen_manifest`).all();
+          const m = {};
+          for (const r of (mrows.results || [])) m[r.key] = r.value;
+          let counts = {};
+          try { counts = JSON.parse(m.counts || '{}'); } catch (err) { counts = {}; }
+          return cpJson({
+            version: m.version || '0',
+            updated_at: m.updated_at || '',
+            counts,
+            series: s.results || [],
+            episodes: e.results || [],
+            komik: k.results || [],
+            komik_episodes: ke.results || [],
+            news: n.results || []
+          }, 200);
         }
         return new Response('Not found', { status: 404 });
       } catch (e) {

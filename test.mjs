@@ -37,7 +37,7 @@ class MockDB {
     ];
     this.cerpenKomik = [{ id: 'komik-01', judul: 'Komik Tes', genre: '', deskripsi: '', cover_url: '' }];
     this.cerpenKomikEpisodes = [{ komik_id: 'komik-01', no: 1, judul: 'Episode 1', panels_cipher: 'UEFORQ==', panels_count: 2 }];
-    this.cerpenNews = [{ id: 'news-1', title: 'Judul Berita', summary: 'Ringkasan', source_name: 'Sumber', source_url: 'https://example.com/a', image_url: 'https://example.com/i.jpg', topic: 'tekno', published_at: '2026-11-12', added_at: '2026-11-12' }];
+    this.cerpenNews = [{ id: 'news-1', title: 'Judul Berita', summary: 'Ringkasan', source_name: 'Sumber', source_url: 'https://example.com/a', image_url: 'https://example.com/i.jpg', images_json: '["https://example.com/i.jpg"]', details_json: '{}', topic: 'tekno', published_at: '2026-11-12', added_at: '2026-11-12' }];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { this.batchCalls = (this.batchCalls || 0) + 1; for (const s of stmts) await s.run(); }
@@ -239,6 +239,10 @@ class MockDB {
     // v62: mock tabel konten Cerpen (dipakai endpoint /api/c/*/cerpen/*)
     if (s.startsWith('SELECT key, value FROM cerpen_manifest')) return this.cerpenManifest;
     if (s.startsWith('SELECT id, judul, genre, deskripsi, cover_url, status FROM cerpen_series')) return this.cerpenSeries;
+    // v63: dump penuh `all` — cek dulu (prefix sama dengan endpoint satuan, tanpa WHERE)
+    if (s.startsWith('SELECT series_id, season, no, judul, isi_cipher, word_count FROM cerpen_episodes') && s.includes('ORDER BY series_id ASC')) return this.cerpenEpisodes;
+    if (s.startsWith('SELECT komik_id, no, judul, panels_cipher, panels_count FROM cerpen_komik_episodes') && s.includes('ORDER BY komik_id ASC')) return this.cerpenKomikEpisodes;
+    if (s.startsWith('SELECT id, title, summary, source_name, source_url, image_url, images_json, details_json, topic, published_at, added_at FROM cerpen_news')) return this.cerpenNews;
     if (s.startsWith('SELECT no, judul, word_count FROM cerpen_episodes')) return this.cerpenEpisodes.filter(e => e.series_id === a[0] && e.season === a[1]).map(e => ({ no: e.no, judul: e.judul, word_count: e.word_count }));
     if (s.startsWith('SELECT series_id, season, no, judul, isi_cipher, word_count FROM cerpen_episodes')) return this.cerpenEpisodes.filter(e => e.series_id === a[0] && e.season === a[1] && e.no === a[2]);
     if (s.startsWith('SELECT id, judul, genre, deskripsi, cover_url FROM cerpen_komik')) return this.cerpenKomik;
@@ -1008,6 +1012,9 @@ assert(r.status === 200 && Array.isArray(j.news) && j.news.length === 1, 'cerpen
 const oldHash = await cerpenHashForTest(-3600000);
 r = await callJson('GET', `/api/c/${oldHash}/cerpen/manifest`, null);
 assert(r.status === 200, 'cerpen-api: hash jam sebelumnya masih diterima (toleransi ±1 jam)');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/all`, null);
+j = await r.json();
+assert(r.status === 200 && j.version === '1' && j.series.length === 1 && j.episodes.length === 2 && j.komik.length === 1 && j.komik_episodes.length === 1 && j.news.length === 1 && j.counts.cerpen_episodes === 2, 'cerpen-api: dump penuh all berisi semua koleksi + counts');
 const savedCerpenBak = env.BACKUP_DB; delete env.BACKUP_DB;
 r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null);
 assert(r.status === 503, 'cerpen-api: tanpa BACKUP_DB -> 503');
