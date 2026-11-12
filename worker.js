@@ -552,6 +552,20 @@ function cfGeo(request) {
   const cf = request.cf || {};
   return { country: String(cf.country || '').slice(0, 8), city: String(cf.city || '').slice(0, 80) };
 }
+// Label jenis aktivitas yang diblokir, untuk globe publik /uptime.
+const SEC_KIND_LABEL = { login_gagal: 'login admin gagal', rate_limit: 'spam / dibatasi', kuota_habis: 'kuota API habis', csrf_gagal: 'token keamanan tidak valid' };
+// Catat satu aktivitas yang diblokir untuk globe publik /uptime. TANPA IP:
+// hanya negara/kota kasar dari request.cf, supaya data yang tampil publik
+// aman. Fail-silent: pencatatan tidak boleh menggagalkan respons yang
+// sedang berjalan. Retensi 500 baris terbaru (prune di tiap insert).
+async function logSecurityEvent(env, kind, request) {
+  try {
+    if (!Object.prototype.hasOwnProperty.call(SEC_KIND_LABEL, kind)) return;
+    const geo = cfGeo(request);
+    await env.DB.prepare(`INSERT INTO security_events (ts, kind, country, city) VALUES (?, ?, ?, ?)`).bind(Date.now(), kind, geo.country, geo.city).run();
+    await env.DB.prepare(`DELETE FROM security_events WHERE id NOT IN (SELECT id FROM security_events ORDER BY id DESC LIMIT 500)`).run();
+  } catch (e) { /* pencatatan gagal diam-diam */ }
+}
 // Metadata konten untuk landing share (judul/deskripsi/genre) — null bila
 // konten tidak ada. Episode spesifik (season+no) mengganti judul tampil
 // dengan judul episode itu; bila episode tidak ada -> null (link tak valid).
@@ -795,7 +809,7 @@ async function handleFetch(request, env) {
         const nowWib = new Date(Date.now() + 7 * 3600000);
         const dayStart = Date.UTC(nowWib.getUTCFullYear(), nowWib.getUTCMonth(), nowWib.getUTCDate(), 0, 0, 0) - 7 * 3600000;
         const cnt = await env.BACKUP_DB.prepare(`SELECT COUNT(*) AS c FROM cerpen_submissions WHERE key_id = ? AND created_at >= ?`).bind(keyRow.key_id, dayStart).first();
-        if (Number(cnt && cnt.c || 0) >= Number(keyRow.daily_limit || 10)) return csJson({ ok: false, error: 'rate limit harian tercapai' }, 429);
+        if (Number(cnt && cnt.c || 0) >= Number(keyRow.daily_limit || 10)) { await logSecurityEvent(env, 'kuota_habis', request); return csJson({ ok: false, error: 'rate limit harian tercapai' }, 429); }
       } catch (e) {
         return csJson({ ok: false, error: 'gagal memeriksa kuota' }, 500);
       }
@@ -968,7 +982,7 @@ async function handleFetch(request, env) {
         const nowWib = new Date(Date.now() + 7 * 3600000);
         const dayStart = Date.UTC(nowWib.getUTCFullYear(), nowWib.getUTCMonth(), nowWib.getUTCDate(), 0, 0, 0) - 7 * 3600000;
         const cnt = await env.BACKUP_DB.prepare(`SELECT COUNT(*) AS c FROM md_backups WHERE key_id = ? AND created_at >= ?`).bind(keyRow.key_id, dayStart).first();
-        if (Number(cnt && cnt.c || 0) >= Number(keyRow.daily_limit || 50)) return mbJson({ ok: false, error: 'rate limit harian tercapai' }, 429);
+        if (Number(cnt && cnt.c || 0) >= Number(keyRow.daily_limit || 50)) { await logSecurityEvent(env, 'kuota_habis', request); return mbJson({ ok: false, error: 'rate limit harian tercapai' }, 429); }
       } catch (e) {
         return mbJson({ ok: false, error: 'gagal memeriksa kuota' }, 500);
       }
@@ -1009,7 +1023,7 @@ async function handleFetch(request, env) {
     if (request.method === 'POST' && path === '/api/share/create') {
       const shJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
       if (!env.BACKUP_DB) return shJson({ ok: false, error: 'database tidak tersedia' }, 503);
-      if (!(await checkRateLimit(env, 'share-create:' + clientIp(request), 20, 3600 * 1000))) return shJson({ ok: false, error: 'terlalu banyak permintaan' }, 429);
+      if (!(await checkRateLimit(env, 'share-create:' + clientIp(request), 20, 3600 * 1000))) { await logSecurityEvent(env, 'rate_limit', request); return shJson({ ok: false, error: 'terlalu banyak permintaan' }, 429); }
       if (!env.SHARE_LINK_KEY) return shJson({ ok: false, error: 'layanan share tidak tersedia' }, 503);
       if (Number(request.headers.get('content-length') || '0') > 8192) return shJson({ ok: false, error: 'payload terlalu besar' }, 413);
       let data = null;
@@ -1116,7 +1130,7 @@ async function handleFetch(request, env) {
     if (path.startsWith('/api/admin/cerpen-')) {
       const aj = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
       if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
-      if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
+      if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) { await logSecurityEvent(env, 'csrf_gagal', request); return aj({ ok: false, error: 'csrf tidak valid' }, 403); }
       if (!env.BACKUP_DB) return aj({ ok: false, error: 'database tidak tersedia' }, 503);
       if (!(await checkRateLimit(env, 'cerpen-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
       const B = env.BACKUP_DB;
@@ -1357,7 +1371,7 @@ async function handleFetch(request, env) {
     if (path.startsWith('/api/admin/md-backup')) {
       const aj = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
       if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
-      if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
+      if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) { await logSecurityEvent(env, 'csrf_gagal', request); return aj({ ok: false, error: 'csrf tidak valid' }, 403); }
       if (!env.BACKUP_DB) return aj({ ok: false, error: 'database tidak tersedia' }, 503);
       if (!(await checkRateLimit(env, 'md-backup-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
       const B = env.BACKUP_DB;
@@ -1770,7 +1784,159 @@ async function handleFetch(request, env) {
       const startMs = Date.UTC(2023, 11, 31, 17, 0, 0); // 1 Jan 2024 00:00 WIB
       const days = Math.max(0, Math.floor((Date.now() - startMs) / 86400000));
       const checkedWib = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><p><a class="read-more" href="/">← Beranda</a></p>`;
+      // Grafik kunjungan 30 hari: pola sama dengan dashboard (batang
+      // HTML/CSS murni dari cms_view_events, tanpa library/JS).
+      let dayChart = '';
+      try {
+        const cutoff = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+        const evs = await env.DB.prepare(`SELECT post_id, viewed_at FROM cms_view_events WHERE viewed_at >= ? ORDER BY viewed_at DESC`).bind(cutoff).all();
+        const perDay = new Map();
+        for (const e of (evs.results || [])) {
+          const d = new Date(new Date(String(e.viewed_at || '')).getTime() + 7 * 3600 * 1000).toISOString().slice(0, 10);
+          if (!d || d === 'NaN-NaN-NaN') continue;
+          perDay.set(d, (perDay.get(d) || 0) + 1);
+        }
+        const dayData = [];
+        for (let i = 29; i >= 0; i--) {
+          const d = new Date(Date.now() - i * 24 * 3600 * 1000 + 7 * 3600 * 1000).toISOString().slice(0, 10);
+          dayData.push([d, perDay.get(d) || 0]);
+        }
+        const dayMax = Math.max(1, ...dayData.map(([, n]) => n));
+        dayChart = dayData.map(([d, n]) => {
+          const w = Math.round((n / dayMax) * 100);
+          const bar = n > 0 ? `<span style="display:inline-block;height:18px;background:#3b82f6;border-radius:4px;min-width:18px;width:${w}%"></span>` : `<span style="display:inline-block;height:18px"></span>`;
+          return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0"><span style="min-width:92px;font-size:13px">${d}</span>${bar}<span style="font-size:13px"><b>${n}</b></span></div>`;
+        }).join('');
+      } catch (e) { dayChart = '<p class="meta">Grafik kunjungan tidak bisa dimuat saat ini.</p>'; }
+      // Globe serangan: agregat 30 hari dari security_events (tanpa IP).
+      let globeData = [];
+      let globeTotal = 0;
+      try {
+        const rows = await env.DB.prepare(`SELECT country, kind, ts FROM security_events WHERE ts >= ? AND country != '' ORDER BY ts DESC LIMIT 200`).bind(Date.now() - 30 * 24 * 3600 * 1000).all();
+        const byCountry = new Map();
+        for (const r of (rows.results || [])) {
+          const c = String(r.country || '').toUpperCase();
+          if (!c) continue;
+          globeTotal++;
+          const cur = byCountry.get(c) || { c, n: 0, kinds: {} };
+          cur.n++;
+          const k = String(r.kind || '');
+          cur.kinds[k] = (cur.kinds[k] || 0) + 1;
+          byCountry.set(c, cur);
+        }
+        globeData = [...byCountry.values()].sort((a, b) => b.n - a.n).slice(0, 20);
+      } catch (e) { globeData = []; globeTotal = 0; }
+      const globeJson = JSON.stringify(globeData).replace(/</g, '\\u003c');
+      const globeList = globeData.length
+        ? globeData.map(g => `<li>${esc(g.c)} — <b>${g.n}</b> (${Object.entries(g.kinds).map(([k, v]) => esc(SEC_KIND_LABEL[k] || k) + ' ' + v).join(', ')})</li>`).join('')
+        : '<li>Belum ada aktivitas yang diblokir dalam 30 hari terakhir.</li>';
+      const globeNote = globeTotal > 0
+        ? `${globeTotal} aktivitas diblokir dalam 30 hari terakhir (hanya negara/kota kasar yang dicatat, tanpa alamat IP).`
+        : 'Globe terisi otomatis setiap ada percobaan login gagal, spam, atau token keamanan tidak valid yang diblokir — tidak ada data yang dibuat-buat.';
+      // Globe 3D kanvas murni (tanpa library/CDN): proyeksi ortografik,
+      // berputar pelan, titik merah per negara asal + busur oranye menuju
+      // situs. Negara yang tidak ada di tabel GEO tetap tampil di daftar.
+      const globeScript = `
+var DATA = ${globeJson};
+var GEO = {US:[39,-98],CN:[35,104],RU:[61,90],IN:[21,78],BR:[-10,-55],VN:[14,108],ID:[-2,118],DE:[51,10],FR:[47,2],GB:[54,-2],NL:[52,5],TR:[39,35],IR:[32,54],SG:[1,104],JP:[36,138],KR:[36,128],UA:[49,32],PL:[52,19],RO:[46,25],BG:[43,25],TH:[16,101],MY:[4,102],PH:[13,122],PK:[30,70],BD:[24,91],EG:[27,30],NG:[9,8],ZA:[-29,25],MX:[23,-102],AR:[-35,-65],CL:[-33,-71],CO:[4,-74],PE:[-10,-76],CA:[56,-106],AU:[-25,133],NZ:[-42,174],SE:[62,15],NO:[64,11],FI:[64,26],DK:[56,10],CH:[47,8],AT:[48,14],BE:[51,4],IE:[53,-8],PT:[39,-8],ES:[40,-4],IT:[43,12],GR:[39,22],CZ:[50,15],HU:[47,19],IL:[31,35],SA:[25,45],AE:[24,54],KZ:[48,68],TW:[24,121],HK:[22,114]};
+(function(){
+var cv=document.getElementById('attack-globe');
+if(!cv||!cv.getContext)return;
+var ctx=cv.getContext('2d');
+var W=0,H=300,R=0,CX=0,CY=150,ROT=0;
+var TARGET=[-6.2,106.8];
+function size(){
+  var dpr=window.devicePixelRatio||1;
+  W=cv.clientWidth||320;H=300;
+  cv.width=W*dpr;cv.height=H*dpr;
+  cv.style.height=H+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  R=Math.min(W,H)/2-14;CX=W/2;CY=H/2;
+}
+function proj(lat,lon){
+  var p=lat*Math.PI/180, l=(lon+ROT)*Math.PI/180;
+  return {x:CX+R*Math.cos(p)*Math.sin(l), y:CY-R*Math.sin(p), z:Math.cos(p)*Math.cos(l)};
+}
+function slerp(a,b,t){
+  var va=[Math.cos(a[0]*Math.PI/180)*Math.cos(a[1]*Math.PI/180), Math.cos(a[0]*Math.PI/180)*Math.sin(a[1]*Math.PI/180), Math.sin(a[0]*Math.PI/180)];
+  var vb=[Math.cos(b[0]*Math.PI/180)*Math.cos(b[1]*Math.PI/180), Math.cos(b[0]*Math.PI/180)*Math.sin(b[1]*Math.PI/180), Math.sin(b[0]*Math.PI/180)];
+  var dot=va[0]*vb[0]+va[1]*vb[1]+va[2]*vb[2];
+  if(dot>0.9999)dot=0.9999; if(dot<-0.9999)dot=-0.9999;
+  var om=Math.acos(dot), so=Math.sin(om)||1;
+  var w1=Math.sin((1-t)*om)/so, w2=Math.sin(t*om)/so;
+  var x=va[0]*w1+vb[0]*w2, y=va[1]*w1+vb[1]*w2, z=va[2]*w1+vb[2]*w2;
+  return [Math.asin(Math.max(-1,Math.min(1,z)))*180/Math.PI, Math.atan2(y,x)*180/Math.PI];
+}
+function draw(now){
+  ROT+=0.15;
+  ctx.clearRect(0,0,W,H);
+  var g=ctx.createRadialGradient(CX-R*0.3,CY-R*0.4,R*0.1,CX,CY,R);
+  g.addColorStop(0,'#1e3a5f');g.addColorStop(0.7,'#0b1e33');g.addColorStop(1,'#060d18');
+  ctx.beginPath();ctx.arc(CX,CY,R,0,Math.PI*2);ctx.fillStyle=g;ctx.fill();
+  ctx.strokeStyle='rgba(96,165,250,0.35)';ctx.lineWidth=1;ctx.stroke();
+  ctx.strokeStyle='rgba(148,163,184,0.18)';
+  var la,lo,pp,first;
+  for(la=-60;la<=60;la+=30){
+    ctx.beginPath();first=true;
+    for(lo=-180;lo<=180;lo+=6){
+      pp=proj(la,lo);
+      if(pp.z<-0.05){first=true;continue;}
+      if(first){ctx.moveTo(pp.x,pp.y);first=false;}else{ctx.lineTo(pp.x,pp.y);}
+    }
+    ctx.stroke();
+  }
+  for(lo=-180;lo<180;lo+=30){
+    ctx.beginPath();first=true;
+    for(la=-90;la<=90;la+=6){
+      pp=proj(la,lo);
+      if(pp.z<-0.05){first=true;continue;}
+      if(first){ctx.moveTo(pp.x,pp.y);first=false;}else{ctx.lineTo(pp.x,pp.y);}
+    }
+    ctx.stroke();
+  }
+  var tp=proj(TARGET[0],TARGET[1]);
+  if(tp.z>-0.05){
+    ctx.beginPath();ctx.arc(tp.x,tp.y,4+2*Math.sin(now/400),0,Math.PI*2);
+    ctx.fillStyle='#22c55e';ctx.fill();
+    ctx.font='12px sans-serif';ctx.fillStyle='#86efac';
+    ctx.fillText('HOZINKING.MY.ID',tp.x+8,tp.y+4);
+  }
+  DATA.forEach(function(d,idx){
+    var geo=GEO[d.c];if(!geo)return;
+    var p=proj(geo[0],geo[1]);
+    if(p.z<-0.05)return;
+    var r=3+Math.min(d.n,6);
+    ctx.beginPath();ctx.arc(p.x,p.y,r+2*Math.sin(now/300+idx),0,Math.PI*2);
+    ctx.fillStyle='rgba(239,68,68,0.9)';ctx.fill();
+    ctx.beginPath();ctx.arc(p.x,p.y,r+6,0,Math.PI*2);
+    ctx.strokeStyle='rgba(239,68,68,0.35)';ctx.stroke();
+    ctx.beginPath();
+    var pen=false;
+    for(var t=0;t<=1.001;t+=0.05){
+      var mid=slerp(geo,TARGET,t);
+      var mp=proj(mid[0],mid[1]);
+      if(mp.z<-0.05){pen=false;continue;}
+      var rr=R*(1+0.35*Math.sin(Math.PI*t));
+      var mx=CX+(mp.x-CX)*(rr/R), my=CY+(mp.y-CY)*(rr/R);
+      if(!pen){ctx.moveTo(mx,my);pen=true;}else{ctx.lineTo(mx,my);}
+    }
+    ctx.strokeStyle='rgba(249,115,22,0.75)';ctx.lineWidth=1.5;ctx.stroke();
+    var pt=(now/2200+idx*0.17)%1;
+    var mid2=slerp(geo,TARGET,pt);
+    var mp2=proj(mid2[0],mid2[1]);
+    if(mp2.z>-0.05){
+      var rr2=R*(1+0.35*Math.sin(Math.PI*pt));
+      var px=CX+(mp2.x-CX)*(rr2/R), py=CY+(mp2.y-CY)*(rr2/R);
+      ctx.beginPath();ctx.arc(px,py,2.5,0,Math.PI*2);ctx.fillStyle='#fdba74';ctx.fill();
+    }
+  });
+  requestAnimationFrame(draw);
+}
+size();
+window.addEventListener('resize',size);
+requestAnimationFrame(draw);
+})();`;
+      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Percobaan yang diblokir dalam 30 hari terakhir, dari negara asalnya menuju situs ini.</p><p class="meta">${esc(globeNote)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul></div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
       return html(await renderPage(env, 'Status Situs', content), 200);
     }
 
@@ -1927,6 +2093,7 @@ async function handleFetch(request, env) {
         }
         const ip = clientIp(request);
         if (!(await checkRateLimit(env, 'comment:' + ip, 5, 10 * 60 * 1000))) {
+          await logSecurityEvent(env, 'rate_limit', request);
           return html(await renderPage(env, 'Komentar', '<div class="card"><p>Terlalu banyak komentar. Coba lagi beberapa menit.</p></div>'), 429);
         }
         const text = String(form.get('text') || '').trim().slice(0, 2000);
@@ -2137,6 +2304,7 @@ async function handleFetch(request, env) {
           return redirectWithCookies('/kendali', [...cookies, 'cms_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0']);
         }
         await env.DB.prepare(`INSERT INTO cms_login_attempts (ip, created_at) VALUES (?, ?)`).bind(ip, new Date().toISOString()).run();
+        await logSecurityEvent(env, 'login_gagal', request);
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
       }
       if (!(await checkRateLimit(env, 'akun:' + ip, 5, 15 * 60 * 1000))) {

@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS cms_view_events (id INTEGER PRIMARY KEY AUTOINCREMENT
 -- Index untuk query dashboard (filter 30 hari) + prune retensi 90 hari.
 CREATE INDEX IF NOT EXISTS idx_cms_view_events_viewed_at ON cms_view_events (viewed_at);
 
+-- Aktivitas yang diblokir untuk globe publik /uptime (Worker v74).
+-- TANPA IP: hanya negara/kota kasar dari request.cf. Retensi 500 baris.
+CREATE TABLE IF NOT EXISTS security_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, kind TEXT NOT NULL, country TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS idx_security_events_ts ON security_events (ts);
+
 -- Retensi data analitik (bukan data produksi): cms_view_events disimpan
 -- 90 hari, cms_rate_limits + cms_login_attempts 24 jam, dihapus bertahap
 -- (maks 500 baris per pemanggilan) saat admin membuka dashboard.

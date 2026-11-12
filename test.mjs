@@ -61,6 +61,13 @@ class MockDB {
     this.mdBackups = [
       { id: 'mdb-111111111111', key_id: 'mdk-aaaaaaaa', path: 'data/PANDUAN-MUSE-LAIN.md', content: '# Panduan Muse Lain\n\nTeks **tebal**, `kode`, dan [tautan](https://example.com).\n\n| Kolom A | Kolom B |\n|---|---|\n| 1 | 2 |\n\n- [x] selesai\n- [ ] tertunda\n', content_hash: 'h-md-1', size: 120, version: 1, created_at: nowT - 1800 * 1000 },
     ];
+    // v74: fixture security_events untuk globe /uptime
+    this.securityEvents = [
+      { id: 1, ts: nowT - 3600 * 1000, kind: 'login_gagal', country: 'US', city: 'Ashburn' },
+      { id: 2, ts: nowT - 1800 * 1000, kind: 'rate_limit', country: 'CN', city: 'Beijing' },
+      { id: 3, ts: nowT - 900 * 1000, kind: 'login_gagal', country: 'RU', city: 'Moscow' },
+    ];
+    this.securityEventSeq = 3;
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { this.batchCalls = (this.batchCalls || 0) + 1; for (const s of stmts) await s.run(); }
@@ -208,6 +215,18 @@ class MockDB {
       return all;
     }
     if (s.startsWith('INSERT INTO cms_view_events')) { this.viewEvents.push({ id: ++this.viewEventSeq, post_id: a[0], viewed_at: a[1] }); return []; }
+    // v74: security_events (globe /uptime)
+    if (s.startsWith('INSERT INTO security_events')) { this.securityEvents.push({ id: ++this.securityEventSeq, ts: a[0], kind: a[1], country: a[2], city: a[3] }); return []; }
+    if (s.startsWith('DELETE FROM security_events')) {
+      const keep = [...this.securityEvents].sort((x, y) => (y.id || 0) - (x.id || 0)).slice(0, 500);
+      const removed = this.securityEvents.length - keep.length;
+      this.securityEvents = keep;
+      return { changes: removed };
+    }
+    if (s.startsWith('SELECT country, kind, ts FROM security_events')) {
+      const evs = this.securityEvents.filter(e => Number(e.ts || 0) >= a[0] && String(e.country || '') !== '');
+      return evs.sort((x, y) => (y.ts || 0) - (x.ts || 0)).slice(0, 200);
+    }
     if (s.startsWith('DELETE FROM cms_view_events')) {
       const old = this.viewEvents.filter(e => String(e.viewed_at || '') < a[0]).sort((x, y) => (x.id || 0) - (y.id || 0)).slice(0, a[1]);
       const ids = new Set(old.map(e => e.id));
@@ -460,6 +479,10 @@ assert(t.includes('id="copyr"') && t.includes('<a href="/uptime">Uptime</a>') &&
 function cookiesOf(res) { const list = res.headers.getSetCookie ? res.headers.getSetCookie() : [(res.headers.get('set-cookie') || '')]; return list.map(c => c.split(';')[0]).filter(Boolean); }
 function cookieHeader(list) { return list.join('; '); }
 r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'salah' }); assert(r.status === 403, 'login admin salah ditolak (pesan generik)');
+// v74: login gagal tercatat di security_events (sumber globe /uptime)
+const secBefore = env.DB.securityEvents.length;
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'salah' });
+assert(r.status === 403 && env.DB.securityEvents.length === secBefore + 1 && env.DB.securityEvents[env.DB.securityEvents.length - 1].kind === 'login_gagal', 'login gagal tercatat di security_events');
 r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token', remember: '1' });
 let cookie = cookieHeader(cookiesOf(r));
 assert(cookie.includes('cms_access=') && cookie.includes('cms_refresh='), 'login admin benar memberi token akses + refresh');
@@ -1125,6 +1148,8 @@ r = await call('GET', '/bio'); t = await r.text();
 assert(r.status === 200 && t.includes('Link Bio'), '/bio: halaman Link Bio tampil');
 r = await call('GET', '/uptime'); t = await r.text();
 assert(r.status === 200 && t.includes('Status Situs') && t.includes('Online sejak 1 Januari 2024'), '/uptime: halaman status tampil');
+// v74: grafik kunjungan 30 hari + globe serangan (data fixture security_events)
+assert(t.includes('Kunjungan tercatat') && t.includes('attack-globe') && t.includes('"c":"US"') && t.includes('"c":"CN"') && t.includes('login admin gagal'), '/uptime: grafik kunjungan + globe serangan tampil (data fixture)');
 r = await callJson('GET', '/api/hacklab/lessons', null);
 let j = await r.json();
 assert(r.status === 200 && Array.isArray(j.lessons) && j.lessons.length === 0, 'hacklab: katalog pelajaran kosong di mock');
