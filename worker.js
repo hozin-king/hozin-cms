@@ -630,6 +630,156 @@ async function handleFetch(request, env) {
       return new Response(JSON.stringify(cfg), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=60' } });
     }
 
+    // ---- Submit konten Cerpen dari API key (akun Muse kedua, v64, 12 Nov 2026) ----
+    // Antrean + persetujuan, BUKAN publish langsung: endpoint ini hanya
+    // menerima usulan ke tabel staging cerpen_submissions (status pending).
+    // Alyaa me-review (skrip review_submissions.py di VM); yang lolos
+    // digabung ke cerpen.json/komik.json + sync ke D1. Kunci konten Cerpen
+    // TIDAK PERNAH masuk Worker/D1 — Worker tidak mengenkripsi apa pun.
+    // Auth: Bearer <key> (atau X-Api-Key), dicocokkan SHA-256 ke key_hash
+    // di cerpen_api_keys (revoked=1 ditolak). Rate limit: daily_limit
+    // per hari/key (WIB, default 10). Dedup 3 lapis (409): id target,
+    // judul ternormalisasi, hash payload.
+    if (request.method === 'POST' && path === '/api/cerpen-submit') {
+      const csJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!env.BACKUP_DB) return csJson({ ok: false, error: 'database tidak tersedia' }, 503);
+      const rawKey = String(request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '').trim()
+        || String(request.headers.get('x-api-key') || '').trim();
+      if (!rawKey) return csJson({ ok: false, error: 'unauthorized' }, 401);
+      let keyRow = null;
+      try {
+        const hash = await sha256Hex(rawKey);
+        keyRow = await env.BACKUP_DB.prepare(`SELECT key_id, key_hash, name, revoked, daily_limit FROM cerpen_api_keys WHERE key_hash = ?`).bind(hash).first();
+        if (!keyRow || Number(keyRow.revoked) !== 0) return csJson({ ok: false, error: 'unauthorized' }, 401);
+        if (!timingSafeHexEqual(String(keyRow.key_hash), hash)) return csJson({ ok: false, error: 'unauthorized' }, 401);
+      } catch (e) {
+        return csJson({ ok: false, error: 'gagal memeriksa kunci' }, 500);
+      }
+      try {
+        const nowWib = new Date(Date.now() + 7 * 3600000);
+        const dayStart = Date.UTC(nowWib.getUTCFullYear(), nowWib.getUTCMonth(), nowWib.getUTCDate(), 0, 0, 0) - 7 * 3600000;
+        const cnt = await env.BACKUP_DB.prepare(`SELECT COUNT(*) AS c FROM cerpen_submissions WHERE key_id = ? AND created_at >= ?`).bind(keyRow.key_id, dayStart).first();
+        if (Number(cnt && cnt.c || 0) >= Number(keyRow.daily_limit || 10)) return csJson({ ok: false, error: 'rate limit harian tercapai' }, 429);
+      } catch (e) {
+        return csJson({ ok: false, error: 'gagal memeriksa kuota' }, 500);
+      }
+      if (Number(request.headers.get('content-length') || '0') > 102400) return csJson({ ok: false, error: 'payload terlalu besar' }, 413);
+      let data = null;
+      try {
+        const text = await request.text();
+        if (text.length > 102400) return csJson({ ok: false, error: 'payload terlalu besar' }, 413);
+        data = JSON.parse(text);
+      } catch (e) { return csJson({ ok: false, error: 'payload bukan JSON' }, 400); }
+      const bad = (msg) => csJson({ ok: false, error: msg }, 400);
+      const GENRES = ['Drama Keluarga', 'Romansa', 'Horor', 'Komedi', 'Fantasi', 'Misteri', 'Slice of Life', 'Sci-Fi', 'Petualangan', 'Thriller'];
+      const KINDS = ['cerpen', 'season', 'edit', 'delete', 'komik'];
+      const normTitle = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const isId = (v) => typeof v === 'string' && /^[a-z0-9-]{3,64}$/.test(v);
+      const isTitle = (v) => typeof v === 'string' && v.trim().length >= 3 && v.length <= 120;
+      const validEpisodes = (eps) => {
+        if (!Array.isArray(eps) || eps.length < 1 || eps.length > 50) return false;
+        for (const e of eps) {
+          if (!e || typeof e !== 'object' || Array.isArray(e)) return false;
+          if (!Number.isInteger(e.no) || e.no < 1 || e.no > 9999) return false;
+          if (typeof e.judul !== 'string' || e.judul.trim().length < 1 || e.judul.length > 200) return false;
+          if (typeof e.isi !== 'string' || e.isi.length < 200 || e.isi.length > 20000) return false;
+        }
+        return true;
+      };
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return bad('payload tidak valid');
+      const kind = data.kind;
+      if (!KINDS.includes(kind)) return bad('kind tidak valid');
+      let targetId = '', title = '';
+      if (kind === 'cerpen') {
+        if (!isId(data.id)) return bad('id tidak valid');
+        if (!isTitle(data.judul)) return bad('judul tidak valid');
+        if (!GENRES.includes(data.genre)) return bad('genre tidak valid');
+        if (typeof data.deskripsi !== 'string' || data.deskripsi.length > 500) return bad('deskripsi tidak valid');
+        if (data.cover !== undefined && (typeof data.cover !== 'string' || data.cover.length > 200)) return bad('cover tidak valid');
+        if (!Array.isArray(data.seasons) || data.seasons.length < 1 || data.seasons.length > 99) return bad('seasons tidak valid');
+        for (const s of data.seasons) {
+          if (!s || typeof s !== 'object' || !Number.isInteger(s.season) || s.season < 1 || s.season > 99) return bad('season tidak valid');
+          if (!validEpisodes(s.episodes)) return bad('episodes tidak valid');
+        }
+        targetId = data.id; title = data.judul;
+      } else if (kind === 'season') {
+        if (!isId(data.id)) return bad('id tidak valid');
+        if (!Number.isInteger(data.season) || data.season < 1 || data.season > 99) return bad('season tidak valid');
+        if (!validEpisodes(data.episodes)) return bad('episodes tidak valid');
+        targetId = data.id; title = '';
+      } else if (kind === 'edit') {
+        if (!isId(data.id)) return bad('id tidak valid');
+        if (!Number.isInteger(data.season) || data.season < 1 || data.season > 99) return bad('season tidak valid');
+        if (!Number.isInteger(data.no) || data.no < 1 || data.no > 9999) return bad('no tidak valid');
+        if (data.judul !== undefined && (typeof data.judul !== 'string' || data.judul.length > 200)) return bad('judul tidak valid');
+        if (data.isi !== undefined && (typeof data.isi !== 'string' || data.isi.length < 200 || data.isi.length > 20000)) return bad('isi tidak valid');
+        if (data.judul === undefined && data.isi === undefined) return bad('tidak ada yang diubah');
+        targetId = data.id; title = '';
+      } else if (kind === 'delete') {
+        if (!isId(data.id)) return bad('id tidak valid');
+        if (typeof data.alasan !== 'string' || data.alasan.trim().length < 3 || data.alasan.length > 500) return bad('alasan tidak valid');
+        targetId = data.id; title = '';
+      } else if (kind === 'komik') {
+        if (!isId(data.id)) return bad('id tidak valid');
+        if (!isTitle(data.judul)) return bad('judul tidak valid');
+        if (!GENRES.includes(data.genre)) return bad('genre tidak valid');
+        if (typeof data.deskripsi !== 'string' || data.deskripsi.length > 500) return bad('deskripsi tidak valid');
+        if (!Array.isArray(data.episodes) || data.episodes.length < 1 || data.episodes.length > 99) return bad('episodes tidak valid');
+        for (const e of data.episodes) {
+          if (!e || typeof e !== 'object' || !Number.isInteger(e.no) || e.no < 1 || e.no > 9999) return bad('episode komik tidak valid');
+          if (typeof e.judul !== 'string' || e.judul.length > 200) return bad('judul episode komik tidak valid');
+          if (!Array.isArray(e.panels) || e.panels.length < 1 || e.panels.length > 20) return bad('panels tidak valid');
+          for (const p of e.panels) {
+            if (!p || typeof p !== 'object' || typeof p.teks !== 'string' || p.teks.length < 10 || p.teks.length > 2000) return bad('teks panel tidak valid');
+          }
+        }
+        targetId = data.id; title = data.judul;
+      }
+      const dup = (reason) => csJson({ ok: false, error: 'duplikat', reason }, 409);
+      const dedupHash = await sha256Hex(JSON.stringify(data));
+      try {
+        if (kind === 'cerpen') {
+          const ex = await env.BACKUP_DB.prepare(`SELECT id FROM cerpen_series WHERE id = ?`).bind(targetId).first();
+          if (ex) return dup('duplicate_id');
+        } else if (kind === 'komik') {
+          const ex = await env.BACKUP_DB.prepare(`SELECT id FROM cerpen_komik WHERE id = ?`).bind(targetId).first();
+          if (ex) return dup('duplicate_id');
+        } else if (kind === 'season') {
+          const s = await env.BACKUP_DB.prepare(`SELECT id FROM cerpen_series WHERE id = ?`).bind(targetId).first();
+          if (!s) return dup('target_missing');
+          const ex = await env.BACKUP_DB.prepare(`SELECT series_id FROM cerpen_episodes WHERE series_id = ? AND season = ? LIMIT 1`).bind(targetId, data.season).first();
+          if (ex) return dup('season_exists');
+        } else if (kind === 'edit') {
+          const ex = await env.BACKUP_DB.prepare(`SELECT series_id FROM cerpen_episodes WHERE series_id = ? AND season = ? AND no = ?`).bind(targetId, data.season, data.no).first();
+          if (!ex) return dup('target_missing');
+        } else if (kind === 'delete') {
+          const s = await env.BACKUP_DB.prepare(`SELECT id FROM cerpen_series WHERE id = ?`).bind(targetId).first();
+          if (!s) return dup('target_missing');
+          const pend = await env.BACKUP_DB.prepare(`SELECT id FROM cerpen_submissions WHERE kind = 'delete' AND target_id = ? AND status = 'pending'`).bind(targetId).first();
+          if (pend) return dup('delete_pending');
+        }
+        if ((kind === 'cerpen' || kind === 'komik') && title && normTitle(title)) {
+          const nt = normTitle(title);
+          const tbl = kind === 'cerpen' ? 'cerpen_series' : 'cerpen_komik';
+          const rows = await env.BACKUP_DB.prepare(`SELECT judul FROM ${tbl}`).all();
+          for (const r of (rows.results || [])) if (normTitle(r.judul) === nt) return dup('duplicate_title');
+          const subs = await env.BACKUP_DB.prepare(`SELECT title FROM cerpen_submissions WHERE status IN ('pending','approved') AND title != ''`).all();
+          for (const r of (subs.results || [])) if (normTitle(r.title) === nt) return dup('duplicate_title');
+        }
+        const same = await env.BACKUP_DB.prepare(`SELECT id FROM cerpen_submissions WHERE dedup_hash = ? AND status IN ('pending','approved')`).bind(dedupHash).first();
+        if (same) return dup('duplicate_payload');
+      } catch (e) {
+        return csJson({ ok: false, error: 'gagal memeriksa duplikat' }, 500);
+      }
+      const subId = 'sub-' + randomHex(6);
+      try {
+        await env.BACKUP_DB.prepare(`INSERT INTO cerpen_submissions (id, key_id, kind, target_id, title, dedup_hash, payload_json, status, created_at, reviewed_at, review_note) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, '')`).bind(subId, keyRow.key_id, kind, targetId, title, dedupHash, JSON.stringify(data), Date.now()).run();
+      } catch (e) {
+        return csJson({ ok: false, error: 'gagal menyimpan usulan' }, 500);
+      }
+      return csJson({ ok: true, id: subId, status: 'pending', message: 'Usulan diterima dan menunggu persetujuan Alyaa.' }, 201);
+    }
+
     // ---- Publik: konten Cerpen Hozin dari D1 (aplikasi Android, v63, 12 Nov 2026) ----
     // Aplikasi Cerpen mengambil daftar + isi dari sini (dulu dari file .enc
     // di repo GitHub). Isi episode/panel TETAP terenkripsi AES-256-GCM
