@@ -1273,6 +1273,10 @@ assert(r.headers.get('cache-control') === 'public, max-age=60', 'cerpen-config: 
 r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
 const csrf38 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 assert(t.includes('name="cerpen_config"') && t.includes('Remote Config — Cerpen Hozin'), 'cerpen-config: textarea + kartu tampil di Pengaturan');
+// 38b. Editor visual Remote Config Cerpen (v79): baris per tab (label +
+// tampil + naik/turun), banner, accent; textarea tetap pembawa submit.
+assert(t.includes('id="cerpen-editor"') && t.includes('cerpen-tab-row') && t.includes('cerpen-tab-up') && t.includes('cerpen-tab-down') && t.includes('class="cerpen-tab-visible"') && t.includes('id="cerpen-banner"') && t.includes('id="cerpen-accent"') && t.includes('id="cerpen-accent-color"') && t.includes('id="cerpen-cfg-json"') && t.includes('id="cerpen_config"'), 'cerpen-editor: baris tab + tombol naik/turun + toggle tampil + banner + accent tampil di Pengaturan');
+assert(t.includes('data-id="cerbung"') && t.includes('data-id="berita"') && t.includes('data-id="komik"') && t.includes('data-id="koleksi"'), 'cerpen-editor: keempat tab dirender sebagai baris (id read-only)');
 assert(csrf38.length > 10, 'cerpen-config: token CSRF baru untuk tes simpan');
 const cerpenValid = JSON.stringify({ version: 1, tabs: [{ id: 'komik', label: 'Komik Baru', visible: true }, { id: 'cerbung', label: 'Cerita', visible: true }, { id: 'berita', label: 'Berita', visible: false }, { id: 'koleksi', label: 'Koleksi', visible: true }], banner: 'Episode baru tiap hari!', accent: '#3b82f6' });
 r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', cerpen_config: '{bukan json' }, cookie);
@@ -1304,6 +1308,19 @@ assert(cerpenCfg.tabs[0].id === 'komik', 'cerpen-config: simpan tanpa field tida
 env.DB.settings.set('cerpen_config', '{rusak');
 r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
 assert(cerpenCfg.version === 1 && cerpenCfg.tabs.length === 4 && cerpenCfg.tabs[0].id === 'cerbung', 'cerpen-config: nilai rusak di DB -> endpoint mengembalikan default');
+// 38c. Editor visual: bila config tersimpan rusak, editor tidak tampil —
+// textarea mentah tetap ada (fallback). Lalu simpan hasil edit visual
+// (urutan + tampil + banner) lewat kolom yang sama, dan pulihkan config
+// valid sebelumnya supaya tes sesudahnya tidak berubah.
+r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
+assert(!t.includes('cerpen-tab-row') && !t.includes('id="cerpen-editor"') && t.includes('name="cerpen_config"'), 'cerpen-editor: config rusak di DB -> editor tidak tampil, textarea mentah tetap ada');
+const cerpenEdited = JSON.stringify({ version: 1, tabs: [{ id: 'berita', label: 'Berita', visible: true }, { id: 'cerbung', label: 'Cerita', visible: true }, { id: 'komik', label: 'Komik', visible: true }, { id: 'koleksi', label: 'Koleksi', visible: false }], banner: 'Baca dulu!', accent: '' });
+r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', cerpen_config: cerpenEdited }, cookie);
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pengaturan-disimpan'), 'cerpen-editor: hasil edit visual tersimpan');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(cerpenCfg.tabs[0].id === 'berita' && cerpenCfg.tabs[3].visible === false && cerpenCfg.banner === 'Baca dulu!' && cerpenCfg.accent === '', 'cerpen-editor: urutan + tampil + banner hasil edit terbaca di endpoint');
+r = await call('POST', '/kendali/settings', { csrf: csrf38, site_title: 'WorkerCMS', theme: 'terang', cerpen_config: cerpenValid }, cookie);
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pengaturan-disimpan'), 'cerpen-editor: config valid sebelumnya dipulihkan');
 // 39. Admin API Cerpen (v66, 12 Nov 2026): panel /kendali/cerpen-api + endpoint /api/admin/cerpen-*
 r = await call('GET', '/kendali', null, cookie); t = await r.text();
 const csrf39 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
