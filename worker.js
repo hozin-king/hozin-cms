@@ -2170,7 +2170,7 @@ async function handleFetch(request, env) {
           const content = `<h2>Cerpen API</h2>${nav}<div class="card"><p>Database Cerpen (stopwatch-db) tidak tersedia — panel tidak bisa dimuat.</p></div>`;
           return html(await renderPage(env, 'Cerpen API', content));
         }
-        const wib = ms => new Date(Number(ms || 0) + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16);
+        const wib = v => { const n = Number(v || 0); const ms = (n > 0 && n < 1e12) ? n * 1000 : n; return new Date(ms + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16); };
         const fStatus = url.searchParams.get('status') || '';
         const fKey = url.searchParams.get('key_id') || '';
         const fKind = url.searchParams.get('kind') || '';
@@ -2325,6 +2325,7 @@ async function cerpenShowDetail(subId) {
   const bodyEl = document.getElementById('cerpen-detail-body');
   const actions = document.getElementById('cerpen-detail-actions');
   box.hidden = false;
+  box.scrollIntoView({ behavior: 'smooth', block: 'start' });
   actions.hidden = true;
   bodyEl.innerHTML = '<p>Memuat…</p>';
   try {
@@ -2336,7 +2337,7 @@ async function cerpenShowDetail(subId) {
     bodyEl.querySelector('pre').textContent = payload;
     actions.hidden = s.status !== 'pending';
     actions.dataset.id = s.id;
-  } catch (err) { bodyEl.innerHTML = '<p>Gagal memuat detail: ' + escHtml(err.message) + '</p>'; }
+  } catch (err) { bodyEl.innerHTML = '<p>Gagal memuat detail: ' + escHtml(err.message) + '</p>'; cerpenShowMsg('Gagal memuat detail: ' + err.message, false); }
 }
 document.querySelectorAll('[data-cerpen-detail]').forEach(function (btn) {
   btn.addEventListener('click', function () { cerpenShowDetail(btn.dataset.cerpenDetail); });
@@ -2365,7 +2366,7 @@ document.getElementById('cerpen-reject').addEventListener('click', async functio
           const content = `<h2>Backup .md</h2>${nav}<div class="card"><p>Database Cerpen (stopwatch-db) tidak tersedia — panel tidak bisa dimuat.</p></div>`;
           return html(await renderPage(env, 'Backup .md', content));
         }
-        const wib = ms => new Date(Number(ms || 0) + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16);
+        const wib = v => { const n = Number(v || 0); const ms = (n > 0 && n < 1e12) ? n * 1000 : n; return new Date(ms + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16); };
         const fPath = url.searchParams.get('path') || '';
         const fView = url.searchParams.get('view') || '';
         let fLimit = parseInt(url.searchParams.get('limit') || '50', 10);
