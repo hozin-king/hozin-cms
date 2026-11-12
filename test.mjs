@@ -1151,7 +1151,7 @@ assert(r.status === 200 && t.includes('Status Situs') && t.includes('Online seja
 // v74: grafik kunjungan 30 hari + globe serangan (data fixture security_events)
 assert(t.includes('Kunjungan tercatat') && t.includes('attack-globe') && t.includes('"c":"US"') && t.includes('"c":"CN"') && t.includes('login admin gagal'), '/uptime: grafik kunjungan + globe serangan tampil (data fixture)');
 // v75: globe baca feed serangan global dari jsDelivr (repo news-getter)
-assert(t.includes('cdn.jsdelivr.net/gh/hozin-king/hozin-news-getter@main/data/attacks.json') && t.includes('id="feed-status"'), '/uptime: globe memuat feed serangan global dari news-getter');
+assert(t.includes('id="feed-status"') && t.includes('SANS DShield'), '/uptime: status feed serangan global tampil');
 r = await callJson('GET', '/api/hacklab/lessons', null);
 let j = await r.json();
 assert(r.status === 200 && Array.isArray(j.lessons) && j.lessons.length === 0, 'hacklab: katalog pelajaran kosong di mock');

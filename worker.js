@@ -1827,6 +1827,25 @@ async function handleFetch(request, env) {
         globeData = [...byCountry.values()].sort((a, b) => b.n - a.n).slice(0, 20);
       } catch (e) { globeData = []; globeTotal = 0; }
       const globeJson = JSON.stringify(globeData).replace(/</g, '\\u003c');
+      // Feed serangan global: diambil SERVER-SIDE (sekali, cache edge
+      // 10 menit) supaya halaman tiba di HP dengan data sudah menempel —
+      // tidak bergantung pada koneksi pengunjung. Gagal -> globe hanya
+      // menampilkan data blokir lokal.
+      const FEED_URL = 'https://cdn.jsdelivr.net/gh/hozin-king/hozin-news-getter@main/data/attacks.json';
+      let feedData = [];
+      let feedStatus = 'Feed serangan global belum tersedia — globe menampilkan data blokir situs ini saja.';
+      try {
+        const fr = await fetch(FEED_URL, { signal: AbortSignal.timeout(5000), cf: { cacheTtl: 600 } });
+        if (fr.ok) {
+          const fj = await fr.json();
+          if (fj && Array.isArray(fj.countries) && fj.countries.length) {
+            feedData = fj.countries.slice(0, 20);
+            const top5 = feedData.slice(0, 5).map(c => `${c.c} ${Number(c.n || 0).toLocaleString('en-US')}`).join(', ');
+            feedStatus = `Serangan global (SANS DShield, diperbarui ${fj.generated_at || '?'}): ${top5}${fj.total_reports_today ? ' — ' + Number(fj.total_reports_today).toLocaleString('en-US') + ' laporan hari ini' : ''}`;
+          }
+        }
+      } catch (e) { /* feed gagal: tetap tampilkan data lokal */ }
+      const feedJson = JSON.stringify(feedData).replace(/</g, '\\u003c');
       const globeList = globeData.length
         ? globeData.map(g => `<li>${esc(g.c)} — <b>${g.n}</b> (${Object.entries(g.kinds).map(([k, v]) => esc(SEC_KIND_LABEL[k] || k) + ' ' + v).join(', ')})</li>`).join('')
         : '<li>Belum ada aktivitas yang diblokir dalam 30 hari terakhir.</li>';
@@ -1843,7 +1862,7 @@ var GEO = {US:[39,-98],CN:[35,104],RU:[61,90],IN:[21,78],BR:[-10,-55],VN:[14,108
 var cv=document.getElementById('attack-globe');
 if(!cv||!cv.getContext)return;
 var ctx=cv.getContext('2d');
-var W=0,H=300,R=0,CX=0,CY=150,ROT=0;
+var W=0,H=300,R=0,CX=0,CY=150,ROT=-1.864;
 var TARGET=[-6.2,106.8];
 function size(){
   var dpr=window.devicePixelRatio||1;
@@ -1868,7 +1887,7 @@ function slerp(a,b,t){
   return [Math.asin(Math.max(-1,Math.min(1,z)))*180/Math.PI, Math.atan2(y,x)*180/Math.PI];
 }
 function draw(now){
-  ROT+=0.15;
+  ROT+=0.0025;
   ctx.clearRect(0,0,W,H);
   var g=ctx.createRadialGradient(CX-R*0.3,CY-R*0.4,R*0.1,CX,CY,R);
   g.addColorStop(0,'#1e3a5f');g.addColorStop(0.7,'#0b1e33');g.addColorStop(1,'#060d18');
@@ -1936,25 +1955,12 @@ function drawSet(list,dot,arc,packet,off,now){
     }
   });
 }
-var FEED=[];
-var FEED_URL='https://cdn.jsdelivr.net/gh/hozin-king/hozin-news-getter@main/data/attacks.json';
-fetch(FEED_URL).then(function(r){return r.json();}).then(function(j){
-  if(!j||!j.countries||!j.countries.length)return;
-  FEED=j.countries;
-  var el=document.getElementById('feed-status');
-  if(el){
-    var top=j.countries.slice(0,5).map(function(c){return c.c+' '+c.n.toLocaleString('en-US');}).join(', ');
-    el.textContent='Serangan global (SANS DShield, diperbarui '+(j.generated_at||'?')+'): '+top+(j.total_reports_today?' — '+j.total_reports_today.toLocaleString('en-US')+' laporan hari ini':'');
-  }
-}).catch(function(){
-  var el=document.getElementById('feed-status');
-  if(el){el.textContent='Feed serangan global belum tersedia — globe menampilkan data blokir situs ini saja.';}
-});
+var FEED = ${feedJson};
 size();
 window.addEventListener('resize',size);
 requestAnimationFrame(draw);
 })();`;
-      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Percobaan yang diblokir dalam 30 hari terakhir, dari negara asalnya menuju situs ini.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">Feed serangan global belum tersedia — globe menampilkan data blokir situs ini saja.</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul></div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
+      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Titik oranye = serangan global dari SANS DShield (diperbarui tiap jam). Titik merah = percobaan yang diblokir di situs ini dalam 30 hari terakhir. Keduanya dari negara asalnya menuju situs ini.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">${esc(feedStatus)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul></div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
       return html(await renderPage(env, 'Status Situs', content), 200);
     }
 
