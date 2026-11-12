@@ -815,12 +815,32 @@ r = await call('POST', '/kendali/settings', { csrf, site_title: 'WorkerCMS', the
 r = await call('GET', '/bio'); t = await r.text();
 assert(t.includes('https://saweria.co/hozin') && t.includes('Donasi sekarang'), 'bio: link donasi dari pengaturan tampil + tombol aktif');
 r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
-assert(t.includes('AdSense: ID penayang'), 'pengaturan: kolom AdSense tampil');
+assert(t.includes('<label>AdSense</label>') && t.includes('Mati'), 'pengaturan: satu kolom AdSense tampil + status Mati saat kosong');
 assert(t.includes('name="donate_url"'), 'pengaturan: kolom link donasi tampil');
 r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: 'ca-pub-1234567890123456', adsense_slot: '1234567890' }, cookie); assert(r.status === 303, 'pengaturan AdSense tersimpan');
 r = await call('GET', '/'); t = await r.text();
 assert(t.includes('adsbygoogle') && t.includes('ca-pub-1234567890123456'), 'AdSense: unit tampil di beranda bila client diisi');
 assert(r.headers.get('content-security-policy') && r.headers.get('content-security-policy').includes('pagead2.googlesyndication.com'), 'AdSense: CSP dilonggarkan hanya untuk domain Google Ads');
+// AdSense: satu kolom — tempel script lengkap diekstrak jadi ID polos
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: '<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-9999999999999999" crossorigin="anonymous"></script>' }, cookie); assert(r.status === 303, 'AdSense: tempelan script lengkap tersimpan');
+r = await call('GET', '/'); t = await r.text();
+assert(t.includes('<meta name="google-adsense-account" content="ca-pub-9999999999999999">') && t.includes('adsbygoogle.js?client=ca-pub-9999999999999999'), 'AdSense: script + meta verifikasi tampil di <head> beranda');
+assert(t.indexOf('google-adsense-account') < t.indexOf('</head>'), 'AdSense: meta verifikasi berada di dalam <head>');
+r = await call('GET', '/ads.txt'); t = await r.text();
+assert(r.status === 200 && t === 'google.com, pub-9999999999999999, DIRECT, f08c47fec0942fa0\n', 'ads.txt: baris persis saat setting terisi');
+r = await call('GET', '/bio'); t = await r.text();
+assert(t.includes('adsbygoogle.js?client=ca-pub-9999999999999999'), 'AdSense: script verifikasi tampil di <head> /bio');
+r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
+assert(t.includes('value="ca-pub-9999999999999999"') && t.includes('Aktif'), 'AdSense: kolom terisi ID polos hasil ekstraksi + status Aktif');
+// AdSense: input tanpa ID valid ditolak, nilai lama tetap
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: 'bukan-id-adsense' }, cookie); assert(r.status === 303 && (r.headers.get('location') || '').includes('adsense-tidak-valid'), 'AdSense: input tanpa ID valid ditolak dengan pesan jelas');
+r = await call('GET', '/'); t = await r.text();
+assert(t.includes('ca-pub-9999999999999999') && !t.includes('bukan-id-adsense'), 'AdSense: nilai lama tetap dipakai setelah input ditolak');
+// AdSense: kolom dikosongkan = ketiganya mati
+r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: '' }, cookie); assert(r.status === 303, 'AdSense: kolom dikosongkan tersimpan');
+r = await call('GET', '/'); t = await r.text();
+assert(!t.includes('adsbygoogle') && !t.includes('google-adsense-account'), 'AdSense: script + meta hilang saat setting dikosongkan');
+r = await call('GET', '/ads.txt'); assert(r.status === 404, 'ads.txt: 404 saat setting kosong');
 r = await call('GET', '/kendali/plugins', null, cookie); t = await r.text();
 assert(t.includes('Filter Kata Kotor') && t.includes('Tahan Komentar Berlink') && t.includes('Tahan Komentar Panjang'), 'plugin keamanan: 3 plugin baru tampil di panel');
 // 21. Plugin keamanan benar-benar jalan (bukan saklar mati)

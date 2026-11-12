@@ -23,7 +23,7 @@
 // Deploy: esbuild worker.js --bundle --format=esm, upload dengan binding D1 bernama DB + secret ADMIN_TOKEN.
 // Catatan deploy root: Worker ini MENGGANTIKAN isi root bila di-route ke domain utama.
 // Situs lama yang ada di root harus dipindah ke subdomain dulu bila root mau jadi CMS ini.
-import { themes } from './themes.js';
+import { themes, adsenseHead } from './themes.js';
 import { pluginDefs } from './plugins.js';
 import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex, parseTags, tagSlug, readCappedBody, sha256Hex, b64url } from './util.js';
 import { renderMarkdown } from './markdown.js';
@@ -75,6 +75,9 @@ async function generateAutoReply(env, postTitle, commentText) {
   } catch (e) { return null; }
 }
 const ADSENSE_CSP = "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://pagead2.googlesyndication.com; frame-src https://googleads.g.doubleclick.net https://tpc.googlesyndication.com https://pagead2.googlesyndication.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
+// ID otoritas sertifikasi akun AdSense pemilik (field ke-4 baris ads.txt,
+// dari akun AdSense yang sama dengan setting adsense_client).
+const ADSENSE_ADS_TXT_CA = 'f08c47fec0942fa0';
 
 
 // ---- API Dracin (pipeline katalog metadata) ----
@@ -344,10 +347,11 @@ const ADMIN_NOTICES = {
   'sesi-dicabut': 'Sesi dicabut.',
   'backup-dibuat': 'Backup dibuat — lihat riwayat di bawah.',
   'cerpen-config-tidak-valid': 'Remote config Cerpen tidak valid — tidak disimpan, nilai lama tetap dipakai.',
+  'adsense-tidak-valid': 'ID AdSense tidak valid — tidak disimpan, nilai lama tetap dipakai. Isi ID ca-pub-… atau tempel script AdSense lengkap.',
 };
 // Slug notice yang menandai KEGAGALAN (bukan keberhasilan): tampil dengan
 // label "Gagal:" + garis merah, bukan "Berhasil:".
-const ADMIN_NOTICE_ERRORS = new Set(['cerpen-config-tidak-valid']);
+const ADMIN_NOTICE_ERRORS = new Set(['cerpen-config-tidak-valid', 'adsense-tidak-valid']);
 function noticeHtml(url) {
   const slug = url.searchParams.get('notice') || '';
   const msg = ADMIN_NOTICES[slug];
@@ -414,6 +418,7 @@ function pageOpts(settingsMap, env) {
     themeId: settingsMap.get('theme') || 'terang',
     siteAvatar: settingsMap.get('site_avatar') || '',
     navbarId: settingsMap.get('navbar') || 'modern',
+    adsenseClient: settingsMap.get('adsense_client') || '',
   };
 }
 // 11 Nov 2026 — pilihan gaya navbar (pengaturan /kendali/settings).
@@ -701,6 +706,11 @@ async function handleFetch(request, env) {
       try {
         const donateUrl = await getSetting(env, 'donate_url', '');
         if (/^https:\/\/[^\s"'<>]+$/.test(donateUrl)) bioHtml = BIO_HTML.replace('https://contoh-link-donasi — GANTI DENGAN LINK SAWERIA/TRAKTEER SETELAH AKUN DIBUAT', donateUrl);
+      } catch (e) {}
+      // AdSense: sisipkan script + meta verifikasi ke <head> bila setting terisi.
+      try {
+        const ah = adsenseHead(await getSetting(env, 'adsense_client', ''));
+        if (ah) bioHtml = bioHtml.replace('</head>', ah + '</head>');
       } catch (e) {}
       return new Response(bioHtml, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=300' } });
     }
@@ -2033,6 +2043,15 @@ requestAnimationFrame(draw);
       const txt = `User-agent: *\nAllow: /\nDisallow: /kendali/\nDisallow: /akun/\nDisallow: /admin/\nSitemap: ${url.origin}/sitemap.xml\n`;
       return new Response(txt, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
     }
+    // ---- ads.txt Google AdSense (satu setting adsense_client) ----
+    // Baris persis dari akun AdSense pemilik; ID publisher diambil dari
+    // setting, bukan hardcode. Setting kosong = 404 (AdSense tidak aktif).
+    if (path === '/ads.txt' && request.method === 'GET') {
+      const c = String(await getSetting(env, 'adsense_client', '') || '').trim();
+      const m = c.match(/^ca-pub-(\d+)$/);
+      if (!m) return new Response('Not Found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+      return new Response(`google.com, pub-${m[1]}, DIRECT, ${ADSENSE_ADS_TXT_CA}\n`, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    }
     // ---- Daftar postingan untuk Command Palette (11 Nov 2026) ----
     // Hanya judul + slug, 20 terbaru; diambil malas saat palette dibuka.
     if (path === '/api/nav-posts' && request.method === 'GET') {
@@ -2998,7 +3017,7 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
       }
       if (path === '/kendali/settings') {
         const envTitle = envSiteTitle(env);
-        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText, adsenseClient, adsenseSlot, imgbbKeys, autoReplyEnabled, navbarId, donateUrl, cerpenConfigRaw] = await Promise.all([
+        const [themeId, siteTitleDb, siteAvatar, adImage, adLink, adText, adsenseClient, imgbbKeys, autoReplyEnabled, navbarId, donateUrl, cerpenConfigRaw] = await Promise.all([
           getSetting(env, 'theme', 'terang'),
           envTitle ? Promise.resolve('') : getSetting(env, 'site_title', 'WorkerCMS'),
           getSetting(env, 'site_avatar', ''),
@@ -3006,7 +3025,6 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
           getSetting(env, 'ad_link', ''),
           getSetting(env, 'ad_text', ''),
           getSetting(env, 'adsense_client', ''),
-          getSetting(env, 'adsense_slot', ''),
           getImgbbKeys(env),
           getSetting(env, 'auto_reply_enabled', '0'),
           getSetting(env, 'navbar', 'modern'),
@@ -3016,7 +3034,7 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
         const cerpenConfigText = cerpenConfigRaw || JSON.stringify(CERPEN_CONFIG_DEFAULT, null, 2);
         const siteTitle = envTitle || siteTitleDb;
         const themeOptions = Object.entries(themes).map(([id, t]) => `<option value="${id}" ${id === themeId ? 'selected' : ''}>${esc(t.name)}</option>`).join('');
-        const content = `<h2>Pengaturan</h2>${nav}${noticeHtml(url)}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Navbar</label><select name="navbar">${navbarOptionsHtml(navbarId)}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>Iklan Google AdSense (opsional)</h4><p>Isi hanya bila sudah punya akun AdSense. Iklan baru tampil setelah Google menyetujui situs; sebelum itu slot ini bisa kosong. Mengisi ini mengaktifkan script Google di halaman yang menampilkan iklan.</p><label>AdSense: ID penayang (ca-pub-…)</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-1234567890123456"><label>AdSense: ID slot iklan (angka, kosong = unit auto)</label><input name="adsense_slot" value="${esc(adsenseSlot)}" placeholder="1234567890"><h4>Donasi (halaman /bio)</h4><p>Link donasi tampil sebagai tombol "Donasi sekarang" di halaman /bio. Kosongkan untuk kembali ke tombol "Link donasi segera hadir".</p><label>Link donasi (Saweria — https://saweria.co/…)</label><input name="donate_url" value="${esc(donateUrl)}" placeholder="https://saweria.co/hozin"><h4>Balasan Otomatis Komentar (model teks Dahono gratis)</h4><p>Kalau aktif, saat admin menyetujui komentar komentator, Worker meminta balasan singkat ke Dahono lalu menyimpannya sebagai balasan atas nama “Balasan Otomatis” (1 balasan per komentar, tidak membalas balasan bot). Kunci Dahono WAJIB secret Worker <code>DAHONO_API_KEY</code> — bukan kolom ini, dan tidak pernah ditulis di repo. Status secret: <b>${env.DAHONO_API_KEY ? 'sudah diset' : 'belum diset — balasan tidak akan terkirim sampai secret diset'}</b>.</p><label><input type="checkbox" name="auto_reply" value="1" ${autoReplyEnabled === '1' ? 'checked' : ''}> Aktifkan balasan otomatis</label><h4>Remote Config — Cerpen Hozin</h4><p>JSON yang dibaca aplikasi Cerpen Hozin saat buka/sync (endpoint <code>/api/cerpen-config</code>). Tab bisa disembunyikan (<code>visible: false</code>), diurutkan ulang, atau diganti namanya (label maks 30 karakter); <code>banner</code> teks pengumuman (maks 140 karakter, kosong = tidak tampil); <code>accent</code> warna aksen <code>#RRGGBB</code> (kosong = warna tema bawaan). Untuk mengembalikan tampilan bawaan, isi dengan JSON default. JSON tidak valid tidak akan disimpan.</p><label>Remote config Cerpen (JSON)</label><textarea name="cerpen_config" rows="16" spellcheck="false">${esc(cerpenConfigText)}</textarea><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Upload Gambar via ImgBB — banyak kunci</h3><p>Upload memilih satu kunci secara acak, kalau gagal otomatis coba kunci lain. Status di bawah dari upload terakhir, bukan ping live: 🟢 = upload terakhir berhasil, 🔴 = gagal terakhir, ⚪ = belum pernah dicoba. Kunci tidak pernah tampil penuh, hanya 4 karakter awal + akhir.</p>${imgbbKeys.length ? imgbbKeys.map((e, i) => `<p>${keyDot(e)} Kunci ${i + 1}: ${esc(maskKey(e.k))}${e.ok ? ` · terakhir berhasil ${esc(String(e.ok).slice(0, 16))}` : ''}${e.fail ? ` · terakhir gagal ${esc(String(e.fail).slice(0, 16))}${e.fail_reason ? ` (${esc(e.fail_reason)})` : ''}` : ''} <form method="post" action="/kendali/imgbb/delete" style="display:inline">${csrfField}<input type="hidden" name="index" value="${i}"><button type="submit">Hapus</button></form></p>`).join('') : '<p>Belum ada kunci ImgBB.</p>'}<form method="post" action="/kendali/imgbb/add">${csrfField}<label>Tambah kunci API ImgBB baru (dari imgbb.com, menu API)</label><input type="password" name="new_key" autocomplete="new-password" placeholder="tempel kunci baru di sini"><button type="submit">Tambah Kunci</button></form></div>`;
+        const content = `<h2>Pengaturan</h2>${nav}${noticeHtml(url)}<div class="card">${envTitle ? '<p>Judul yang tampil saat ini diatur dari variabel Worker (SITE_TITLE), bukan dari kolom ini — mengubah kolom ini tidak akan mengubah header sampai variabel itu dihapus.</p>' : ''}<form method="post" action="/kendali/settings">${csrfField}<label>Judul situs</label><input name="site_title" value="${esc(siteTitle)}"><label>Tema</label><select name="theme">${themeOptions}</select><label>Navbar</label><select name="navbar">${navbarOptionsHtml(navbarId)}</select><label>Foto profil situs (link gambar https://…, kosong = tidak tampil)</label><input name="site_avatar" value="${esc(siteAvatar)}" placeholder="https://…"><label>Iklan: gambar banner (link https://…, kosong = iklan tidak tampil)</label><input name="ad_image" value="${esc(adImage)}" placeholder="https://…"><label>Iklan: link tujuan (https://…)</label><input name="ad_link" value="${esc(adLink)}" placeholder="https://…"><label>Iklan: teks (opsional)</label><input name="ad_text" value="${esc(adText)}"><h4>AdSense</h4><p>Status: <b>${adsenseClient ? 'Aktif' : 'Mati'}</b>${adsenseClient ? ' — script + meta verifikasi tampil di semua halaman publik, ads.txt aktif.' : ' — isi ID di bawah untuk mengaktifkan.'}</p><label>AdSense</label><input name="adsense_client" value="${esc(adsenseClient)}" placeholder="ca-pub-… atau tempel script AdSense lengkap"><p>Isi ID penayang (ca-pub-…) atau tempel script AdSense lengkap — ID diekstrak otomatis. Kosongkan untuk mematikan. Sekali simpan, script + meta verifikasi tampil di semua halaman publik dan ads.txt aktif.</p><h4>Donasi (halaman /bio)</h4><p>Link donasi tampil sebagai tombol "Donasi sekarang" di halaman /bio. Kosongkan untuk kembali ke tombol "Link donasi segera hadir".</p><label>Link donasi (Saweria — https://saweria.co/…)</label><input name="donate_url" value="${esc(donateUrl)}" placeholder="https://saweria.co/hozin"><h4>Balasan Otomatis Komentar (model teks Dahono gratis)</h4><p>Kalau aktif, saat admin menyetujui komentar komentator, Worker meminta balasan singkat ke Dahono lalu menyimpannya sebagai balasan atas nama “Balasan Otomatis” (1 balasan per komentar, tidak membalas balasan bot). Kunci Dahono WAJIB secret Worker <code>DAHONO_API_KEY</code> — bukan kolom ini, dan tidak pernah ditulis di repo. Status secret: <b>${env.DAHONO_API_KEY ? 'sudah diset' : 'belum diset — balasan tidak akan terkirim sampai secret diset'}</b>.</p><label><input type="checkbox" name="auto_reply" value="1" ${autoReplyEnabled === '1' ? 'checked' : ''}> Aktifkan balasan otomatis</label><h4>Remote Config — Cerpen Hozin</h4><p>JSON yang dibaca aplikasi Cerpen Hozin saat buka/sync (endpoint <code>/api/cerpen-config</code>). Tab bisa disembunyikan (<code>visible: false</code>), diurutkan ulang, atau diganti namanya (label maks 30 karakter); <code>banner</code> teks pengumuman (maks 140 karakter, kosong = tidak tampil); <code>accent</code> warna aksen <code>#RRGGBB</code> (kosong = warna tema bawaan). Untuk mengembalikan tampilan bawaan, isi dengan JSON default. JSON tidak valid tidak akan disimpan.</p><label>Remote config Cerpen (JSON)</label><textarea name="cerpen_config" rows="16" spellcheck="false">${esc(cerpenConfigText)}</textarea><button type="submit">Simpan Pengaturan</button></form></div><div class="card"><h3>Upload Gambar via ImgBB — banyak kunci</h3><p>Upload memilih satu kunci secara acak, kalau gagal otomatis coba kunci lain. Status di bawah dari upload terakhir, bukan ping live: 🟢 = upload terakhir berhasil, 🔴 = gagal terakhir, ⚪ = belum pernah dicoba. Kunci tidak pernah tampil penuh, hanya 4 karakter awal + akhir.</p>${imgbbKeys.length ? imgbbKeys.map((e, i) => `<p>${keyDot(e)} Kunci ${i + 1}: ${esc(maskKey(e.k))}${e.ok ? ` · terakhir berhasil ${esc(String(e.ok).slice(0, 16))}` : ''}${e.fail ? ` · terakhir gagal ${esc(String(e.fail).slice(0, 16))}${e.fail_reason ? ` (${esc(e.fail_reason)})` : ''}` : ''} <form method="post" action="/kendali/imgbb/delete" style="display:inline">${csrfField}<input type="hidden" name="index" value="${i}"><button type="submit">Hapus</button></form></p>`).join('') : '<p>Belum ada kunci ImgBB.</p>'}<form method="post" action="/kendali/imgbb/add">${csrfField}<label>Tambah kunci API ImgBB baru (dari imgbb.com, menu API)</label><input type="password" name="new_key" autocomplete="new-password" placeholder="tempel kunci baru di sini"><button type="submit">Tambah Kunci</button></form></div>`;
         return html(await renderPage(env, 'Pengaturan', content, { siteTitle, themeId }));
       }
       if (path === '/kendali/sessions') {
@@ -3212,6 +3230,24 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
           }
           cerpenConfigToSave = JSON.stringify(parsed);
         }
+        // AdSense: satu kolom — terima ID polos atau tempelan script lengkap,
+        // ID diekstrak otomatis. Input berisi tapi tanpa ID valid = seluruh
+        // simpan ditolak (pola yang sama dengan cerpen_config di atas).
+        // Form lain yang tidak mengirim field ini tidak kena validasi ini.
+        let adsenseClientToSave = null;
+        if (form.get('adsense_client') !== null) {
+          const adsenseRaw = String(form.get('adsense_client') || '').trim();
+          if (adsenseRaw) {
+            const m = adsenseRaw.match(/ca-pub-\d+/);
+            if (!m) {
+              const retBad = String(form.get('return_to') || '');
+              return redirect(withNotice(retBad.startsWith('/kendali/') ? retBad : '/kendali/settings', 'adsense-tidak-valid'));
+            }
+            adsenseClientToSave = m[0];
+          } else {
+            adsenseClientToSave = '';
+          }
+        }
         const siteTitle = String(form.get('site_title') || '').trim().slice(0, 100) || 'WorkerCMS';
         const theme = String(form.get('theme') || 'terang');
         // Foto profil + iklan: hanya link https yang disimpan, sisanya
@@ -3224,10 +3260,6 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
         const adImage = cleanUrl(form.get('ad_image'));
         const adLink = cleanUrl(form.get('ad_link'));
         const adText = String(form.get('ad_text') || '').trim().slice(0, 100);
-        const adsenseClientRaw = String(form.get('adsense_client') || '').trim();
-        const adsenseClient = /^ca-pub-\d+$/.test(adsenseClientRaw) ? adsenseClientRaw : '';
-        const adsenseSlotRaw = String(form.get('adsense_slot') || '').trim();
-        const adsenseSlot = /^\d+$/.test(adsenseSlotRaw) ? adsenseSlotRaw : '';
 
         if (themes[theme]) {
           await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('site_title', ?)`).bind(siteTitle).run();
@@ -3243,8 +3275,12 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_image', ?)`).bind(adImage).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_link', ?)`).bind(adLink).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('ad_text', ?)`).bind(adText).run();
-        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_client', ?)`).bind(adsenseClient).run();
-        await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_slot', ?)`).bind(adsenseSlot).run();
+        // adsense_slot tidak lagi diedit dari UI (satu kolom AdSense saja);
+        // nilai lama di D1 dibiarkan apa adanya supaya unit iklan yang
+        // sudah ada tidak berubah (slot kosong = unit auto).
+        if (adsenseClientToSave !== null) {
+          await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('adsense_client', ?)`).bind(adsenseClientToSave).run();
+        }
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('donate_url', ?)`).bind(cleanUrl(form.get('donate_url'))).run();
         await env.DB.prepare(`INSERT OR REPLACE INTO cms_settings (key, value) VALUES ('auto_reply_enabled', ?)`).bind(String(form.get('auto_reply') || '') === '1' ? '1' : '0').run();
         if (cerpenConfigToSave !== null) {

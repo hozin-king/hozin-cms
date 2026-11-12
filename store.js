@@ -256,6 +256,10 @@ export async function renderPage(env, pageTitle, content, opts = {}) {
     if (!navbarId) navbarId = navbarDb;
   }
   if (typeof siteAvatar !== 'string' || !siteAvatar.startsWith('https://') || /["'<\s]/.test(siteAvatar)) siteAvatar = '';
+  // AdSense: satu setting mengendalikan script + meta verifikasi di <head>.
+  // Diambil dari opts (pageOpts) bila ada, kalau tidak baca D1 sekali.
+  let adsenseClient = opts.adsenseClient;
+  if (adsenseClient === undefined) adsenseClient = await getSetting(env, 'adsense_client', '');
   const theme = themes[themeId] || themes.terang;
-  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content, siteAvatar, metaDesc: opts.metaDesc || '', navbar: navbarId });
+  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content, siteAvatar, metaDesc: opts.metaDesc || '', navbar: navbarId, adsenseClient });
 }
