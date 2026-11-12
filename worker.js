@@ -672,7 +672,7 @@ async function handleFetch(request, env) {
       } catch (e) { return csJson({ ok: false, error: 'payload bukan JSON' }, 400); }
       const bad = (msg) => csJson({ ok: false, error: msg }, 400);
       const GENRES = ['Drama Keluarga', 'Romansa', 'Horor', 'Komedi', 'Fantasi', 'Misteri', 'Slice of Life', 'Sci-Fi', 'Petualangan', 'Thriller'];
-      const KINDS = ['cerpen', 'season', 'edit', 'delete', 'komik'];
+      const KINDS = ['cerpen', 'season', 'edit', 'delete', 'komik', 'komik-episode'];
       const normTitle = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]/g, '');
       const isId = (v) => typeof v === 'string' && /^[a-z0-9-]{3,64}$/.test(v);
       const isTitle = (v) => typeof v === 'string' && v.trim().length >= 3 && v.length <= 120;
@@ -734,6 +734,16 @@ async function handleFetch(request, env) {
           }
         }
         targetId = data.id; title = data.judul;
+      } else if (kind === 'komik-episode') {
+        if (!isId(data.id)) return bad('id tidak valid');
+        if (!Number.isInteger(data.no) || data.no < 1 || data.no > 9999) return bad('no tidak valid');
+        if (typeof data.judul !== 'string' || data.judul.trim().length < 1 || data.judul.length > 200) return bad('judul tidak valid');
+        if (!Array.isArray(data.panels) || data.panels.length !== 5) return bad('panels tidak valid');
+        for (const p of data.panels) {
+          if (!p || typeof p !== 'object' || typeof p.teks !== 'string' || p.teks.length < 10 || p.teks.length > 500) return bad('teks panel tidak valid');
+          if (typeof p.image_prompt !== 'string' || p.image_prompt.length < 10 || p.image_prompt.length > 500) return bad('image_prompt panel tidak valid');
+        }
+        targetId = data.id; title = data.judul;
       }
       const dup = (reason) => csJson({ ok: false, error: 'duplikat', reason }, 409);
       const dedupHash = await sha256Hex(JSON.stringify(data));
@@ -757,6 +767,11 @@ async function handleFetch(request, env) {
           if (!s) return dup('target_missing');
           const pend = await env.BACKUP_DB.prepare(`SELECT id FROM cerpen_submissions WHERE kind = 'delete' AND target_id = ? AND status = 'pending'`).bind(targetId).first();
           if (pend) return dup('delete_pending');
+        } else if (kind === 'komik-episode') {
+          const k = await env.BACKUP_DB.prepare(`SELECT id FROM cerpen_komik WHERE id = ?`).bind(targetId).first();
+          if (!k) return dup('target_missing');
+          const ex = await env.BACKUP_DB.prepare(`SELECT komik_id FROM cerpen_komik_episodes WHERE komik_id = ? AND no = ?`).bind(targetId, data.no).first();
+          if (ex) return dup('episode_exists');
         }
         if ((kind === 'cerpen' || kind === 'komik') && title && normTitle(title)) {
           const nt = normTitle(title);
