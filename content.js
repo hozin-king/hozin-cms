@@ -30,11 +30,14 @@ export function adBanner(adImage, adLink, adText, adsenseClient = '', adsenseSlo
   const manual = (img && link) ? `<div class="card" style="text-align:center"><p class="meta">Iklan</p><a href="${esc(link)}" target="_blank" rel="sponsored noopener"><img src="${esc(img)}" alt="${esc(adText || 'Iklan')}" loading="lazy" style="max-width:100%;height:auto;border-radius:12px"></a>${adText ? `<p>${esc(adText)}</p>` : ''}</div>` : '';
   // AdSense: hanya bila client valid (ca-pub-angka). Slot kosong = unit auto.
   // Iklan AdSense baru tampil setelah Google menyetujui situs; sebelum itu
-  // slot ini bisa kosong — itu perilaku AdSense, bukan bug CMS.
+  // slot ini bisa kosong — itu perilaku AdSense, bukan bug CMS. Bila AdSense
+  // melaporkan unit tidak terisi (data-ad-status="unfilled"), script di bawah
+  // menyembunyikan kotaknya supaya tidak ada kotak "Iklan" kosong raksasa.
+  // Tanpa timeout: iklan yang telat ke-load tidak ikut disembunyikan.
   const client = typeof adsenseClient === 'string' && /^ca-pub-\d+$/.test(adsenseClient.trim()) ? adsenseClient.trim() : '';
   const slot = typeof adsenseSlot === 'string' && /^\d+$/.test(adsenseSlot.trim()) ? adsenseSlot.trim() : '';
   if (!client) return manual;
-  const adsense = `<div class="card" style="text-align:center"><p class="meta">Iklan</p><script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${esc(client)}" crossorigin="anonymous"></script><ins class="adsbygoogle" style="display:block" data-ad-client="${esc(client)}"${slot ? ` data-ad-slot="${esc(slot)}"` : ''} data-ad-format="auto" data-full-width-responsive="true"></ins><script>(adsbygoogle = window.adsbygoogle || []).push({});</script></div>`;
+  const adsense = `<div class="card adsense-box" style="text-align:center"><p class="meta">Iklan</p><script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${esc(client)}" crossorigin="anonymous"></script><ins class="adsbygoogle" style="display:block" data-ad-client="${esc(client)}"${slot ? ` data-ad-slot="${esc(slot)}"` : ''} data-ad-format="auto" data-full-width-responsive="true"></ins><script>(adsbygoogle = window.adsbygoogle || []).push({});</script><script>(function(){function hide(ins){var box=ins.closest('.adsense-box');if(box)box.style.display='none';}document.querySelectorAll('.adsense-box ins.adsbygoogle').forEach(function(ins){if(ins.getAttribute('data-ad-status')==='unfilled')return hide(ins);new MutationObserver(function(m){m.forEach(function(x){if(x.attributeName==='data-ad-status'&&ins.getAttribute('data-ad-status')==='unfilled')hide(ins);});}).observe(ins,{attributes:true,attributeFilter:['data-ad-status']});});})();</script></div>`;
   return adsense + manual;
 }
 
