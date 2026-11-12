@@ -772,6 +772,13 @@ async function handleFetch(request, env) {
           if (!k) return dup('target_missing');
           const ex = await env.BACKUP_DB.prepare(`SELECT komik_id FROM cerpen_komik_episodes WHERE komik_id = ? AND no = ?`).bind(targetId, data.no).first();
           if (ex) return dup('episode_exists');
+          // Episode yang sama sudah ada di antrean pending -> tolak juga,
+          // kalau tidak dua usulan no sama bisa lolos berbarengan (tabel
+          // live baru berisi episode itu setelah approve pertama).
+          const pendRows = await env.BACKUP_DB.prepare(`SELECT payload_json FROM cerpen_submissions WHERE kind = 'komik-episode' AND target_id = ? AND status = 'pending'`).bind(targetId).all();
+          for (const r of (pendRows.results || [])) {
+            try { if (JSON.parse(r.payload_json).no === data.no) return dup('episode_exists'); } catch (e) { /* abaikan payload rusak */ }
+          }
         }
         if ((kind === 'cerpen' || kind === 'komik') && title && normTitle(title)) {
           const nt = normTitle(title);
