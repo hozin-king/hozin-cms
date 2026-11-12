@@ -1887,7 +1887,7 @@ function slerp(a,b,t){
   return [Math.asin(Math.max(-1,Math.min(1,z)))*180/Math.PI, Math.atan2(y,x)*180/Math.PI];
 }
 function draw(now){
-  ROT+=0.0025;
+  ROT+=0.001;
   ctx.clearRect(0,0,W,H);
   var g=ctx.createRadialGradient(CX-R*0.3,CY-R*0.4,R*0.1,CX,CY,R);
   g.addColorStop(0,'#1e3a5f');g.addColorStop(0.7,'#0b1e33');g.addColorStop(1,'#060d18');
