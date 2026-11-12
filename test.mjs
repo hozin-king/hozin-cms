@@ -1150,8 +1150,9 @@ r = await call('GET', '/uptime'); t = await r.text();
 assert(r.status === 200 && t.includes('Status Situs') && t.includes('Online sejak 1 Januari 2024'), '/uptime: halaman status tampil');
 // v74: grafik kunjungan 30 hari + globe serangan (data fixture security_events)
 assert(t.includes('Kunjungan tercatat') && t.includes('attack-globe') && t.includes('"c":"US"') && t.includes('"c":"CN"') && t.includes('login admin gagal'), '/uptime: grafik kunjungan + globe serangan tampil (data fixture)');
-// v75: globe baca feed serangan global dari jsDelivr (repo news-getter)
-assert(t.includes('id="feed-status"') && t.includes('SANS DShield'), '/uptime: status feed serangan global tampil');
+// v76: globe interaktif — seret untuk putar, warna busur per negara, ketuk titik untuk detail
+assert(t.includes('id="globe-detail"') && t.includes('Ketuk titik') && t.includes('Seret globe'), '/uptime: globe interaktif (seret + ketuk detail)');
+assert(t.includes('"col":"#') && t.includes('pointerdown'), '/uptime: warna busur per negara (drag + warna)');
 r = await callJson('GET', '/api/hacklab/lessons', null);
 let j = await r.json();
 assert(r.status === 200 && Array.isArray(j.lessons) && j.lessons.length === 0, 'hacklab: katalog pelajaran kosong di mock');

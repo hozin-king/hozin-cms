@@ -1808,6 +1808,11 @@ async function handleFetch(request, env) {
           return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0"><span style="min-width:92px;font-size:13px">${d}</span>${bar}<span style="font-size:13px"><b>${n}</b></span></div>`;
         }).join('');
       } catch (e) { dayChart = '<p class="meta">Grafik kunjungan tidak bisa dimuat saat ini.</p>'; }
+      // Warna busur per negara penyerang: 12 warna beda, ditentukan dari
+      // kode negara (deterministik — negara yang sama selalu warna sama,
+      // di globe maupun di daftar).
+      const GLOBE_PALETTE = ['#f97316', '#eab308', '#22c55e', '#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899', '#ef4444', '#84cc16', '#14b8a6', '#f59e0b', '#d946ef'];
+      const globeColor = (code) => GLOBE_PALETTE[((code.charCodeAt(0) || 0) * 31 + (code.charCodeAt(1) || 0)) % GLOBE_PALETTE.length];
       // Globe serangan: agregat 30 hari dari security_events (tanpa IP).
       let globeData = [];
       let globeTotal = 0;
@@ -1824,7 +1829,7 @@ async function handleFetch(request, env) {
           cur.kinds[k] = (cur.kinds[k] || 0) + 1;
           byCountry.set(c, cur);
         }
-        globeData = [...byCountry.values()].sort((a, b) => b.n - a.n).slice(0, 20);
+        globeData = [...byCountry.values()].sort((a, b) => b.n - a.n).slice(0, 20).map(g => ({ ...g, kind: 'local', col: globeColor(g.c), lbl: Object.entries(g.kinds).map(([k, v]) => `${SEC_KIND_LABEL[k] || k} ${v}`).join(', ') }));
       } catch (e) { globeData = []; globeTotal = 0; }
       const globeJson = JSON.stringify(globeData).replace(/</g, '\\u003c');
       // Feed serangan global: diambil SERVER-SIDE (sekali, cache edge
@@ -1839,7 +1844,7 @@ async function handleFetch(request, env) {
         if (fr.ok) {
           const fj = await fr.json();
           if (fj && Array.isArray(fj.countries) && fj.countries.length) {
-            feedData = fj.countries.slice(0, 20);
+            feedData = fj.countries.slice(0, 20).map(c => ({ ...c, kind: 'feed', col: globeColor(c.c) }));
             const top5 = feedData.slice(0, 5).map(c => `${c.c} ${Number(c.n || 0).toLocaleString('en-US')}`).join(', ');
             feedStatus = `Serangan global (SANS DShield, diperbarui ${fj.generated_at || '?'}): ${top5}${fj.total_reports_today ? ' — ' + Number(fj.total_reports_today).toLocaleString('en-US') + ' laporan hari ini' : ''}`;
           }
@@ -1847,14 +1852,18 @@ async function handleFetch(request, env) {
       } catch (e) { /* feed gagal: tetap tampilkan data lokal */ }
       const feedJson = JSON.stringify(feedData).replace(/</g, '\\u003c');
       const globeList = globeData.length
-        ? globeData.map(g => `<li>${esc(g.c)} — <b>${g.n}</b> (${Object.entries(g.kinds).map(([k, v]) => esc(SEC_KIND_LABEL[k] || k) + ' ' + v).join(', ')})</li>`).join('')
+        ? globeData.map(g => `<li><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${g.col}"></span> ${esc(g.c)} — <b>${g.n}</b> (${esc(g.lbl)}) → hozinking.my.id</li>`).join('')
         : '<li>Belum ada aktivitas yang diblokir dalam 30 hari terakhir.</li>';
+      const feedListHtml = feedData.length
+        ? `<h3 style="margin:16px 0 6px;font-size:15px">Serangan global per negara</h3><ul style="margin:0;padding-left:20px">${feedData.map(c => `<li><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${c.col}"></span> ${esc(c.c)} — <b>${Number(c.n || 0).toLocaleString('en-US')}</b> laporan dari ${Number(c.ips || 0).toLocaleString('en-US')} IP → hozinking.my.id</li>`).join('')}</ul>`
+        : '';
       const globeNote = globeTotal > 0
         ? `${globeTotal} aktivitas diblokir dalam 30 hari terakhir (hanya negara/kota kasar yang dicatat, tanpa alamat IP).`
         : 'Globe terisi otomatis setiap ada percobaan login gagal, spam, atau token keamanan tidak valid yang diblokir — tidak ada data yang dibuat-buat.';
       // Globe 3D kanvas murni (tanpa library/CDN): proyeksi ortografik,
-      // berputar pelan, titik merah per negara asal + busur oranye menuju
-      // situs. Negara yang tidak ada di tabel GEO tetap tampil di daftar.
+      // bisa diseret untuk memutar (pointer events), titik + busur
+      // berwarna per negara asal, ketuk titik untuk detail serangan.
+      // Negara yang tidak ada di tabel GEO tetap tampil di daftar.
       const globeScript = `
 var DATA = ${globeJson};
 var GEO = {US:[39,-98],CN:[35,104],RU:[61,90],IN:[21,78],BR:[-10,-55],VN:[14,108],ID:[-2,118],DE:[51,10],FR:[47,2],GB:[54,-2],NL:[52,5],TR:[39,35],IR:[32,54],SG:[1,104],JP:[36,138],KR:[36,128],UA:[49,32],PL:[52,19],RO:[46,25],BG:[43,25],TH:[16,101],MY:[4,102],PH:[13,122],PK:[30,70],BD:[24,91],EG:[27,30],NG:[9,8],ZA:[-29,25],MX:[23,-102],AR:[-35,-65],CL:[-33,-71],CO:[4,-74],PE:[-10,-76],CA:[56,-106],AU:[-25,133],NZ:[-42,174],SE:[62,15],NO:[64,11],FI:[64,26],DK:[56,10],CH:[47,8],AT:[48,14],BE:[51,4],IE:[53,-8],PT:[39,-8],ES:[40,-4],IT:[43,12],GR:[39,22],CZ:[50,15],HU:[47,19],IL:[31,35],SA:[25,45],AE:[24,54],KZ:[48,68],TW:[24,121],HK:[22,114]};
@@ -1862,7 +1871,9 @@ var GEO = {US:[39,-98],CN:[35,104],RU:[61,90],IN:[21,78],BR:[-10,-55],VN:[14,108
 var cv=document.getElementById('attack-globe');
 if(!cv||!cv.getContext)return;
 var ctx=cv.getContext('2d');
-var W=0,H=300,R=0,CX=0,CY=150,ROT=-1.864;
+var W=0,H=300,R=0,CX=0,CY=150,ROT=-1.864,TILT=0;
+var dots=[];
+var dragging=false,lastX=0,lastY=0,moved=0,lastInteract=0;
 var TARGET=[-6.2,106.8];
 function size(){
   var dpr=window.devicePixelRatio||1;
@@ -1874,7 +1885,10 @@ function size(){
 }
 function proj(lat,lon){
   var p=lat*Math.PI/180, l=(lon+ROT)*Math.PI/180;
-  return {x:CX+R*Math.cos(p)*Math.sin(l), y:CY-R*Math.sin(p), z:Math.cos(p)*Math.cos(l)};
+  var x=Math.cos(p)*Math.sin(l), y=Math.sin(p), z=Math.cos(p)*Math.cos(l);
+  var ct=Math.cos(TILT), st=Math.sin(TILT);
+  var y2=y*ct-z*st, z2=y*st+z*ct;
+  return {x:CX+R*x, y:CY-R*y2, z:z2};
 }
 function slerp(a,b,t){
   var va=[Math.cos(a[0]*Math.PI/180)*Math.cos(a[1]*Math.PI/180), Math.cos(a[0]*Math.PI/180)*Math.sin(a[1]*Math.PI/180), Math.sin(a[0]*Math.PI/180)];
@@ -1887,8 +1901,9 @@ function slerp(a,b,t){
   return [Math.asin(Math.max(-1,Math.min(1,z)))*180/Math.PI, Math.atan2(y,x)*180/Math.PI];
 }
 function draw(now){
-  ROT+=0.001;
+  if(!dragging && now-lastInteract>2500)ROT+=0.001;
   ctx.clearRect(0,0,W,H);
+  dots=[];
   var g=ctx.createRadialGradient(CX-R*0.3,CY-R*0.4,R*0.1,CX,CY,R);
   g.addColorStop(0,'#1e3a5f');g.addColorStop(0.7,'#0b1e33');g.addColorStop(1,'#060d18');
   ctx.beginPath();ctx.arc(CX,CY,R,0,Math.PI*2);ctx.fillStyle=g;ctx.fill();
@@ -1919,21 +1934,24 @@ function draw(now){
     ctx.fillStyle='#22c55e';ctx.fill();
     ctx.font='12px sans-serif';ctx.fillStyle='#86efac';
     ctx.fillText('HOZINKING.MY.ID',tp.x+8,tp.y+4);
+    dots.push({target:true,x:tp.x,y:tp.y});
   }
-  drawSet(DATA,'rgba(239,68,68,0.9)','rgba(239,68,68,0.75)','#fca5a5',0,now);
-  drawSet(FEED,'rgba(249,115,22,0.9)','rgba(249,115,22,0.75)','#fdba74',0.5,now);
+  drawSet(DATA,0,now);
+  drawSet(FEED,0.5,now);
   requestAnimationFrame(draw);
 }
-function drawSet(list,dot,arc,packet,off,now){
+function drawSet(list,off,now){
   list.forEach(function(d,idx){
     var geo=GEO[d.c];if(!geo)return;
     var p=proj(geo[0],geo[1]);
     if(p.z<-0.05)return;
+    var col=d.col||'#f97316';
     var r=3+Math.min(6,Math.log10(d.n+1));
+    dots.push({c:d.c,n:d.n,ips:d.ips||0,x:p.x,y:p.y,col:col,kind:d.kind||'feed',lbl:d.lbl||''});
     ctx.beginPath();ctx.arc(p.x,p.y,r+2*Math.sin(now/300+idx),0,Math.PI*2);
-    ctx.fillStyle=dot;ctx.fill();
+    ctx.fillStyle=col;ctx.fill();
     ctx.beginPath();ctx.arc(p.x,p.y,r+6,0,Math.PI*2);
-    ctx.strokeStyle=dot;ctx.stroke();
+    ctx.strokeStyle=col;ctx.stroke();
     ctx.beginPath();
     var pen=false;
     for(var t=0;t<=1.001;t+=0.05){
@@ -1944,23 +1962,63 @@ function drawSet(list,dot,arc,packet,off,now){
       var mx=CX+(mp.x-CX)*(rr/R), my=CY+(mp.y-CY)*(rr/R);
       if(!pen){ctx.moveTo(mx,my);pen=true;}else{ctx.lineTo(mx,my);}
     }
-    ctx.strokeStyle=arc;ctx.lineWidth=1.5;ctx.stroke();
+    ctx.globalAlpha=0.8;ctx.strokeStyle=col;ctx.lineWidth=1.5;ctx.stroke();ctx.globalAlpha=1;
     var pt=(now/2200+idx*0.17+off)%1;
     var mid2=slerp(geo,TARGET,pt);
     var mp2=proj(mid2[0],mid2[1]);
     if(mp2.z>-0.05){
       var rr2=R*(1+0.35*Math.sin(Math.PI*pt));
       var px=CX+(mp2.x-CX)*(rr2/R), py=CY+(mp2.y-CY)*(rr2/R);
-      ctx.beginPath();ctx.arc(px,py,2.5,0,Math.PI*2);ctx.fillStyle=packet;ctx.fill();
+      ctx.beginPath();ctx.arc(px,py,2.5,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();
     }
   });
 }
+function tapAt(e){
+  var r=cv.getBoundingClientRect();
+  var x=e.clientX-r.left, y=e.clientY-r.top;
+  var best=null,bd=26;
+  dots.forEach(function(d){
+    var dd=Math.hypot(d.x-x,d.y-y);
+    if(dd<bd){bd=dd;best=d;}
+  });
+  var el=document.getElementById('globe-detail');
+  if(!el)return;
+  if(!best){el.textContent='Ketuk titik di globe untuk melihat detail serangan.';return;}
+  if(best.target){el.textContent='Tujuan: hozinking.my.id (Indonesia) — semua busur di globe ini menuju ke sini.';return;}
+  if(best.kind==='feed'){
+    el.textContent=best.c+' → hozinking.my.id: '+best.n.toLocaleString('en-US')+' laporan serangan dari '+best.ips.toLocaleString('en-US')+' IP hari ini (SANS DShield).';
+  }else{
+    el.textContent=best.c+' → hozinking.my.id: '+best.n+' percobaan diblokir dalam 30 hari terakhir ('+best.lbl+').';
+  }
+}
+cv.style.touchAction='none';cv.style.cursor='grab';
+cv.addEventListener('pointerdown',function(e){
+  dragging=true;moved=0;lastX=e.clientX;lastY=e.clientY;
+  lastInteract=performance.now();
+  try{cv.setPointerCapture(e.pointerId);}catch(_){}
+  cv.style.cursor='grabbing';
+});
+cv.addEventListener('pointermove',function(e){
+  if(!dragging)return;
+  var dx=e.clientX-lastX, dy=e.clientY-lastY;
+  lastX=e.clientX;lastY=e.clientY;moved+=Math.abs(dx)+Math.abs(dy);
+  ROT+=dx*0.005;TILT=Math.max(-1,Math.min(1,TILT+dy*0.004));
+  lastInteract=performance.now();
+});
+function endDrag(e){
+  if(!dragging)return;
+  dragging=false;cv.style.cursor='grab';
+  lastInteract=performance.now();
+  if(moved<6)tapAt(e);
+}
+cv.addEventListener('pointerup',endDrag);
+cv.addEventListener('pointercancel',endDrag);
 var FEED = ${feedJson};
 size();
 window.addEventListener('resize',size);
 requestAnimationFrame(draw);
 })();`;
-      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Titik oranye = serangan global dari SANS DShield (diperbarui tiap jam). Titik merah = percobaan yang diblokir di situs ini dalam 30 hari terakhir. Keduanya dari negara asalnya menuju situs ini.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">${esc(feedStatus)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul></div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
+      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Seret globe untuk memutar. Ketuk titik untuk melihat detail serangan. Warna busur = negara penyerang (tiap negara warnanya beda). Semua busur menuju hozinking.my.id.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">${esc(feedStatus)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><p class="meta" id="globe-detail">Ketuk titik di globe untuk melihat detail serangan.</p><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul>${feedListHtml}</div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
       return html(await renderPage(env, 'Status Situs', content), 200);
     }
 
