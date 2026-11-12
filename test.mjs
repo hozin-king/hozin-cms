@@ -1540,4 +1540,11 @@ assert(!renderMarkdown('<script>alert(1)</script>').includes('<script>'), 'md-re
 assert(renderMarkdown('[klik](javascript:alert(1))').includes('klik') && !renderMarkdown('[klik](javascript:alert(1))').includes('javascript:'), 'md-render: link javascript tidak dirender sebagai <a>');
 assert(renderMarkdown('```js\nconst a = 1;\n```').includes('<pre><code>const a = 1;'), 'md-render: code block berpagar');
 assert(renderMarkdown('snake_case tetap').includes('snake_case') && !renderMarkdown('snake_case tetap').includes('<em>'), 'md-render: snake_case tidak jadi miring');
+// 43. Layout mobile panel admin (v70, 12 Nov 2026): baris .adm-row
+// membungkus (flex-wrap) supaya di layar ~360px teks tidak pecah per
+// karakter dan tombol tidak menutupi teks.
+r = await call('GET', '/kendali/cerpen-api', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('.adm-row{display:flex;flex-wrap:wrap') && t.includes('.adm-row-body{flex:1 1 220px') && t.includes('.adm-row-title{') && t.includes('overflow-wrap:break-word'), 'layout-mobile: CSS baris admin membungkus + judul patah di batas kata');
+r = await call('GET', '/kendali/md-backup', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('.adm-row{display:flex;flex-wrap:wrap') && t.includes('white-space:nowrap'), 'layout-mobile: halaman md-backup memakai CSS baris yang sama');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
