@@ -1901,15 +1901,20 @@ function draw(now){
     ctx.font='12px sans-serif';ctx.fillStyle='#86efac';
     ctx.fillText('HOZINKING.MY.ID',tp.x+8,tp.y+4);
   }
-  DATA.forEach(function(d,idx){
+  drawSet(DATA,'rgba(239,68,68,0.9)','rgba(239,68,68,0.75)','#fca5a5',0,now);
+  drawSet(FEED,'rgba(249,115,22,0.9)','rgba(249,115,22,0.75)','#fdba74',0.5,now);
+  requestAnimationFrame(draw);
+}
+function drawSet(list,dot,arc,packet,off,now){
+  list.forEach(function(d,idx){
     var geo=GEO[d.c];if(!geo)return;
     var p=proj(geo[0],geo[1]);
     if(p.z<-0.05)return;
-    var r=3+Math.min(d.n,6);
+    var r=3+Math.min(6,Math.log10(d.n+1));
     ctx.beginPath();ctx.arc(p.x,p.y,r+2*Math.sin(now/300+idx),0,Math.PI*2);
-    ctx.fillStyle='rgba(239,68,68,0.9)';ctx.fill();
+    ctx.fillStyle=dot;ctx.fill();
     ctx.beginPath();ctx.arc(p.x,p.y,r+6,0,Math.PI*2);
-    ctx.strokeStyle='rgba(239,68,68,0.35)';ctx.stroke();
+    ctx.strokeStyle=dot;ctx.stroke();
     ctx.beginPath();
     var pen=false;
     for(var t=0;t<=1.001;t+=0.05){
@@ -1920,23 +1925,36 @@ function draw(now){
       var mx=CX+(mp.x-CX)*(rr/R), my=CY+(mp.y-CY)*(rr/R);
       if(!pen){ctx.moveTo(mx,my);pen=true;}else{ctx.lineTo(mx,my);}
     }
-    ctx.strokeStyle='rgba(249,115,22,0.75)';ctx.lineWidth=1.5;ctx.stroke();
-    var pt=(now/2200+idx*0.17)%1;
+    ctx.strokeStyle=arc;ctx.lineWidth=1.5;ctx.stroke();
+    var pt=(now/2200+idx*0.17+off)%1;
     var mid2=slerp(geo,TARGET,pt);
     var mp2=proj(mid2[0],mid2[1]);
     if(mp2.z>-0.05){
       var rr2=R*(1+0.35*Math.sin(Math.PI*pt));
       var px=CX+(mp2.x-CX)*(rr2/R), py=CY+(mp2.y-CY)*(rr2/R);
-      ctx.beginPath();ctx.arc(px,py,2.5,0,Math.PI*2);ctx.fillStyle='#fdba74';ctx.fill();
+      ctx.beginPath();ctx.arc(px,py,2.5,0,Math.PI*2);ctx.fillStyle=packet;ctx.fill();
     }
   });
-  requestAnimationFrame(draw);
 }
+var FEED=[];
+var FEED_URL='https://cdn.jsdelivr.net/gh/hozin-king/hozin-news-getter@main/data/attacks.json';
+fetch(FEED_URL).then(function(r){return r.json();}).then(function(j){
+  if(!j||!j.countries||!j.countries.length)return;
+  FEED=j.countries;
+  var el=document.getElementById('feed-status');
+  if(el){
+    var top=j.countries.slice(0,5).map(function(c){return c.c+' '+c.n.toLocaleString('en-US');}).join(', ');
+    el.textContent='Serangan global (SANS DShield, diperbarui '+(j.generated_at||'?')+'): '+top+(j.total_reports_today?' — '+j.total_reports_today.toLocaleString('en-US')+' laporan hari ini':'');
+  }
+}).catch(function(){
+  var el=document.getElementById('feed-status');
+  if(el){el.textContent='Feed serangan global belum tersedia — globe menampilkan data blokir situs ini saja.';}
+});
 size();
 window.addEventListener('resize',size);
 requestAnimationFrame(draw);
 })();`;
-      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Percobaan yang diblokir dalam 30 hari terakhir, dari negara asalnya menuju situs ini.</p><p class="meta">${esc(globeNote)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul></div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
+      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Percobaan yang diblokir dalam 30 hari terakhir, dari negara asalnya menuju situs ini.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">Feed serangan global belum tersedia — globe menampilkan data blokir situs ini saja.</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul></div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
       return html(await renderPage(env, 'Status Situs', content), 200);
     }
 
