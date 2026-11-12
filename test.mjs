@@ -50,6 +50,9 @@ class MockDB {
       { id: 'sub-cccccccccccc', key_id: 'key-11111111', kind: 'komik', target_id: 'komik-99', title: 'Komik Uji Rejected', dedup_hash: 'h3', payload_json: '{"kind":"komik","id":"komik-99"}', status: 'rejected', created_at: nowT - 600 * 1000, reviewed_at: nowT - 500 * 1000, review_note: 'tidak lolos' },
     ];
     this.cerpenAdminAudit = [];
+    // v67: fixture share link Cerpen (tabel cerpen_share_links + cerpen_share_opens)
+    this.cerpenShareLinks = [];
+    this.cerpenShareOpens = [];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { this.batchCalls = (this.batchCalls || 0) + 1; for (const s of stmts) await s.run(); }
@@ -335,6 +338,46 @@ class MockDB {
     if (s.startsWith('DELETE FROM dracin_catalog')) { this.dracinCatalog = this.dracinCatalog.filter(t => !(t.platform === a[0] && t.title_id === a[1])); return []; }
     if (s.startsWith('DELETE FROM dracin_seeds')) { this.dracinSeeds = this.dracinSeeds.filter(x => !(x.platform === a[0] && x.query === a[1])); return []; }
     if (s.startsWith('INSERT INTO cms_backup_dracin_')) { this.backupDracin = (this.backupDracin || 0) + 1; return []; }
+    // v67: pola SQL share link Cerpen (/api/share/*, /s/*, /api/admin/cerpen-shares*, panel)
+    if (s.startsWith('SELECT id, judul, genre, deskripsi FROM cerpen_series WHERE id = ?')) return this.cerpenSeries.filter(x => x.id === a[0]);
+    if (s.startsWith('SELECT judul FROM cerpen_episodes WHERE series_id = ? AND season = ? AND no = ?')) return this.cerpenEpisodes.filter(e => e.series_id === a[0] && e.season === a[1] && e.no === a[2]).map(e => ({ judul: e.judul }));
+    if (s.startsWith('SELECT id, judul, genre, deskripsi FROM cerpen_komik WHERE id = ?')) return this.cerpenKomik.filter(x => x.id === a[0]);
+    if (s.startsWith('SELECT judul FROM cerpen_komik_episodes WHERE komik_id = ? AND no = ?')) return this.cerpenKomikEpisodes.filter(e => e.komik_id === a[0] && e.no === a[1]).map(e => ({ judul: e.judul }));
+    if (s.startsWith('SELECT id, title, summary, topic FROM cerpen_news WHERE id = ?')) return this.cerpenNews.filter(x => x.id === a[0]);
+    if (s.startsWith('INSERT INTO cerpen_share_links')) { this.cerpenShareLinks.push({ id: a[0], content_type: a[1], content_id: a[2], season: a[3], episode_no: a[4], created_at: a[5], sharer_ip: a[6], sharer_country: a[7], sharer_city: a[8], sharer_device: a[9], revoked: 0, opens_count: 0 }); return []; }
+    if (s.startsWith('INSERT INTO cerpen_share_opens')) { this.cerpenShareOpens.push({ id: a[0], share_id: a[1], opened_at: a[2], ip: a[3], country: a[4], city: a[5], device: a[6], user_agent: a[7], via: a[8] }); return []; }
+    if (s.startsWith('UPDATE cerpen_share_links SET opens_count = opens_count + 1')) { const x = this.cerpenShareLinks.find(v => v.id === a[0]); if (x) x.opens_count = (Number(x.opens_count) || 0) + 1; return []; }
+    if (s.startsWith('UPDATE cerpen_share_links SET revoked = ?')) { const x = this.cerpenShareLinks.find(v => v.id === a[1]); if (x) x.revoked = a[0]; return []; }
+    if (s === 'SELECT COUNT(*) AS c FROM cerpen_share_links') return [{ c: this.cerpenShareLinks.length }];
+    if (s.startsWith('SELECT COALESCE(SUM(opens_count), 0) AS c FROM cerpen_share_links')) return [{ c: this.cerpenShareLinks.reduce((t, x) => t + (Number(x.opens_count) || 0), 0) }];
+    if (s.startsWith('SELECT id, content_type, content_id, season, episode_no, revoked FROM cerpen_share_links WHERE id = ?')) return this.cerpenShareLinks.filter(x => x.id === a[0]);
+    if (s.startsWith('SELECT id FROM cerpen_share_links WHERE id = ?')) return this.cerpenShareLinks.filter(x => x.id === a[0]).map(x => ({ id: x.id }));
+    if (s.startsWith('SELECT id, content_type, content_id, season, episode_no, created_at, sharer_ip, sharer_country, sharer_city, sharer_device, revoked, opens_count FROM cerpen_share_links WHERE id = ?')) return this.cerpenShareLinks.filter(x => x.id === a[0]);
+    if (s.startsWith('SELECT id, content_type, content_id, season, episode_no, created_at, sharer_country, sharer_city, sharer_device, revoked, opens_count FROM cerpen_share_links WHERE 1 = 1')) {
+      let rows = [...this.cerpenShareLinks];
+      let i = 0;
+      if (s.includes('AND content_type = ?')) { const v = a[i++]; rows = rows.filter(x => x.content_type === v); }
+      if (s.includes('AND revoked = ?')) { const v = a[i++]; rows = rows.filter(x => Number(x.revoked) === v); }
+      const limit = a[i];
+      rows.sort((x, y) => y.created_at - x.created_at);
+      return rows.slice(0, limit);
+    }
+    if (s.startsWith('SELECT id, content_type, content_id, season, episode_no, created_at, sharer_country, sharer_city, sharer_device, revoked, opens_count FROM cerpen_share_links ORDER BY created_at DESC LIMIT 50')) return [...this.cerpenShareLinks].sort((x, y) => y.created_at - x.created_at).slice(0, 50);
+    if (s.startsWith('SELECT content_type, content_id, COUNT(*) AS c, SUM(opens_count) AS opens FROM cerpen_share_links GROUP BY content_type, content_id ORDER BY c DESC LIMIT 10')) {
+      const map = new Map();
+      for (const x of this.cerpenShareLinks) {
+        const k = x.content_type + '|' + x.content_id;
+        const e = map.get(k) || { content_type: x.content_type, content_id: x.content_id, c: 0, opens: 0 };
+        e.c++; e.opens += Number(x.opens_count) || 0;
+        map.set(k, e);
+      }
+      return [...map.values()].sort((x, y) => y.c - x.c).slice(0, 10);
+    }
+    if (s.startsWith('SELECT id, share_id, opened_at, ip, country, city, device, user_agent, via FROM cerpen_share_opens WHERE share_id = ?')) return this.cerpenShareOpens.filter(o => o.share_id === a[0]).sort((x, y) => y.opened_at - x.opened_at).slice(0, 50);
+    if (s.startsWith('SELECT o.id, o.share_id, o.opened_at, o.country, o.city, o.device, o.via, l.content_type, l.content_id FROM cerpen_share_opens o JOIN cerpen_share_links l ON l.id = o.share_id ORDER BY o.opened_at DESC LIMIT 20')) {
+      const byId = new Map(this.cerpenShareLinks.map(x => [x.id, x]));
+      return this.cerpenShareOpens.map(o => ({ ...o, content_type: (byId.get(o.share_id) || {}).content_type, content_id: (byId.get(o.share_id) || {}).content_id })).sort((x, y) => y.opened_at - x.opened_at).slice(0, 20);
+    }
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -1218,4 +1261,98 @@ r = await call('GET', '/kendali/cerpen-api'); assert(r.status === 303 && (r.head
 r = await call('GET', '/kendali/cerpen-api', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('Cerpen API') && t.includes('Cerpen Uji Pending') && t.includes('key-be663fc2') && t.includes('Riwayat admin'), 'cerpen-admin: halaman panel tampil (statistik + keys + submissions + audit)');
 assert(t.includes('href="/kendali/cerpen-api"'), 'cerpen-admin: panel masuk nav admin');
+// 40. Share link Cerpen (v67, 12 Nov 2026): assetlinks + token AES-GCM +
+// landing + resolve + admin revoke/unrevoke + rate limit.
+r = await call('GET', '/.well-known/assetlinks.json'); t = await r.text();
+assert(r.status === 200 && (r.headers.get('content-type') || '').includes('application/json'), 'share: assetlinks.json 200 + content-type JSON');
+const assetlinks = JSON.parse(t);
+assert(Array.isArray(assetlinks) && assetlinks.length === 1 && assetlinks[0].relation[0] === 'delegate_permission/common.handle_all_urls' && assetlinks[0].target.namespace === 'android_app' && assetlinks[0].target.package_name === 'com.hozinking.cerpen' && assetlinks[0].target.sha256_cert_fingerprints[0] === '75ba028f4f9b401b3f414a2b9e63617fa35b503c692c5f6c188e3724a7a01c1d', 'share: assetlinks berisi package + fingerprint rilis yang benar');
+// Tanpa secret -> create fail-closed 503, token apa pun 404
+delete env.SHARE_LINK_KEY;
+r = await callJson('POST', '/api/share/create', { content_type: 'cerpen', content_id: 'cerpen-01' });
+assert(r.status === 503, 'share: tanpa SHARE_LINK_KEY, create ditolak 503 (fail-closed)');
+r = await call('GET', '/s/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'); assert(r.status === 404, 'share: tanpa secret, landing token apa pun 404');
+env.SHARE_LINK_KEY = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64');
+r = await callJson('POST', '/api/share/create', { content_type: 'cerpen', content_id: 'cerpen-tidak-ada' });
+assert(r.status === 404, 'share: create konten tak ada ditolak 404');
+r = await callJson('POST', '/api/share/create', { content_type: 'video', content_id: 'cerpen-01' });
+assert(r.status === 400, 'share: create content_type tidak valid ditolak 400');
+r = await callJson('POST', '/api/share/create', { content_type: 'cerpen', content_id: 'cerpen-01', device: 'POCO X6 Pro' });
+jj = await r.json();
+assert(r.status === 201 && jj.ok && /^https:\/\/hozinking\.my\.id\/s\/[A-Za-z0-9_-]+$/.test(jj.url) && !jj.url.includes('cerpen-01'), 'share: create cerpen-01 -> 201 + URL opaque (tanpa id konten)');
+const shareUrl = jj.url;
+const shareToken = shareUrl.split('/s/')[1];
+const shareRow = env.BACKUP_DB.cerpenShareLinks.find(x => x.content_id === 'cerpen-01' && x.content_type === 'cerpen');
+assert(shareRow && /^shr-[0-9a-f]{16}$/.test(shareRow.id) && Number(shareRow.revoked) === 0 && Number(shareRow.opens_count) === 0, 'share: baris link tersimpan (id shr-*, revoked 0, opens 0)');
+r = await callJson('GET', '/api/share/resolve?token=' + shareToken, null);
+jj = await r.json();
+assert(r.status === 200 && jj.ok && jj.content_type === 'cerpen' && jj.content_id === 'cerpen-01' && jj.season === null && jj.episode_no === null, 'share: resolve token valid -> konten benar');
+assert(env.BACKUP_DB.cerpenShareOpens.length === 1 && env.BACKUP_DB.cerpenShareOpens[0].via === 'app' && env.BACKUP_DB.cerpenShareOpens[0].share_id === shareRow.id, 'share: resolve mencatat pembukaan via=app');
+r = await call('GET', '/s/' + shareToken); t = await r.text();
+assert(r.status === 200 && t.includes('Surat Tanpa Nama') && t.includes('Buka di Aplikasi') && t.includes('intent://hozinking.my.id/s/') && t.includes('package=com.hozinking.cerpen') && t.includes('Download Aplikasi') && t.includes('github.com/hozin-king/cerpen-hozin/releases/latest'), 'share: landing berisi judul + tombol aplikasi (intent) + download');
+assert(Number(env.BACKUP_DB.cerpenShareLinks.find(x => x.id === shareRow.id).opens_count) === 2 && env.BACKUP_DB.cerpenShareOpens.length === 2 && env.BACKUP_DB.cerpenShareOpens[1].via === 'browser', 'share: landing mencatat pembukaan via=browser + opens_count naik');
+// Token rusak / token lain -> 404 (tidak dibedakan)
+const badToken = shareToken.slice(0, -1) + (shareToken.slice(-1) === 'A' ? 'B' : 'A');
+r = await callJson('GET', '/api/share/resolve?token=' + badToken, null); assert(r.status === 404, 'share: resolve token rusak ditolak 404');
+r = await call('GET', '/s/' + badToken); assert(r.status === 404, 'share: landing token rusak ditolak 404');
+r = await callJson('GET', '/api/share/resolve', null); assert(r.status === 404, 'share: resolve tanpa token ditolak 404');
+r = await call('GET', '/s/!!!'); assert(r.status === 404, 'share: landing token karakter tidak valid ditolak 404');
+// Episode spesifik + komik + berita
+r = await callJson('POST', '/api/share/create', { content_type: 'cerpen', content_id: 'cerpen-01', season: 1, episode_no: 2 });
+jj = await r.json();
+assert(r.status === 201 && jj.ok, 'share: create episode spesifik -> 201');
+const epToken = jj.url.split('/s/')[1];
+r = await callJson('GET', '/api/share/resolve?token=' + epToken, null); jj = await r.json();
+assert(r.status === 200 && jj.season === 1 && jj.episode_no === 2, 'share: resolve episode mengembalikan season + episode_no');
+r = await call('GET', '/s/' + epToken); t = await r.text();
+assert(r.status === 200 && t.includes('Yang Tidak Beres'), 'share: landing episode menampilkan judul episode');
+r = await callJson('POST', '/api/share/create', { content_type: 'cerpen', content_id: 'cerpen-01', season: 1, episode_no: 99 });
+assert(r.status === 404, 'share: create episode tak ada ditolak 404');
+r = await callJson('POST', '/api/share/create', { content_type: 'komik', content_id: 'komik-01' });
+assert(r.status === 201, 'share: create komik -> 201');
+r = await callJson('POST', '/api/share/create', { content_type: 'berita', content_id: 'news-1' });
+assert(r.status === 201, 'share: create berita -> 201');
+// Admin: tanpa auth 401, tanpa CSRF 403, daftar + filter + detail
+r = await callJson('GET', '/api/admin/cerpen-shares', null, {}); assert(r.status === 401, 'share-admin: daftar tanpa auth ditolak 401');
+r = await callJson('GET', '/api/admin/cerpen-shares', null, { cookie }); assert(r.status === 403, 'share-admin: daftar tanpa CSRF ditolak 403');
+r = await callJson('GET', '/api/admin/cerpen-shares', null, admH); jj = await r.json();
+assert(r.status === 200 && jj.ok && jj.shares.length === 4 && jj.shares.some(s => s.id === shareRow.id) && Array.isArray(jj.top) && jj.top.some(s => s.content_id === 'cerpen-01'), 'share-admin: daftar 4 link + top shared berisi cerpen-01');
+r = await callJson('GET', '/api/admin/cerpen-shares?content_type=komik', null, admH); jj = await r.json();
+assert(jj.shares.length === 1 && jj.shares[0].content_type === 'komik', 'share-admin: filter content_type=komik');
+r = await callJson('GET', '/api/admin/cerpen-shares?revoked=1', null, admH); jj = await r.json();
+assert(jj.shares.length === 0, 'share-admin: filter revoked=1 kosong sebelum ada yang dicabut');
+r = await callJson('GET', '/api/admin/cerpen-shares?content_type=bogus', null, admH); assert(r.status === 400, 'share-admin: filter content_type tidak valid -> 400');
+r = await callJson('GET', '/api/admin/cerpen-shares/' + shareRow.id, null, admH); jj = await r.json();
+assert(r.status === 200 && jj.share.id === shareRow.id && Array.isArray(jj.opens) && jj.opens.length === 2, 'share-admin: detail link + 2 pembukaan tercatat');
+r = await callJson('GET', '/api/admin/cerpen-shares/shr-0000000000000000', null, admH); assert(r.status === 404, 'share-admin: detail link hilang -> 404');
+r = await callJson('GET', '/api/admin/cerpen-shares/bukan-id', null, admH); assert(r.status === 400, 'share-admin: detail id tidak valid -> 400');
+// Revoke: resolve + landing 404; unrevoke: pulih lagi; audit tercatat
+r = await callJson('POST', '/api/admin/cerpen-shares/' + shareRow.id + '/revoke', {}, admH); jj = await r.json();
+assert(r.status === 200 && jj.revoked === 1, 'share-admin: revoke link');
+assert(env.BACKUP_DB.cerpenAdminAudit.some(a => a.action === 'share_revoke' && a.target_id === shareRow.id), 'share-admin: revoke menulis audit');
+r = await callJson('GET', '/api/share/resolve?token=' + shareToken, null); assert(r.status === 404, 'share: resolve link dicabut ditolak 404');
+r = await call('GET', '/s/' + shareToken); assert(r.status === 404, 'share: landing link dicabut ditolak 404');
+r = await callJson('POST', '/api/admin/cerpen-shares/' + shareRow.id + '/unrevoke', {}, admH); jj = await r.json();
+assert(r.status === 200 && jj.revoked === 0, 'share-admin: unrevoke link');
+r = await callJson('GET', '/api/share/resolve?token=' + shareToken, null); assert(r.status === 200, 'share: resolve pulih setelah unrevoke');
+r = await callJson('POST', '/api/admin/cerpen-shares/shr-0000000000000000/revoke', {}, admH); assert(r.status === 404, 'share-admin: revoke link hilang -> 404');
+// Rate limit: create 20/jam, resolve 30/10 menit
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 20; i++) {
+  r = await callJson('POST', '/api/share/create', { content_type: 'cerpen', content_id: 'cerpen-01' });
+  assert(r.status === 201, 'share: rate-limit create ke-' + (i + 1) + ' dari 20 lolos');
+}
+r = await callJson('POST', '/api/share/create', { content_type: 'cerpen', content_id: 'cerpen-01' });
+assert(r.status === 429, 'share: rate-limit create ke-21 ditolak 429');
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 30; i++) {
+  r = await callJson('GET', '/api/share/resolve?token=' + shareToken, null);
+  assert(r.status === 200, 'share: rate-limit resolve ke-' + (i + 1) + ' dari 30 lolos');
+}
+r = await callJson('GET', '/api/share/resolve?token=' + shareToken, null);
+assert(r.status === 429, 'share: rate-limit resolve ke-31 ditolak 429');
+env.DB.rateLimits = new Map();
+// Halaman panel memuat seksi Share
+r = await call('GET', '/kendali/cerpen-api', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('Share Link') && t.includes('Konten paling sering di-share') && t.includes('Buka terakhir') && t.includes(shareRow.id) && t.includes('data-cerpen-share="revoke"'), 'share-admin: halaman panel memuat seksi Share + tombol cabut');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

@@ -478,6 +478,118 @@ async function getCerpenConfig(env) {
   }
 }
 
+// ---- Share link Cerpen Hozin (v67, 12 Nov 2026) ----
+// URL share terenkripsi: https://hozinking.my.id/s/<token> dengan token =
+// base64url(iv 12 byte + ciphertext AES-256-GCM) atas JSON
+// {share_id, content_type, content_id, season, episode_no}.
+// Kunci WAJIB secret Worker SHARE_LINK_KEY (base64 dari 32 byte acak) —
+// jangan pernah ditulis di kode/repo. Tanpa secret -> semua endpoint
+// share fail-closed (503/404 generik, tanpa bocor). Catatan D1 di
+// cerpen_share_links + cerpen_share_opens (binding BACKUP_DB).
+const SHARE_APP_PACKAGE = 'com.hozinking.cerpen';
+const SHARE_FINGERPRINT = '75ba028f4f9b401b3f414a2b9e63617fa35b503c692c5f6c188e3724a7a01c1d';
+const SHARE_TYPES = ['cerpen', 'komik', 'berita'];
+const SHARE_TYPE_LABEL = { cerpen: 'Cerpen', komik: 'Komik', berita: 'Berita' };
+const SHARE_ID_RE = /^shr-[0-9a-f]{16}$/;
+const SHARE_CONTENT_ID_RE = /^[a-z0-9-]{3,64}$/;
+// Decode base64 (standar maupun url-safe, tanpa padding juga diterima).
+function b64ToBytes(s) {
+  let t = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  while (t.length % 4) t += '=';
+  const bin = atob(t);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+// Kunci AES-GCM dari secret (base64 32 byte). null bila belum diset / rusak.
+async function shareCryptoKey(env) {
+  const raw = env.SHARE_LINK_KEY;
+  if (!raw || typeof raw !== 'string') return null;
+  try {
+    const bytes = b64ToBytes(raw);
+    if (bytes.length !== 32) return null;
+    return await crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  } catch (e) { return null; }
+}
+async function shareEncryptToken(env, payload) {
+  const key = await shareCryptoKey(env);
+  if (!key) return null;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(payload)));
+  const combined = new Uint8Array(12 + ct.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ct), 12);
+  return b64url(combined);
+}
+// Dekripsi + validasi bentuk payload. null untuk token apa pun yang
+// tidak valid (format, auth tag, JSON, maupun isi) — tidak dibedakan.
+async function shareDecryptToken(env, token) {
+  if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{1,512}$/.test(token)) return null;
+  const key = await shareCryptoKey(env);
+  if (!key) return null;
+  try {
+    const bytes = b64ToBytes(token);
+    if (bytes.length < 29) return null; // iv 12 + tag 16 + min 1 byte isi
+    const iv = bytes.slice(0, 12);
+    const ct = bytes.slice(12);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+    const obj = JSON.parse(new TextDecoder().decode(pt));
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+    if (typeof obj.share_id !== 'string' || !SHARE_ID_RE.test(obj.share_id)) return null;
+    if (!SHARE_TYPES.includes(obj.content_type)) return null;
+    if (typeof obj.content_id !== 'string' || !SHARE_CONTENT_ID_RE.test(obj.content_id)) return null;
+    if (obj.season !== null && obj.season !== undefined && (!Number.isInteger(obj.season) || obj.season < 1 || obj.season > 99)) return null;
+    if (obj.episode_no !== null && obj.episode_no !== undefined && (!Number.isInteger(obj.episode_no) || obj.episode_no < 1 || obj.episode_no > 9999)) return null;
+    return { share_id: obj.share_id, content_type: obj.content_type, content_id: obj.content_id, season: obj.season ?? null, episode_no: obj.episode_no ?? null };
+  } catch (e) { return null; }
+}
+// Negara/kota dari request.cf (Cloudflare). Di luar Worker (tes) kosong.
+function cfGeo(request) {
+  const cf = request.cf || {};
+  return { country: String(cf.country || '').slice(0, 8), city: String(cf.city || '').slice(0, 80) };
+}
+// Metadata konten untuk landing share (judul/deskripsi/genre) — null bila
+// konten tidak ada. Episode spesifik (season+no) mengganti judul tampil
+// dengan judul episode itu; bila episode tidak ada -> null (link tak valid).
+async function shareContentMeta(B, contentType, contentId, season, episodeNo) {
+  if (contentType === 'cerpen') {
+    const s = await B.prepare(`SELECT id, judul, genre, deskripsi FROM cerpen_series WHERE id = ?`).bind(contentId).first();
+    if (!s) return null;
+    let title = s.judul;
+    if (season && episodeNo) {
+      const ep = await B.prepare(`SELECT judul FROM cerpen_episodes WHERE series_id = ? AND season = ? AND no = ?`).bind(contentId, season, episodeNo).first();
+      if (!ep) return null;
+      title = ep.judul + ' — ' + s.judul;
+    }
+    return { title, description: s.deskripsi || '', genre: s.genre || '' };
+  }
+  if (contentType === 'komik') {
+    const k = await B.prepare(`SELECT id, judul, genre, deskripsi FROM cerpen_komik WHERE id = ?`).bind(contentId).first();
+    if (!k) return null;
+    let title = k.judul;
+    if (episodeNo) {
+      const ep = await B.prepare(`SELECT judul FROM cerpen_komik_episodes WHERE komik_id = ? AND no = ?`).bind(contentId, episodeNo).first();
+      if (!ep) return null;
+      title = ep.judul + ' — ' + k.judul;
+    }
+    return { title, description: k.deskripsi || '', genre: k.genre || '' };
+  }
+  const n = await B.prepare(`SELECT id, title, summary, topic FROM cerpen_news WHERE id = ?`).bind(contentId).first();
+  if (!n) return null;
+  return { title: n.title, description: n.summary || '', genre: n.topic || '' };
+}
+// Catat satu pembukaan link (browser/app) + naikkan opens_count.
+// Gagal catat tidak menggagalkan penyajian link (fail-silent).
+async function shareLogOpen(B, shareId, request, via) {
+  try {
+    const geo = cfGeo(request);
+    const ua = (request.headers.get('user-agent') || '').slice(0, 500);
+    const device = ua.slice(0, 120);
+    await B.prepare(`INSERT INTO cerpen_share_opens (id, share_id, opened_at, ip, country, city, device, user_agent, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind('opn-' + randomHex(8), shareId, Date.now(), clientIp(request), geo.country, geo.city, device, ua, via).run();
+    await B.prepare(`UPDATE cerpen_share_links SET opens_count = opens_count + 1 WHERE id = ?`).bind(shareId).run();
+  } catch (e) {}
+}
+
 export default {
   // Fallback anti-1101 (insiden 29 Okt 2026 20:28 WIB): bila D1 tidak bisa
   // diakses — mis. kuota baca harian gratis habis — JANGAN lempar exception
@@ -573,6 +685,17 @@ async function handleFetch(request, env) {
         if (/^https:\/\/[^\s"'<>]+$/.test(donateUrl)) bioHtml = BIO_HTML.replace('https://contoh-link-donasi — GANTI DENGAN LINK SAWERIA/TRAKTEER SETELAH AKUN DIBUAT', donateUrl);
       } catch (e) {}
       return new Response(bioHtml, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=300' } });
+    }
+
+    // ---- Android App Links: /.well-known/assetlinks.json (share Cerpen, v67) ----
+    // HARUS di path ini persis, tanpa auth, tanpa redirect, content-type
+    // application/json. Ditempatkan SEBELUM ensureSchema supaya tetap
+    // menjawab walau D1 mati (verifikasi App Links oleh Google tidak
+    // boleh gagal karena kuota D1). Sidik jari dari sertifikat rilis
+    // aplikasi (APK v1.1.19, terverifikasi).
+    if (request.method === 'GET' && path === '/.well-known/assetlinks.json') {
+      const assetlinks = [{ relation: ['delegate_permission/common.handle_all_urls'], target: { namespace: 'android_app', package_name: SHARE_APP_PACKAGE, sha256_cert_fingerprints: [SHARE_FINGERPRINT] } }];
+      return new Response(JSON.stringify(assetlinks), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=3600' } });
     }
 
     await ensureSchema(env);
@@ -802,6 +925,109 @@ async function handleFetch(request, env) {
       return csJson({ ok: true, id: subId, status: 'pending', message: 'Usulan diterima dan menunggu persetujuan Alyaa.' }, 201);
     }
 
+    // ---- Share link Cerpen Hozin (publik, v67, 12 Nov 2026) ----
+    // POST /api/share/create — buat link share terenkripsi untuk satu
+    // konten (cerpen/komik/berita). Rate limit 20/jam/IP. Validasi konten
+    // ADA di D1, kalau tidak -> 404. Secret SHARE_LINK_KEY belum diset ->
+    // 503 fail-closed. Balasan: {ok, url} — token TIDAK PERNAH dicatat
+    // di log/teks lain; URL lengkap hanya ada di balasan ini.
+    if (request.method === 'POST' && path === '/api/share/create') {
+      const shJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!env.BACKUP_DB) return shJson({ ok: false, error: 'database tidak tersedia' }, 503);
+      if (!(await checkRateLimit(env, 'share-create:' + clientIp(request), 20, 3600 * 1000))) return shJson({ ok: false, error: 'terlalu banyak permintaan' }, 429);
+      if (!env.SHARE_LINK_KEY) return shJson({ ok: false, error: 'layanan share tidak tersedia' }, 503);
+      if (Number(request.headers.get('content-length') || '0') > 8192) return shJson({ ok: false, error: 'payload terlalu besar' }, 413);
+      let data = null;
+      try {
+        const text = await request.text();
+        if (text.length > 8192) return shJson({ ok: false, error: 'payload terlalu besar' }, 413);
+        data = JSON.parse(text);
+      } catch (e) { return shJson({ ok: false, error: 'payload bukan JSON' }, 400); }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return shJson({ ok: false, error: 'payload tidak valid' }, 400);
+      const contentType = data.content_type;
+      const contentId = data.content_id;
+      const season = data.season === undefined || data.season === null ? null : data.season;
+      const episodeNo = data.episode_no === undefined || data.episode_no === null ? null : data.episode_no;
+      if (!SHARE_TYPES.includes(contentType)) return shJson({ ok: false, error: 'content_type tidak valid' }, 400);
+      if (typeof contentId !== 'string' || !SHARE_CONTENT_ID_RE.test(contentId)) return shJson({ ok: false, error: 'content_id tidak valid' }, 400);
+      if (season !== null && (!Number.isInteger(season) || season < 1 || season > 99)) return shJson({ ok: false, error: 'season tidak valid' }, 400);
+      if (episodeNo !== null && (!Number.isInteger(episodeNo) || episodeNo < 1 || episodeNo > 9999)) return shJson({ ok: false, error: 'episode_no tidak valid' }, 400);
+      const device = String(data.device || '').trim().slice(0, 80);
+      let meta = null;
+      try {
+        meta = await shareContentMeta(env.BACKUP_DB, contentType, contentId, season, episodeNo);
+      } catch (e) {
+        return shJson({ ok: false, error: 'gagal memeriksa konten' }, 500);
+      }
+      if (!meta) return shJson({ ok: false, error: 'konten tidak ditemukan' }, 404);
+      const shareId = 'shr-' + randomHex(8);
+      const token = await shareEncryptToken(env, { share_id: shareId, content_type: contentType, content_id: contentId, season, episode_no: episodeNo });
+      if (!token) return shJson({ ok: false, error: 'layanan share tidak tersedia' }, 503);
+      try {
+        const geo = cfGeo(request);
+        await env.BACKUP_DB.prepare(`INSERT INTO cerpen_share_links (id, content_type, content_id, season, episode_no, created_at, sharer_ip, sharer_country, sharer_city, sharer_device, revoked, opens_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`).bind(shareId, contentType, contentId, season, episodeNo, Date.now(), clientIp(request), geo.country, geo.city, device || (request.headers.get('user-agent') || '').slice(0, 80)).run();
+      } catch (e) {
+        return shJson({ ok: false, error: 'gagal menyimpan link share' }, 500);
+      }
+      return shJson({ ok: true, url: 'https://hozinking.my.id/s/' + token }, 201);
+    }
+
+    // GET /api/share/resolve?token=... — dipakai aplikasi Cerpen untuk
+    // membuka link share: dekripsi + validasi + catat pembukaan (via=app).
+    // Rate limit 30/10 menit/IP. Token tidak valid / link dicabut -> 404.
+    if (request.method === 'GET' && path === '/api/share/resolve') {
+      const shJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!env.BACKUP_DB) return shJson({ ok: false, error: 'database tidak tersedia' }, 503);
+      if (!(await checkRateLimit(env, 'share-resolve:' + clientIp(request), 30, 10 * 60 * 1000))) return shJson({ ok: false, error: 'terlalu banyak permintaan' }, 429);
+      const payload = await shareDecryptToken(env, url.searchParams.get('token') || '');
+      if (!payload) return shJson({ ok: false, error: 'tidak ditemukan' }, 404);
+      let row = null;
+      try {
+        row = await env.BACKUP_DB.prepare(`SELECT id, content_type, content_id, season, episode_no, revoked FROM cerpen_share_links WHERE id = ?`).bind(payload.share_id).first();
+      } catch (e) {
+        return shJson({ ok: false, error: 'gagal memeriksa link' }, 500);
+      }
+      if (!row || Number(row.revoked) !== 0) return shJson({ ok: false, error: 'tidak ditemukan' }, 404);
+      await shareLogOpen(env.BACKUP_DB, payload.share_id, request, 'app');
+      return shJson({ ok: true, content_type: payload.content_type, content_id: payload.content_id, season: payload.season, episode_no: payload.episode_no });
+    }
+
+    // GET /s/<token> — landing browser untuk link share. Token tidak
+    // valid / link dicabut / konten hilang -> 404 (tanpa bocor alasan).
+    // Pembukaan dicatat (via=browser) + opens_count naik. Halaman arahan
+    // teks saja (tanpa cover — cover adalah file .enc yang tidak bisa
+    // ditampilkan): judul + deskripsi + genre, tombol "Buka di Aplikasi"
+    // (intent://, fallback ke halaman ini) dan "Download Aplikasi".
+    const shareMatch = request.method === 'GET' && path.match(/^\/s\/([A-Za-z0-9_-]{1,512})$/);
+    if (shareMatch) {
+      const token = shareMatch[1];
+      const notFound = async () => html(await renderPage(env, 'Tidak ditemukan', '<div class="card"><p>Link tidak ditemukan atau sudah tidak berlaku.</p><p><a href="/">← Beranda</a></p></div>'), 404);
+      if (!env.BACKUP_DB) return notFound();
+      const payload = await shareDecryptToken(env, token);
+      if (!payload) return notFound();
+      let row = null;
+      try {
+        row = await env.BACKUP_DB.prepare(`SELECT id, content_type, content_id, season, episode_no, revoked FROM cerpen_share_links WHERE id = ?`).bind(payload.share_id).first();
+      } catch (e) {
+        return notFound();
+      }
+      if (!row || Number(row.revoked) !== 0) return notFound();
+      let meta = null;
+      try {
+        meta = await shareContentMeta(env.BACKUP_DB, payload.content_type, payload.content_id, payload.season, payload.episode_no);
+      } catch (e) {
+        return notFound();
+      }
+      if (!meta) return notFound();
+      await shareLogOpen(env.BACKUP_DB, payload.share_id, request, 'browser');
+      const pageUrl = 'https://hozinking.my.id/s/' + token;
+      const intentUrl = 'intent://hozinking.my.id/s/' + token + '#Intent;scheme=https;package=' + SHARE_APP_PACKAGE + ';S.browser_fallback_url=' + encodeURIComponent(pageUrl) + ';end';
+      const typeLabel = SHARE_TYPE_LABEL[payload.content_type] || payload.content_type;
+      const epLabel = payload.episode_no ? ` · Episode ${payload.episode_no}` : (payload.season ? ` · Season ${payload.season}` : '');
+      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:4px 14px;border-radius:999px;background:rgba(59,130,246,.16);color:#3b82f6;font-weight:800;font-size:13px">${esc(typeLabel)}${esc(epLabel)}${meta.genre ? ' · ' + esc(meta.genre) : ''}</span></p><h2 style="margin:8px 0 10px">${esc(meta.title)}</h2>${meta.description ? `<p style="max-width:560px;margin:0 auto 20px;line-height:1.6">${esc(meta.description)}</p>` : ''}<p><a href="${esc(intentUrl)}" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:700;padding:12px 24px;border-radius:10px;text-decoration:none;min-height:44px;line-height:44px">Buka di Aplikasi</a></p><p><a href="https://github.com/hozin-king/cerpen-hozin/releases/latest" style="display:inline-block;font-weight:700;padding:12px 24px;border-radius:10px;border:1px solid rgba(128,128,128,.4);text-decoration:none;color:inherit">Download Aplikasi</a></p><p style="font-size:13px;opacity:.65;margin:18px 0 0">Belum memasang Cerpen Hozin? Unduh aplikasinya dulu, lalu buka lagi link ini — konten akan terbuka langsung di aplikasi.</p></div><p><a href="/">← Beranda hozinking.my.id</a></p>`;
+      return html(await renderPage(env, meta.title, content), 200);
+    }
+
     // ---- Admin: kontrol API Cerpen (panel /kendali/cerpen-api, v66) ----
     // Guard sama seperti /kendali: sesi admin (cookie cms_access HMAC).
     // CSRF via header x-csrf (token yang sama dengan form admin) untuk
@@ -962,6 +1188,50 @@ async function handleFetch(request, env) {
           await B.prepare(`UPDATE cerpen_submissions SET status = ?, reviewed_at = ?, review_note = ? WHERE id = ? AND status = 'pending'`).bind(to, Date.now(), note, subId).run();
           await cerpenAudit(action === 'approve' ? 'submission_approve' : 'submission_reject', 'submission', subId, note);
           return aj({ ok: true, id: subId, status: to });
+        }
+        // ---- Share link Cerpen (v67) ----
+        // GET /api/admin/cerpen-shares — daftar link + jumlah buka, filter
+        // content_type/revoked; plus konten paling sering di-share (top).
+        if (path === '/api/admin/cerpen-shares' && request.method === 'GET') {
+          const fType = url.searchParams.get('content_type') || '';
+          const fRev = url.searchParams.get('revoked') || '';
+          let limit = parseInt(url.searchParams.get('limit') || '50', 10);
+          if (Number.isNaN(limit)) limit = 50;
+          limit = Math.min(100, Math.max(1, limit));
+          if (fType && !SHARE_TYPES.includes(fType)) return aj({ ok: false, error: 'content_type tidak valid' }, 400);
+          if (fRev && fRev !== '0' && fRev !== '1') return aj({ ok: false, error: 'revoked tidak valid' }, 400);
+          let sql = `SELECT id, content_type, content_id, season, episode_no, created_at, sharer_country, sharer_city, sharer_device, revoked, opens_count FROM cerpen_share_links WHERE 1 = 1`;
+          const args = [];
+          if (fType) { sql += ` AND content_type = ?`; args.push(fType); }
+          if (fRev) { sql += ` AND revoked = ?`; args.push(Number(fRev)); }
+          sql += ` ORDER BY created_at DESC LIMIT ?`;
+          args.push(limit);
+          const rows = await B.prepare(sql).bind(...args).all();
+          const top = await B.prepare(`SELECT content_type, content_id, COUNT(*) AS c, SUM(opens_count) AS opens FROM cerpen_share_links GROUP BY content_type, content_id ORDER BY c DESC LIMIT 10`).all();
+          return aj({ ok: true, shares: rows.results || [], top: top.results || [] });
+        }
+        // GET /api/admin/cerpen-shares/:id — detail + 50 buka terakhir.
+        const shareGet = path.match(/^\/api\/admin\/cerpen-shares\/([^/]+)$/);
+        if (shareGet && request.method === 'GET') {
+          const shareId = shareGet[1];
+          if (!SHARE_ID_RE.test(shareId)) return aj({ ok: false, error: 'id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT id, content_type, content_id, season, episode_no, created_at, sharer_ip, sharer_country, sharer_city, sharer_device, revoked, opens_count FROM cerpen_share_links WHERE id = ?`).bind(shareId).first();
+          if (!row) return aj({ ok: false, error: 'share link tidak ditemukan' }, 404);
+          const opens = await B.prepare(`SELECT id, share_id, opened_at, ip, country, city, device, user_agent, via FROM cerpen_share_opens WHERE share_id = ? ORDER BY opened_at DESC LIMIT 50`).bind(shareId).all();
+          return aj({ ok: true, share: row, opens: opens.results || [] });
+        }
+        // POST /api/admin/cerpen-shares/:id/revoke|unrevoke
+        const shareAction = path.match(/^\/api\/admin\/cerpen-shares\/([^/]+)\/(revoke|unrevoke)$/);
+        if (shareAction && request.method === 'POST') {
+          const shareId = shareAction[1];
+          const action = shareAction[2];
+          if (!SHARE_ID_RE.test(shareId)) return aj({ ok: false, error: 'id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT id FROM cerpen_share_links WHERE id = ?`).bind(shareId).first();
+          if (!row) return aj({ ok: false, error: 'share link tidak ditemukan' }, 404);
+          const revoked = action === 'revoke' ? 1 : 0;
+          await B.prepare(`UPDATE cerpen_share_links SET revoked = ? WHERE id = ?`).bind(revoked, shareId).run();
+          await cerpenAudit(action === 'revoke' ? 'share_revoke' : 'share_unrevoke', 'share', shareId, '');
+          return aj({ ok: true, id: shareId, revoked });
         }
         return aj({ ok: false, error: 'endpoint tidak ditemukan' }, 404);
       } catch (e) {
@@ -1679,13 +1949,18 @@ async function handleFetch(request, env) {
         if (fKind) { subSql += ` AND kind = ?`; subArgs.push(fKind); }
         subSql += ` ORDER BY created_at DESC LIMIT ?`;
         subArgs.push(fLimit);
-        const [keyRows, keyCounts, subRows, statRows, auditRows, last24Row] = await Promise.all([
+        const [keyRows, keyCounts, subRows, statRows, auditRows, last24Row, shareTotalRow, shareOpensRow, shareTopRows, shareRecentRows, shareListRows] = await Promise.all([
           B2.prepare(`SELECT key_id, key_hash, name, created_at, revoked, daily_limit FROM cerpen_api_keys ORDER BY created_at DESC`).all(),
           B2.prepare(`SELECT key_id, COUNT(*) AS total, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending FROM cerpen_submissions GROUP BY key_id`).all(),
           B2.prepare(subSql).bind(...subArgs).all(),
           B2.prepare(`SELECT status, COUNT(*) AS c FROM cerpen_submissions GROUP BY status`).all(),
           B2.prepare(`SELECT id, created_at, actor, action, target_type, target_id, note FROM cerpen_admin_audit ORDER BY created_at DESC LIMIT 20`).all(),
           B2.prepare(`SELECT COUNT(*) AS c FROM cerpen_submissions WHERE created_at >= ?`).bind(Date.now() - 24 * 3600 * 1000).first(),
+          B2.prepare(`SELECT COUNT(*) AS c FROM cerpen_share_links`).first(),
+          B2.prepare(`SELECT COALESCE(SUM(opens_count), 0) AS c FROM cerpen_share_links`).first(),
+          B2.prepare(`SELECT content_type, content_id, COUNT(*) AS c, SUM(opens_count) AS opens FROM cerpen_share_links GROUP BY content_type, content_id ORDER BY c DESC LIMIT 10`).all(),
+          B2.prepare(`SELECT o.id, o.share_id, o.opened_at, o.country, o.city, o.device, o.via, l.content_type, l.content_id FROM cerpen_share_opens o JOIN cerpen_share_links l ON l.id = o.share_id ORDER BY o.opened_at DESC LIMIT 20`).all(),
+          B2.prepare(`SELECT id, content_type, content_id, season, episode_no, created_at, sharer_country, sharer_city, sharer_device, revoked, opens_count FROM cerpen_share_links ORDER BY created_at DESC LIMIT 50`).all(),
         ]);
         const perStatus = { pending: 0, approved: 0, applied: 0, rejected: 0 };
         for (const r of (statRows.results || [])) if (r.status in perStatus) perStatus[r.status] = Number(r.c) || 0;
@@ -1711,7 +1986,21 @@ async function handleFetch(request, env) {
         const limitOpts = [10, 25, 50, 100].map(v => `<option value="${v}"${v === fLimit ? ' selected' : ''}>${v}</option>`).join('');
         const subHtml = (subRows.results || []).map(s => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(s.title || '(tanpa judul)')}</span> ${badge(s.status)}<div class="adm-row-meta">${wib(s.created_at)} · ${esc(s.kind)} · key ${esc(s.key_id)} · target ${esc(s.target_id || '-')} · ${esc(s.id)}${s.review_note ? ' · catatan: ' + esc(s.review_note) : ''}</div></div><button type="button" data-cerpen-detail="${esc(s.id)}">Detail</button></div>`).join('') || '<p>Tidak ada submission untuk filter ini.</p>';
         const auditHtml = (auditRows.results || []).map(a => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(a.action)}</span><div class="adm-row-meta">${wib(a.created_at)} · ${esc(a.actor)} · ${esc(a.target_type)} ${esc(a.target_id)}${a.note ? ' · ' + esc(a.note) : ''}</div></div></div>`).join('') || '<p>Belum ada aksi admin tercatat.</p>';
-        const content = `<h2>Cerpen API</h2>${nav}${noticeHtml(url)}<div id="cerpen-api-msg"></div><div class="card"><h3>Statistik</h3>${statsHtml}</div><div class="card"><h3>API Keys</h3>${keyHtml}<h4>Daftarkan key baru</h4><form id="cerpen-key-form"><label>Hash SHA-256 key baru (64 hex, BUKAN plaintext key)<input name="key_hash" required pattern="[0-9a-f]{64}" minlength="64" maxlength="64" placeholder="64 karakter hex lowercase" style="font-family:monospace" autocomplete="off"></label><label>Nama<input name="name" required maxlength="80" placeholder="mis. muse-kedua"></label><label>Limit per hari<input name="daily_limit" type="number" min="1" max="100" value="10" required></label><p><button type="submit">Daftarkan key</button></p><p style="font-size:13px;opacity:.7">Key plaintext TIDAK PERNAH ditulis di sini — yang didaftarkan hanya hash-nya. Key plaintext dibuat &amp; disimpan oleh pemilik key di pihaknya sendiri.</p></form></div><div class="card"><h3>Submissions</h3><form method="get" action="/kendali/cerpen-api" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">Status<select name="status">${statusOpts}</select></label><label style="margin:0">Key<select name="key_id">${keyOpts}</select></label><label style="margin:0">Kind<select name="kind">${kindOpts}</select></label><label style="margin:0">Tampil<select name="limit">${limitOpts}</select></label><button type="submit">Filter</button></form>${subHtml}</div><div class="card" id="cerpen-detail" hidden><h3>Detail submission</h3><div id="cerpen-detail-body"><p>Pilih tombol Detail pada salah satu submission.</p></div><div id="cerpen-detail-actions" hidden><button type="button" id="cerpen-approve">Setujui (approve)</button> <button type="button" id="cerpen-reject" style="background:#dc2626">Tolak (reject)</button></div><p style="font-size:13px;opacity:.7">Approve di sini hanya mengubah status jadi approved — konten diterapkan oleh applier VM (tiap ~15 menit), kunci enkripsi tidak pernah keluar VM.</p></div><div class="card"><h3>Riwayat admin (audit)</h3>${auditHtml}</div><script>
+        // ---- Seksi Share Link (v67) ----
+        // Statistik + konten paling sering di-share + 20 buka terakhir +
+        // 50 link terbaru dengan tombol revoke/unrevoke. Link share TIDAK
+        // pernah menampilkan token/URL lengkap di sini (token opaque).
+        const shareTotal = Number(shareTotalRow && shareTotalRow.c) || 0;
+        const shareOpensTotal = Number(shareOpensRow && shareOpensRow.c) || 0;
+        const shareTopHtml = (shareTopRows.results || []).map((r, i) => `<div class="adm-row"><span class="adm-rank">${i + 1}</span><div class="adm-row-body"><span class="adm-row-title">${esc(r.content_type)} · ${esc(r.content_id)}</span><div class="adm-row-meta">${Number(r.c) || 0} link dibagikan · ${Number(r.opens) || 0} kali dibuka</div></div></div>`).join('') || '<p>Belum ada link share.</p>';
+        const shareRecentHtml = (shareRecentRows.results || []).map(o => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(o.content_type)} · ${esc(o.content_id)}</span><div class="adm-row-meta">${wib(o.opened_at)} · ${esc(o.country || '–')}${o.city ? ' → ' + esc(o.city) : ''} · ${esc(o.via)} · ${esc((o.device || '').slice(0, 60))}</div></div></div>`).join('') || '<p>Belum ada pembukaan tercatat.</p>';
+        const shareListHtml = (shareListRows.results || []).map(s => {
+          const revoked = Number(s.revoked) === 1;
+          const ep = s.episode_no ? ` · ep ${esc(s.episode_no)}` : (s.season ? ` · season ${esc(s.season)}` : '');
+          return `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(s.content_type)} · ${esc(s.content_id)}${ep}</span> <span style="font-size:12px;font-weight:700;color:${revoked ? '#dc2626' : '#22c55e'}">${revoked ? 'DICABUT' : 'AKTIF'}</span><div class="adm-row-meta">${esc(s.id)} · dibuat ${wib(s.created_at)} · dibuka ${Number(s.opens_count) || 0} kali${s.sharer_country ? ` · dibagikan dari ${esc(s.sharer_country)}${s.sharer_city ? ' → ' + esc(s.sharer_city) : ''}` : ''}${s.sharer_device ? ' · ' + esc(s.sharer_device.slice(0, 60)) : ''}</div></div>${revoked ? `<button type="button" data-cerpen-share="unrevoke" data-id="${esc(s.id)}">Aktifkan</button>` : `<button type="button" data-cerpen-share="revoke" data-id="${esc(s.id)}" style="background:#dc2626">Cabut</button>`}</div>`;
+        }).join('') || '<p>Belum ada link share.</p>';
+        const shareHtml = `<div class="card"><h3>Share Link</h3><div class="adm-stats"><div class="adm-stat"><span class="adm-stat-num">${shareTotal}</span><span class="adm-stat-label">Link share</span><span class="adm-stat-sub">dibuat dari aplikasi</span></div><div class="adm-stat"><span class="adm-stat-num">${shareOpensTotal}</span><span class="adm-stat-label">Total dibuka</span><span class="adm-stat-sub">browser + aplikasi</span></div></div><h4>Konten paling sering di-share</h4>${shareTopHtml}<h4>Buka terakhir</h4>${shareRecentHtml}<h4>Link terbaru</h4>${shareListHtml}</div>`;
+        const content = `<h2>Cerpen API</h2>${nav}${noticeHtml(url)}<div id="cerpen-api-msg"></div><div class="card"><h3>Statistik</h3>${statsHtml}</div><div class="card"><h3>API Keys</h3>${keyHtml}<h4>Daftarkan key baru</h4><form id="cerpen-key-form"><label>Hash SHA-256 key baru (64 hex, BUKAN plaintext key)<input name="key_hash" required pattern="[0-9a-f]{64}" minlength="64" maxlength="64" placeholder="64 karakter hex lowercase" style="font-family:monospace" autocomplete="off"></label><label>Nama<input name="name" required maxlength="80" placeholder="mis. muse-kedua"></label><label>Limit per hari<input name="daily_limit" type="number" min="1" max="100" value="10" required></label><p><button type="submit">Daftarkan key</button></p><p style="font-size:13px;opacity:.7">Key plaintext TIDAK PERNAH ditulis di sini — yang didaftarkan hanya hash-nya. Key plaintext dibuat &amp; disimpan oleh pemilik key di pihaknya sendiri.</p></form></div><div class="card"><h3>Submissions</h3><form method="get" action="/kendali/cerpen-api" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">Status<select name="status">${statusOpts}</select></label><label style="margin:0">Key<select name="key_id">${keyOpts}</select></label><label style="margin:0">Kind<select name="kind">${kindOpts}</select></label><label style="margin:0">Tampil<select name="limit">${limitOpts}</select></label><button type="submit">Filter</button></form>${subHtml}</div>${shareHtml}<div class="card" id="cerpen-detail" hidden><h3>Detail submission</h3><div id="cerpen-detail-body"><p>Pilih tombol Detail pada salah satu submission.</p></div><div id="cerpen-detail-actions" hidden><button type="button" id="cerpen-approve">Setujui (approve)</button> <button type="button" id="cerpen-reject" style="background:#dc2626">Tolak (reject)</button></div><p style="font-size:13px;opacity:.7">Approve di sini hanya mengubah status jadi approved — konten diterapkan oleh applier VM (tiap ~15 menit), kunci enkripsi tidak pernah keluar VM.</p></div><div class="card"><h3>Riwayat admin (audit)</h3>${auditHtml}</div><script>
 const CERPEN_CSRF = "${csrf}";
 const cerpenMsg = document.getElementById('cerpen-api-msg');
 function escHtml(s) { return String(s == null ? '' : s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'); }
@@ -1745,6 +2034,17 @@ document.querySelectorAll('[data-cerpen-key]').forEach(function (btn) {
     if (act === 'revoke' && !confirm('Cabut key ' + id + '? Key ini tidak bisa dipakai submit lagi.')) return;
     try {
       await cerpenCall(act === 'delete' ? 'DELETE' : 'POST', '/api/admin/cerpen-keys/' + id + (act === 'delete' ? '' : '/' + act), body);
+      location.reload();
+    } catch (err) { cerpenShowMsg(err.message, false); }
+  });
+});
+document.querySelectorAll('[data-cerpen-share]').forEach(function (btn) {
+  btn.addEventListener('click', async function () {
+    const id = btn.dataset.id;
+    const act = btn.dataset.cerpenShare;
+    if (act === 'revoke' && !confirm('Cabut link share ' + id + '? Link ini tidak bisa dibuka lagi.')) return;
+    try {
+      await cerpenCall('POST', '/api/admin/cerpen-shares/' + id + '/' + act, {});
       location.reload();
     } catch (err) { cerpenShowMsg(err.message, false); }
   });
