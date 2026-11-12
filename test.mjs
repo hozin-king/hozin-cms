@@ -3,7 +3,7 @@
 import worker from './worker.js';
 import { themes } from './themes.js';
 import { renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
-import { parseTags, tagSlug, sanitizeHtml } from './util.js';
+import { parseTags, tagSlug, sanitizeHtml, sha256Hex } from './util.js';
 import { checkRateLimit } from './security.js';
 import { tagLinks } from './content.js';
 
@@ -41,8 +41,8 @@ class MockDB {
     // v66: fixture API Cerpen admin (keys + submissions + audit) untuk tes /api/admin/cerpen-*
     const nowT = Date.now();
     this.cerpenApiKeys = [
-      { key_id: 'key-be663fc2', key_hash: 'a'.repeat(64), name: 'muse-kedua', created_at: nowT - 2 * 3600 * 1000, revoked: 0, daily_limit: 10 },
-      { key_id: 'key-11111111', key_hash: 'b'.repeat(64), name: 'kunci-uji', created_at: nowT - 1 * 3600 * 1000, revoked: 1, daily_limit: 5 },
+      { key_id: 'key-be663fc2', key_hash: 'a'.repeat(64), name: 'muse-kedua', created_at: nowT - 2 * 3600 * 1000, revoked: 0, daily_limit: 10, auto_approve_mode: 'off', auto_approve_until: null },
+      { key_id: 'key-11111111', key_hash: 'b'.repeat(64), name: 'kunci-uji', created_at: nowT - 1 * 3600 * 1000, revoked: 1, daily_limit: 5, auto_approve_mode: 'off', auto_approve_until: null },
     ];
     this.cerpenSubmissions = [
       { id: 'sub-aaaaaaaaaaaa', key_id: 'key-be663fc2', kind: 'cerpen', target_id: 'cerpen-99', title: 'Cerpen Uji Pending', dedup_hash: 'h1', payload_json: '{"kind":"cerpen","id":"cerpen-99"}', status: 'pending', created_at: nowT - 1800 * 1000, reviewed_at: null, review_note: '' },
@@ -269,7 +269,7 @@ class MockDB {
       return rows.slice(0, a[0]);
     }
     // v66: pola SQL endpoint admin Cerpen (/api/admin/cerpen-*) + halaman /kendali/cerpen-api
-    if (s.startsWith('SELECT key_id, key_hash, name, created_at, revoked, daily_limit FROM cerpen_api_keys ORDER BY created_at DESC')) return [...this.cerpenApiKeys].sort((x, y) => y.created_at - x.created_at);
+    if (s.startsWith('SELECT key_id, key_hash, name, created_at, revoked, daily_limit, auto_approve_mode, auto_approve_until FROM cerpen_api_keys ORDER BY created_at DESC')) return [...this.cerpenApiKeys].sort((x, y) => y.created_at - x.created_at);
     if (s.startsWith('SELECT key_id, COUNT(*) AS total, SUM(CASE WHEN status = \'pending\' THEN 1 ELSE 0 END) AS pending FROM cerpen_submissions GROUP BY key_id')) {
       const map = new Map();
       for (const x of this.cerpenSubmissions) {
@@ -311,6 +311,15 @@ class MockDB {
     if (s.startsWith('SELECT id, key_id, kind, target_id, title, dedup_hash, payload_json, status, created_at, reviewed_at, review_note FROM cerpen_submissions WHERE id = ?')) return this.cerpenSubmissions.filter(x => x.id === a[0]);
     if (s.startsWith('SELECT id, status FROM cerpen_submissions WHERE id = ?')) return this.cerpenSubmissions.filter(x => x.id === a[0]).map(x => ({ id: x.id, status: x.status }));
     if (s.startsWith('UPDATE cerpen_submissions SET status = ?')) { const x = this.cerpenSubmissions.find(v => v.id === a[3] && v.status === 'pending'); if (x) { x.status = a[0]; x.reviewed_at = a[1]; x.review_note = a[2]; } return []; }
+    // v68: pola SQL auto-approve + endpoint submit Cerpen (POST /api/cerpen-submit)
+    if (s.startsWith('SELECT key_id, key_hash, name, revoked, daily_limit, auto_approve_mode, auto_approve_until FROM cerpen_api_keys WHERE key_hash = ?')) return this.cerpenApiKeys.filter(k => k.key_hash === a[0]);
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_submissions WHERE key_id = ? AND created_at >= ?')) return [{ c: this.cerpenSubmissions.filter(x => x.key_id === a[0] && x.created_at >= a[1]).length }];
+    if (s.startsWith('SELECT id FROM cerpen_series WHERE id = ?')) return this.cerpenSeries.filter(x => x.id === a[0]).map(x => ({ id: x.id }));
+    if (s.startsWith('SELECT judul FROM cerpen_series')) return this.cerpenSeries.map(x => ({ judul: x.judul }));
+    if (s.startsWith("SELECT title FROM cerpen_submissions WHERE status IN ('pending','approved')")) return this.cerpenSubmissions.filter(x => x.status === 'pending' || x.status === 'approved').map(x => ({ title: x.title }));
+    if (s.startsWith("SELECT id FROM cerpen_submissions WHERE dedup_hash = ? AND status IN ('pending','approved')")) return this.cerpenSubmissions.filter(x => x.dedup_hash === a[0] && (x.status === 'pending' || x.status === 'approved')).map(x => ({ id: x.id }));
+    if (s.startsWith('INSERT INTO cerpen_submissions')) { this.cerpenSubmissions.push({ id: a[0], key_id: a[1], kind: a[2], target_id: a[3], title: a[4], dedup_hash: a[5], payload_json: a[6], status: a[7], created_at: a[8], reviewed_at: a[9], review_note: a[10] }); return []; }
+    if (s.startsWith('UPDATE cerpen_api_keys SET auto_approve_mode = ?')) { const k = this.cerpenApiKeys.find(x => x.key_id === a[2]); if (k) { k.auto_approve_mode = a[0]; k.auto_approve_until = a[1]; } return []; }
     if (s.startsWith('INSERT INTO cerpen_admin_audit')) { this.cerpenAdminAudit.push({ id: a[0], created_at: a[1], actor: 'admin', action: a[2], target_type: a[3], target_id: a[4], note: a[5] }); return []; }
     if (s.startsWith('SELECT id, created_at, actor, action, target_type, target_id, note FROM cerpen_admin_audit ORDER BY created_at DESC LIMIT 20')) return [...this.cerpenAdminAudit].sort((x, y) => y.created_at - x.created_at).slice(0, 20);
     if (s.startsWith('INSERT INTO dracin_api_usage')) { this.dracinUsage.push({ ts: a[0], key_id: a[1], endpoint: a[2], method: a[3], status: a[4], country: a[5], region: a[6], city: a[7] }); return []; }
@@ -1355,4 +1364,63 @@ env.DB.rateLimits = new Map();
 // Halaman panel memuat seksi Share
 r = await call('GET', '/kendali/cerpen-api', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('Share Link') && t.includes('Konten paling sering di-share') && t.includes('Buka terakhir') && t.includes(shareRow.id) && t.includes('data-cerpen-share="revoke"'), 'share-admin: halaman panel memuat seksi Share + tombol cabut');
+// 41. Auto-approve usulan Cerpen (v68, 12 Nov 2026): mode per key (off /
+// always / 1d / 1w / 1mo / until) — submit dari key yang aktif langsung
+// 'approved', applier VM yang menerapkannya. Default semua key: mati.
+const aaKeyPlain = 'kunci-uji-auto-approve-' + Date.now().toString(36);
+const aaKeyHash = await sha256Hex(aaKeyPlain);
+r = await callJson('POST', '/api/admin/cerpen-keys', { key_hash: aaKeyHash, name: 'kunci-aa', daily_limit: 10 }, admH); jj = await r.json();
+assert(r.status === 201 && jj.ok && jj.auto_approve_mode === 'off' && jj.auto_approve_until === null, 'auto-approve: key baru default mati (off)');
+const aaKeyId = jj.key_id;
+const aaSubmit = (n) => callJson('POST', '/api/cerpen-submit', { kind: 'cerpen', id: 'cerpen-aa-' + n, judul: 'Cerpen AA Uji ' + n, genre: 'Misteri', deskripsi: '', seasons: [{ season: 1, episodes: [{ no: 1, judul: 'Ep 1', isi: 'x'.repeat(300) }] }] }, { Authorization: 'Bearer ' + aaKeyPlain });
+// Tanpa auth -> 401; tanpa CSRF -> 403
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'always' }, {}); assert(r.status === 401, 'auto-approve: set mode tanpa auth ditolak 401');
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'always' }, { cookie }); assert(r.status === 403, 'auto-approve: set mode tanpa CSRF ditolak 403');
+// Validasi mode + until
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'bogus' }, admH); assert(r.status === 400, 'auto-approve: mode tidak valid ditolak 400');
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'until' }, admH); assert(r.status === 400, 'auto-approve: until tanpa tanggal ditolak 400');
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'until', until: Math.floor(Date.now() / 1000) - 60 }, admH); assert(r.status === 400, 'auto-approve: until di masa lalu ditolak 400');
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'until', until: Math.floor(Date.now() / 1000) + 366 * 86400 }, admH); assert(r.status === 400, 'auto-approve: until >1 tahun ditolak 400');
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'always' }, admH); jj = await r.json();
+assert(r.status === 200 && jj.auto_approve_mode === 'always' && jj.auto_approve_until === null, 'auto-approve: set always');
+assert(env.BACKUP_DB.cerpenAdminAudit.some(a => a.action === 'auto_approve_set' && a.target_id === aaKeyId && a.note.includes('mode=always')), 'auto-approve: set always menulis audit');
+// Mode off -> submit pending
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'off' }, admH); jj = await r.json();
+assert(r.status === 200 && jj.auto_approve_mode === 'off', 'auto-approve: set off');
+r = await aaSubmit(1); jj = await r.json();
+assert(r.status === 201 && jj.ok && jj.status === 'pending', 'auto-approve: mode off -> submit pending');
+// Mode always -> submit approved + review_note auto-approved
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'always' }, admH); assert(r.status === 200, 'auto-approve: set always lagi');
+r = await aaSubmit(2); jj = await r.json();
+assert(r.status === 201 && jj.ok && jj.status === 'approved', 'auto-approve: mode always -> submit approved');
+const aaRow2 = env.BACKUP_DB.cerpenSubmissions.find(x => x.id === jj.id);
+assert(aaRow2 && aaRow2.status === 'approved' && (aaRow2.review_note || '').includes('auto-approved'), 'auto-approve: baris tersimpan approved + review_note auto-approved');
+// Mode 1d -> expiry ~24 jam + submit approved
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: '1d' }, admH); jj = await r.json();
+const aaNowSec = Math.floor(Date.now() / 1000);
+assert(r.status === 200 && jj.auto_approve_mode === 'until' && jj.auto_approve_until > aaNowSec + 86000 && jj.auto_approve_until <= aaNowSec + 86400 + 5, 'auto-approve: 1d -> until ~24 jam');
+r = await aaSubmit(3); jj = await r.json();
+assert(r.status === 201 && jj.status === 'approved', 'auto-approve: mode 1d -> submit approved');
+// Until kedaluwarsa -> submit pending (simulasikan lewat dengan mengubah baris mock)
+const aaKeyRow = env.BACKUP_DB.cerpenApiKeys.find(k => k.key_id === aaKeyId);
+aaKeyRow.auto_approve_mode = 'until'; aaKeyRow.auto_approve_until = Math.floor(Date.now() / 1000) - 10;
+r = await aaSubmit(4); jj = await r.json();
+assert(r.status === 201 && jj.status === 'pending', 'auto-approve: until kedaluwarsa -> submit pending');
+// Until manual valid (1 jam) -> submit approved
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'until', until: Math.floor(Date.now() / 1000) + 3600 }, admH); jj = await r.json();
+assert(r.status === 200 && jj.auto_approve_mode === 'until' && jj.auto_approve_until > aaNowSec, 'auto-approve: until manual 1 jam');
+r = await aaSubmit(5); jj = await r.json();
+assert(r.status === 201 && jj.status === 'approved', 'auto-approve: until manual valid -> submit approved');
+// Dimatikan lagi -> submit pending; GET keys menampilkan setting
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'off' }, admH); assert(r.status === 200, 'auto-approve: dimatikan lagi');
+r = await aaSubmit(6); jj = await r.json();
+assert(r.status === 201 && jj.status === 'pending', 'auto-approve: dimatikan -> submit pending lagi');
+r = await callJson('GET', '/api/admin/cerpen-keys', null, admH); jj = await r.json();
+const aaKeyView = jj.keys.find(k => k.key_id === aaKeyId);
+assert(aaKeyView && aaKeyView.auto_approve_mode === 'off' && aaKeyView.auto_approve_until === null, 'auto-approve: GET keys menampilkan setting (off)');
+// Panel memuat kontrol Auto-approve
+r = await call('GET', '/kendali/cerpen-api', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('Auto-approve') && t.includes('data-cerpen-aa='), 'auto-approve: panel memuat status + tombol Auto-approve per key');
+// Key hilang -> 404
+r = await callJson('POST', '/api/admin/cerpen-keys/key-00000000/auto-approve', { mode: 'always' }, admH); assert(r.status === 404, 'auto-approve: key hilang -> 404');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

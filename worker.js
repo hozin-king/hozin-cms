@@ -772,12 +772,21 @@ async function handleFetch(request, env) {
       let keyRow = null;
       try {
         const hash = await sha256Hex(rawKey);
-        keyRow = await env.BACKUP_DB.prepare(`SELECT key_id, key_hash, name, revoked, daily_limit FROM cerpen_api_keys WHERE key_hash = ?`).bind(hash).first();
+        keyRow = await env.BACKUP_DB.prepare(`SELECT key_id, key_hash, name, revoked, daily_limit, auto_approve_mode, auto_approve_until FROM cerpen_api_keys WHERE key_hash = ?`).bind(hash).first();
         if (!keyRow || Number(keyRow.revoked) !== 0) return csJson({ ok: false, error: 'unauthorized' }, 401);
         if (!timingSafeHexEqual(String(keyRow.key_hash), hash)) return csJson({ ok: false, error: 'unauthorized' }, 401);
       } catch (e) {
         return csJson({ ok: false, error: 'gagal memeriksa kunci' }, 500);
       }
+      // Auto-approve per key (v68): bila aktif, submission langsung berstatus
+      // 'approved' (bukan 'pending') — applier VM yang menerapkannya ke
+      // konten dalam ~15 menit. Default semua key: mati ('off').
+      const aaMode = String(keyRow.auto_approve_mode || 'off');
+      const aaUntil = Number(keyRow.auto_approve_until || 0);
+      const aaActive = aaMode === 'always' || (aaMode === 'until' && aaUntil > 0 && Date.now() < aaUntil * 1000);
+      const aaNote = aaActive
+        ? (aaMode === 'always' ? 'auto-approved (selalu)' : 'auto-approved (s/d ' + new Date(aaUntil * 1000 + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' WIB)')
+        : '';
       try {
         const nowWib = new Date(Date.now() + 7 * 3600000);
         const dayStart = Date.UTC(nowWib.getUTCFullYear(), nowWib.getUTCMonth(), nowWib.getUTCDate(), 0, 0, 0) - 7 * 3600000;
@@ -917,12 +926,13 @@ async function handleFetch(request, env) {
         return csJson({ ok: false, error: 'gagal memeriksa duplikat' }, 500);
       }
       const subId = 'sub-' + randomHex(6);
+      const subStatus = aaActive ? 'approved' : 'pending';
       try {
-        await env.BACKUP_DB.prepare(`INSERT INTO cerpen_submissions (id, key_id, kind, target_id, title, dedup_hash, payload_json, status, created_at, reviewed_at, review_note) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, '')`).bind(subId, keyRow.key_id, kind, targetId, title, dedupHash, JSON.stringify(data), Date.now()).run();
+        await env.BACKUP_DB.prepare(`INSERT INTO cerpen_submissions (id, key_id, kind, target_id, title, dedup_hash, payload_json, status, created_at, reviewed_at, review_note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(subId, keyRow.key_id, kind, targetId, title, dedupHash, JSON.stringify(data), subStatus, Date.now(), aaActive ? Date.now() : null, aaNote).run();
       } catch (e) {
         return csJson({ ok: false, error: 'gagal menyimpan usulan' }, 500);
       }
-      return csJson({ ok: true, id: subId, status: 'pending', message: 'Usulan diterima dan menunggu persetujuan Alyaa.' }, 201);
+      return csJson({ ok: true, id: subId, status: subStatus, message: aaActive ? 'Usulan diterima dan langsung disetujui (auto-approve aktif) — akan diterapkan applier.' : 'Usulan diterima dan menunggu persetujuan Alyaa.' }, 201);
     }
 
     // ---- Share link Cerpen Hozin (publik, v67, 12 Nov 2026) ----
@@ -1063,12 +1073,12 @@ async function handleFetch(request, env) {
       try {
         // GET /api/admin/cerpen-keys — daftar key (hash hanya 8 karakter pertama).
         if (path === '/api/admin/cerpen-keys' && request.method === 'GET') {
-          const keys = await B.prepare(`SELECT key_id, key_hash, name, created_at, revoked, daily_limit FROM cerpen_api_keys ORDER BY created_at DESC`).all();
+          const keys = await B.prepare(`SELECT key_id, key_hash, name, created_at, revoked, daily_limit, auto_approve_mode, auto_approve_until FROM cerpen_api_keys ORDER BY created_at DESC`).all();
           const counts = await B.prepare(`SELECT key_id, COUNT(*) AS total, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending FROM cerpen_submissions GROUP BY key_id`).all();
           const byKey = new Map((counts.results || []).map(r => [r.key_id, r]));
           return aj({ ok: true, keys: (keys.results || []).map(k => {
             const c = byKey.get(k.key_id) || {};
-            return { key_id: k.key_id, name: k.name, created_at: k.created_at, revoked: Number(k.revoked) || 0, daily_limit: k.daily_limit, key_hash_prefix: String(k.key_hash || '').slice(0, 8), submissions: Number(c.total) || 0, pending: Number(c.pending) || 0 };
+            return { key_id: k.key_id, name: k.name, created_at: k.created_at, revoked: Number(k.revoked) || 0, daily_limit: k.daily_limit, key_hash_prefix: String(k.key_hash || '').slice(0, 8), submissions: Number(c.total) || 0, pending: Number(c.pending) || 0, auto_approve_mode: String(k.auto_approve_mode || 'off'), auto_approve_until: Number(k.auto_approve_until || 0) || null };
           }) });
         }
         // POST /api/admin/cerpen-keys — daftar key baru dari HASH (bukan plaintext).
@@ -1087,7 +1097,7 @@ async function handleFetch(request, env) {
           const createdAt = Date.now();
           await B.prepare(`INSERT INTO cerpen_api_keys (key_id, key_hash, name, created_at, revoked, daily_limit) VALUES (?, ?, ?, ?, 0, ?)`).bind(keyId, keyHash, name, createdAt, dailyLimit).run();
           await cerpenAudit('key_create', 'key', keyId, 'name=' + name + ' limit=' + dailyLimit);
-          return aj({ ok: true, key_id: keyId, name, created_at: createdAt, revoked: 0, daily_limit: dailyLimit, key_hash_prefix: keyHash.slice(0, 8) }, 201);
+          return aj({ ok: true, key_id: keyId, name, created_at: createdAt, revoked: 0, daily_limit: dailyLimit, key_hash_prefix: keyHash.slice(0, 8), auto_approve_mode: 'off', auto_approve_until: null }, 201);
         }
         // POST /api/admin/cerpen-keys/:id/revoke|unrevoke|limit
         const keyAction = path.match(/^\/api\/admin\/cerpen-keys\/([^/]+)\/(revoke|unrevoke|limit)$/);
@@ -1110,6 +1120,41 @@ async function handleFetch(request, env) {
           await B.prepare(`UPDATE cerpen_api_keys SET revoked = ? WHERE key_id = ?`).bind(revoked, keyId).run();
           await cerpenAudit(revoked ? 'key_revoke' : 'key_unrevoke', 'key', keyId, '');
           return aj({ ok: true, key_id: keyId, revoked });
+        }
+        // POST /api/admin/cerpen-keys/:id/auto-approve (v68) — atur mode
+        // auto-approve per key: off | always | 1d | 1w | 1mo | until.
+        // 1d/1w/1mo dihitung dari waktu request (24 jam / 7 hari / 30 hari);
+        // 'until' butuh body.until = unix detik di masa depan (maks 1 tahun).
+        // Disimpan sebagai mode 'off' | 'always' | 'until' + until (detik).
+        // Submission dari key yang auto-approve aktif langsung berstatus
+        // 'approved' di /api/cerpen-submit, lalu applier VM menerapkannya.
+        const keyAa = path.match(/^\/api\/admin\/cerpen-keys\/([^/]+)\/auto-approve$/);
+        if (keyAa && request.method === 'POST') {
+          const keyId = keyAa[1];
+          if (!isKeyId(keyId)) return aj({ ok: false, error: 'key_id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT key_id FROM cerpen_api_keys WHERE key_id = ?`).bind(keyId).first();
+          if (!row) return aj({ ok: false, error: 'key tidak ditemukan' }, 404);
+          const { body, err } = await readJsonBody();
+          if (err) return aj({ ok: false, error: err }, 400);
+          const mode = String(body.mode || '').trim().toLowerCase();
+          if (!['off', 'always', '1d', '1w', '1mo', 'until'].includes(mode)) return aj({ ok: false, error: 'mode tidak valid (off/always/1d/1w/1mo/until)' }, 400);
+          const nowSec = Math.floor(Date.now() / 1000);
+          const wibText = (sec) => new Date(sec * 1000 + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' WIB';
+          let storedMode = 'off', storedUntil = null, note = 'mode=off';
+          if (mode === 'always') { storedMode = 'always'; note = 'mode=always'; }
+          else if (mode === '1d') { storedMode = 'until'; storedUntil = nowSec + 86400; note = 'mode=1d sampai ' + wibText(storedUntil); }
+          else if (mode === '1w') { storedMode = 'until'; storedUntil = nowSec + 7 * 86400; note = 'mode=1w sampai ' + wibText(storedUntil); }
+          else if (mode === '1mo') { storedMode = 'until'; storedUntil = nowSec + 30 * 86400; note = 'mode=1mo sampai ' + wibText(storedUntil); }
+          else if (mode === 'until') {
+            const until = Number(body.until);
+            if (!Number.isInteger(until)) return aj({ ok: false, error: 'until harus unix detik (integer)' }, 400);
+            if (until <= nowSec) return aj({ ok: false, error: 'until harus di masa depan' }, 400);
+            if (until > nowSec + 365 * 86400) return aj({ ok: false, error: 'until maks 1 tahun ke depan' }, 400);
+            storedMode = 'until'; storedUntil = until; note = 'mode=until sampai ' + wibText(storedUntil);
+          }
+          await B.prepare(`UPDATE cerpen_api_keys SET auto_approve_mode = ?, auto_approve_until = ? WHERE key_id = ?`).bind(storedMode, storedUntil, keyId).run();
+          await cerpenAudit('auto_approve_set', 'key', keyId, note);
+          return aj({ ok: true, key_id: keyId, auto_approve_mode: storedMode, auto_approve_until: storedUntil });
         }
         // DELETE /api/admin/cerpen-keys/:id (submission lama tetap tersimpan).
         const keyDel = path.match(/^\/api\/admin\/cerpen-keys\/([^/]+)$/);
@@ -1950,7 +1995,7 @@ async function handleFetch(request, env) {
         subSql += ` ORDER BY created_at DESC LIMIT ?`;
         subArgs.push(fLimit);
         const [keyRows, keyCounts, subRows, statRows, auditRows, last24Row, shareTotalRow, shareOpensRow, shareTopRows, shareRecentRows, shareListRows] = await Promise.all([
-          B2.prepare(`SELECT key_id, key_hash, name, created_at, revoked, daily_limit FROM cerpen_api_keys ORDER BY created_at DESC`).all(),
+          B2.prepare(`SELECT key_id, key_hash, name, created_at, revoked, daily_limit, auto_approve_mode, auto_approve_until FROM cerpen_api_keys ORDER BY created_at DESC`).all(),
           B2.prepare(`SELECT key_id, COUNT(*) AS total, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending FROM cerpen_submissions GROUP BY key_id`).all(),
           B2.prepare(subSql).bind(...subArgs).all(),
           B2.prepare(`SELECT status, COUNT(*) AS c FROM cerpen_submissions GROUP BY status`).all(),
@@ -1974,10 +2019,19 @@ async function handleFetch(request, env) {
           return `<span style="display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:800;color:#fff;background:${colors[s] || '#6b7280'}">${esc(s)}</span>`;
         };
         const statsHtml = `<div class="adm-stats"><div class="adm-stat"><span class="adm-stat-num">${keys.length}</span><span class="adm-stat-label">Total key</span><span class="adm-stat-sub">${activeKeys} aktif</span></div><div class="adm-stat"><span class="adm-stat-num">${perStatus.pending}</span><span class="adm-stat-label">Pending</span><span class="adm-stat-sub">menunggu review</span></div><div class="adm-stat"><span class="adm-stat-num">${perStatus.approved}</span><span class="adm-stat-label">Approved</span><span class="adm-stat-sub">menunggu applier VM</span></div><div class="adm-stat"><span class="adm-stat-num">${perStatus.applied}</span><span class="adm-stat-label">Applied</span><span class="adm-stat-sub">sudah masuk konten</span></div><div class="adm-stat"><span class="adm-stat-num">${perStatus.rejected}</span><span class="adm-stat-label">Rejected</span></div><div class="adm-stat"><span class="adm-stat-num">${last24h}</span><span class="adm-stat-label">24 jam terakhir</span><span class="adm-stat-sub">${totalSubs} submission total</span></div></div>`;
+        const aaLabel = (k) => {
+          const m = String(k.auto_approve_mode || 'off');
+          if (m === 'always') return 'Auto-approve: Selalu';
+          if (m === 'until' && Number(k.auto_approve_until || 0) > 0) {
+            const exp = Number(k.auto_approve_until) * 1000;
+            return Date.now() < exp ? 'Auto-approve: Aktif s/d ' + wib(exp) : 'Auto-approve: Kedaluwarsa (' + wib(exp) + ')';
+          }
+          return 'Auto-approve: Mati';
+        };
         const keyHtml = keys.map(k => {
           const c = byKey.get(k.key_id) || {};
           const revoked = Number(k.revoked) === 1;
-          return `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(k.name)}</span> <span style="font-size:12px;font-weight:700;color:${revoked ? '#dc2626' : '#22c55e'}">${revoked ? 'DICABUT' : 'AKTIF'}</span><div class="adm-row-meta">${esc(k.key_id)} · hash ${esc(String(k.key_hash || '').slice(0, 8))}… · dibuat ${wib(k.created_at)} · limit ${esc(k.daily_limit)}/hari · ${Number(c.total) || 0} submission (${Number(c.pending) || 0} pending)</div></div><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">${revoked ? `<button type="button" data-cerpen-key="unrevoke" data-id="${esc(k.key_id)}">Aktifkan</button>` : `<button type="button" data-cerpen-key="revoke" data-id="${esc(k.key_id)}">Cabut</button>`}<button type="button" data-cerpen-key="limit" data-id="${esc(k.key_id)}" data-limit="${esc(k.daily_limit)}">Limit</button><button type="button" data-cerpen-key="delete" data-id="${esc(k.key_id)}" style="background:#dc2626">Hapus</button></div></div>`;
+          return `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(k.name)}</span> <span style="font-size:12px;font-weight:700;color:${revoked ? '#dc2626' : '#22c55e'}">${revoked ? 'DICABUT' : 'AKTIF'}</span><div class="adm-row-meta">${esc(k.key_id)} · hash ${esc(String(k.key_hash || '').slice(0, 8))}… · dibuat ${wib(k.created_at)} · limit ${esc(k.daily_limit)}/hari · ${Number(c.total) || 0} submission (${Number(c.pending) || 0} pending) · ${esc(aaLabel(k))}</div></div><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">${revoked ? `<button type="button" data-cerpen-key="unrevoke" data-id="${esc(k.key_id)}">Aktifkan</button>` : `<button type="button" data-cerpen-key="revoke" data-id="${esc(k.key_id)}">Cabut</button>`}<button type="button" data-cerpen-key="limit" data-id="${esc(k.key_id)}" data-limit="${esc(k.daily_limit)}">Limit</button><button type="button" data-cerpen-aa="${esc(k.key_id)}" data-mode="${esc(String(k.auto_approve_mode || 'off'))}">Auto-approve</button><button type="button" data-cerpen-key="delete" data-id="${esc(k.key_id)}" style="background:#dc2626">Hapus</button></div></div>`;
         }).join('') || '<p>Belum ada key.</p>';
         const opt = (val, cur, label) => `<option value="${val}"${val === cur ? ' selected' : ''}>${label}</option>`;
         const statusOpts = [''].concat(['pending', 'approved', 'applied', 'rejected']).map(v => opt(v, fStatus, v === '' ? 'Semua status' : v)).join('');
@@ -2045,6 +2099,32 @@ document.querySelectorAll('[data-cerpen-share]').forEach(function (btn) {
     if (act === 'revoke' && !confirm('Cabut link share ' + id + '? Link ini tidak bisa dibuka lagi.')) return;
     try {
       await cerpenCall('POST', '/api/admin/cerpen-shares/' + id + '/' + act, {});
+      location.reload();
+    } catch (err) { cerpenShowMsg(err.message, false); }
+  });
+});
+document.querySelectorAll('[data-cerpen-aa]').forEach(function (btn) {
+  btn.addEventListener('click', async function () {
+    const id = btn.dataset.cerpenAa;
+    const cur = btn.dataset.mode || 'off';
+    const mode = prompt('Mode auto-approve untuk key ' + id + ' (saat ini: ' + cur + '):\n- off = mati\n- always = selalu setujui\n- 1d = 1 hari\n- 1w = 1 minggu\n- 1mo = 1 bulan\n- until = manual (pakai tanggal)', cur);
+    if (mode === null) return;
+    const m = mode.trim().toLowerCase();
+    if (['off', 'always', '1d', '1w', '1mo', 'until'].indexOf(m) === -1) { cerpenShowMsg('Mode tidak valid (off/always/1d/1w/1mo/until).', false); return; }
+    const body = { mode: m };
+    if (m === 'until') {
+      const d = prompt('Tanggal berakhir (format: YYYY-MM-DD HH:MM WIB):', '');
+      if (d === null) return;
+      const ts = Date.parse(d.trim().replace(' ', 'T') + ':00+07:00') / 1000;
+      if (!Number.isFinite(ts) || ts <= Date.now() / 1000) { cerpenShowMsg('Tanggal tidak valid / bukan masa depan.', false); return; }
+      body.until = Math.floor(ts);
+    }
+    const warn = m === 'always'
+      ? 'Mode SELALU: semua usulan dari key ini langsung disetujui TANPA dibaca dulu, lalu tayang. Lanjutkan?'
+      : (m === 'off' ? 'Matikan auto-approve untuk key ini?' : 'Aktifkan auto-approve (' + m + ') untuk key ini? Usulan yang masuk langsung disetujui tanpa dibaca dulu.');
+    if (!confirm(warn)) return;
+    try {
+      await cerpenCall('POST', '/api/admin/cerpen-keys/' + id + '/auto-approve', body);
       location.reload();
     } catch (err) { cerpenShowMsg(err.message, false); }
   });
