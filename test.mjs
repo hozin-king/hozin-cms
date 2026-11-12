@@ -28,6 +28,16 @@ class MockDB {
     this.users = new Map(); this.votes = []; this.rateLimits = new Map(); this.loadtestRuns = [];
     this.dracinKeys = []; this.dracinCatalog = []; this.dracinEpisodes = []; this.dracinSeeds = []; this.dracinUsage = [];
     this.viewEventSeq = 0; this.attemptSeq = 0;
+    // v62: fixture konten Cerpen (D1 stopwatch-db) untuk tes API /api/c/*/cerpen/*
+    this.cerpenManifest = [{ key: 'version', value: '1' }, { key: 'updated_at', value: '2026-11-12T00:00:00+07:00' }, { key: 'counts', value: '{"cerpen_series":1,"cerpen_episodes":2}' }];
+    this.cerpenSeries = [{ id: 'cerpen-01', judul: 'Surat Tanpa Nama', genre: 'Misteri', deskripsi: '', cover_url: 'https://example.com/c1.jpg', status: 'aktif' }];
+    this.cerpenEpisodes = [
+      { series_id: 'cerpen-01', season: 1, no: 1, judul: 'Lestari Tiba', isi_cipher: 'QUJD', word_count: 100 },
+      { series_id: 'cerpen-01', season: 1, no: 2, judul: 'Yang Tidak Beres', isi_cipher: 'REVG', word_count: 120 },
+    ];
+    this.cerpenKomik = [{ id: 'komik-01', judul: 'Komik Tes', genre: '', deskripsi: '', cover_url: '' }];
+    this.cerpenKomikEpisodes = [{ komik_id: 'komik-01', no: 1, judul: 'Episode 1', panels_cipher: 'UEFORQ==', panels_count: 2 }];
+    this.cerpenNews = [{ id: 'news-1', title: 'Judul Berita', summary: 'Ringkasan', source_name: 'Sumber', source_url: 'https://example.com/a', image_url: 'https://example.com/i.jpg', topic: 'tekno', published_at: '2026-11-12', added_at: '2026-11-12' }];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { this.batchCalls = (this.batchCalls || 0) + 1; for (const s of stmts) await s.run(); }
@@ -226,6 +236,19 @@ class MockDB {
     if (s.startsWith('SELECT * FROM dracin_seeds ORDER BY platform ASC, query ASC')) return [...this.dracinSeeds].sort((x, y) => (x.platform + x.query).localeCompare(y.platform + y.query));
     if (s.startsWith('SELECT * FROM dracin_seeds WHERE platform')) return this.dracinSeeds.filter(x => x.platform === a[0] && x.query === a[1]);
     if (s.startsWith('SELECT * FROM hacklab_lessons')) return [];
+    // v62: mock tabel konten Cerpen (dipakai endpoint /api/c/*/cerpen/*)
+    if (s.startsWith('SELECT key, value FROM cerpen_manifest')) return this.cerpenManifest;
+    if (s.startsWith('SELECT id, judul, genre, deskripsi, cover_url, status FROM cerpen_series')) return this.cerpenSeries;
+    if (s.startsWith('SELECT no, judul, word_count FROM cerpen_episodes')) return this.cerpenEpisodes.filter(e => e.series_id === a[0] && e.season === a[1]).map(e => ({ no: e.no, judul: e.judul, word_count: e.word_count }));
+    if (s.startsWith('SELECT series_id, season, no, judul, isi_cipher, word_count FROM cerpen_episodes')) return this.cerpenEpisodes.filter(e => e.series_id === a[0] && e.season === a[1] && e.no === a[2]);
+    if (s.startsWith('SELECT id, judul, genre, deskripsi, cover_url FROM cerpen_komik')) return this.cerpenKomik;
+    if (s.startsWith('SELECT no, judul, panels_count FROM cerpen_komik_episodes')) return this.cerpenKomikEpisodes.filter(e => e.komik_id === a[0]).map(e => ({ no: e.no, judul: e.judul, panels_count: e.panels_count }));
+    if (s.startsWith('SELECT komik_id, no, judul, panels_cipher, panels_count FROM cerpen_komik_episodes')) return this.cerpenKomikEpisodes.filter(e => e.komik_id === a[0] && e.no === a[1]);
+    if (s.startsWith('SELECT id, title, summary, source_name, source_url, image_url, topic, published_at, added_at FROM cerpen_news')) {
+      let rows = [...this.cerpenNews];
+      if (s.includes('WHERE added_at > ?')) { rows = rows.filter(n => n.added_at > a[0]); return rows.slice(0, a[1]); }
+      return rows.slice(0, a[0]);
+    }
     if (s.startsWith('INSERT INTO dracin_api_usage')) { this.dracinUsage.push({ ts: a[0], key_id: a[1], endpoint: a[2], method: a[3], status: a[4], country: a[5], region: a[6], city: a[7] }); return []; }
     if (s.startsWith('INSERT INTO dracin_api_keys')) { this.dracinKeys.push({ id: a[0], name: a[1], key_hash: a[2], scope: a[3], active: a[4], created_at: a[5] }); return []; }
     if (s.startsWith('UPDATE dracin_api_keys SET active = 0')) { const k = this.dracinKeys.find(x => x.id === a[0]); if (k) k.active = 0; return []; }
@@ -254,7 +277,7 @@ class MockDB {
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
-const env = { DB: new MockDB(), BACKUP_DB: new MockDB(), ADMIN_TOKEN: 'test-admin-token' };
+const env = { DB: new MockDB(), BACKUP_DB: new MockDB(), ADMIN_TOKEN: 'test-admin-token', CERPEN_PATH_KEY: '11'.repeat(32) };
 const base = 'https://cms.test';
 async function call(method, path, body = null, cookie = '') {
   const headers = {};
@@ -944,6 +967,51 @@ assert(r.status === 200 && t.includes('Status Situs') && t.includes('Online seja
 r = await callJson('GET', '/api/hacklab/lessons', null);
 let j = await r.json();
 assert(r.status === 200 && Array.isArray(j.lessons) && j.lessons.length === 0, 'hacklab: katalog pelajaran kosong di mock');
+// ---- v62: API konten Cerpen dari D1 (path muter tiap jam) ----
+async function cerpenHashForTest(offsetMs = 0) {
+  const keyHex = env.CERPEN_PATH_KEY;
+  const keyBytes = new Uint8Array(keyHex.match(/../g).map(h => parseInt(h, 16)));
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const d = new Date(Date.now() + offsetMs + 7 * 3600000);
+  const hour = d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0') + '-' + String(d.getUTCHours()).padStart(2, '0');
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(hour));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 12);
+}
+const cHash = await cerpenHashForTest(0);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null);
+j = await r.json();
+assert(r.status === 200 && j.version === '1' && j.counts && j.counts.cerpen_series === 1, 'cerpen-api: manifest terbaca dengan hash jam ini');
+r = await callJson('GET', `/api/c/${'0'.repeat(12)}/cerpen/manifest`, null);
+assert(r.status === 404, 'cerpen-api: hash salah ditolak 404');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/series`, null);
+j = await r.json();
+assert(r.status === 200 && Array.isArray(j.series) && j.series.length === 1 && j.series[0].id === 'cerpen-01', 'cerpen-api: daftar series terbaca');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/episodes?series=cerpen-01&season=1`, null);
+j = await r.json();
+assert(r.status === 200 && Array.isArray(j.episodes) && j.episodes.length === 2, 'cerpen-api: daftar episode terbaca');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1&no=1`, null);
+j = await r.json();
+assert(r.status === 200 && j.episode && j.episode.isi_cipher === 'QUJD', 'cerpen-api: isi episode terbaca (cipher)');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1`, null);
+assert(r.status === 400, 'cerpen-api: parameter kurang ditolak 400');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1&no=99`, null);
+assert(r.status === 404, 'cerpen-api: episode tidak ada ditolak 404');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/komik`, null);
+j = await r.json();
+assert(r.status === 200 && Array.isArray(j.komik) && j.komik.length === 1, 'cerpen-api: daftar komik terbaca');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/komik-episode?komik=komik-01&no=1`, null);
+j = await r.json();
+assert(r.status === 200 && j.episode && j.episode.panels_cipher === 'UEFORQ==', 'cerpen-api: episode komik terbaca (cipher)');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/news?limit=1`, null);
+j = await r.json();
+assert(r.status === 200 && Array.isArray(j.news) && j.news.length === 1, 'cerpen-api: berita terbaca');
+const oldHash = await cerpenHashForTest(-3600000);
+r = await callJson('GET', `/api/c/${oldHash}/cerpen/manifest`, null);
+assert(r.status === 200, 'cerpen-api: hash jam sebelumnya masih diterima (toleransi ±1 jam)');
+const savedCerpenBak = env.BACKUP_DB; delete env.BACKUP_DB;
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null);
+assert(r.status === 503, 'cerpen-api: tanpa BACKUP_DB -> 503');
+env.BACKUP_DB = savedCerpenBak;
 r = await callJson('GET', '/api/dracin/catalog', null);
 j = await r.json();
 assert(r.status === 200 && j.ok === true && Array.isArray(j.titles), 'dracin: katalog publik bisa dibaca tanpa kunci');

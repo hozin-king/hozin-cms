@@ -421,7 +421,7 @@ function keyDot(e) {
   return '⚪';
 }
 
-// ---- Remote config Cerpen Hozin (aplikasi Android, v61, 11 Nov 2026) ----
+// ---- Remote config Cerpen Hozin (aplikasi Android, v62, 12 Nov 2026) ----
 // Kontrak bersama dengan sisi aplikasi (JANGAN ubah skema): tabs urutan =
 // urutan dock; id di luar 4 itu diabaikan aplikasi; label kosong = label
 // bawaan; visible:false = tab disembunyikan; banner kosong = tidak tampil;
@@ -628,6 +628,112 @@ async function handleFetch(request, env) {
     if (request.method === 'GET' && path === '/api/cerpen-config') {
       const cfg = await getCerpenConfig(env);
       return new Response(JSON.stringify(cfg), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=60' } });
+    }
+
+    // ---- Publik: konten Cerpen Hozin dari D1 (aplikasi Android, v62, 12 Nov 2026) ----
+    // Aplikasi Cerpen mengambil daftar + isi dari sini (dulu dari file .enc
+    // di repo GitHub). Isi episode/panel TETAP terenkripsi AES-256-GCM
+    // (base64) — Worker hanya menyajikan, dekripsi di aplikasi.
+    // Path muter tiap jam: /api/c/<12 hex>/cerpen/... dengan hash =
+    // HMAC-SHA256(kunci-jalur, "YYYY-MM-DD-HH" WIB) 12 hex pertama.
+    // Kunci-jalur = SHA-256(kunci-konten || "cerpen-api-v1") — diturunkan
+    // dari kunci konten yang sama, disimpan sebagai secret Worker
+    // CERPEN_PATH_KEY (hex 64). Ini KAMUFLASE, bukan keamanan: perlindungan
+    // beneran tetap enkripsi isi. Hash salah / secret belum diset -> 404
+    // (tidak bisa dibedakan dari rute tak dikenal). BACKUP_DB hilang -> 503.
+    // Toleransi jam ±1 (jam HP bisa meleset). Read-only, tanpa auth lain.
+    if (request.method === 'GET' && path.startsWith('/api/c/')) {
+      const cpJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': status === 200 ? 'public, max-age=60' : 'no-store' } });
+      const parts = path.split('/').filter(Boolean); // ['api','c',hash,'cerpen',res]
+      const cerpenHashOk = async (hash) => {
+        const keyHex = env.CERPEN_PATH_KEY;
+        if (!keyHex || !/^[0-9a-f]{64}$/.test(keyHex) || !/^[0-9a-f]{12}$/.test(hash || '')) return false;
+        const keyBytes = new Uint8Array(keyHex.match(/../g).map(h => parseInt(h, 16)));
+        const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const now = Date.now();
+        for (const off of [-3600000, 0, 3600000]) {
+          const d = new Date(now + off + 7 * 3600000); // WIB
+          const hour = d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0') + '-' + String(d.getUTCHours()).padStart(2, '0');
+          const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(hour));
+          const hex = [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
+          if (hex.slice(0, 12) === hash) return true;
+        }
+        return false;
+      };
+      if (parts.length < 5 || parts[0] !== 'api' || parts[1] !== 'c' || parts[3] !== 'cerpen') {
+        return new Response('Not found', { status: 404 });
+      }
+      if (!(await cerpenHashOk(parts[2]))) {
+        return new Response('Not found', { status: 404 });
+      }
+      if (!env.BACKUP_DB) return cpJson({ ok: false, error: 'database tidak tersedia' }, 503);
+      const res = parts[4];
+      const url = new URL(request.url);
+      const q = (name) => url.searchParams.get(name);
+      try {
+        if (res === 'manifest') {
+          const rows = await env.BACKUP_DB.prepare(`SELECT key, value FROM cerpen_manifest`).all();
+          const m = {};
+          for (const r of (rows.results || [])) m[r.key] = r.value;
+          let counts = {};
+          try { counts = JSON.parse(m.counts || '{}'); } catch (e) { counts = {}; }
+          return cpJson({ version: m.version || '0', updated_at: m.updated_at || '', counts }, 200);
+        }
+        if (res === 'series') {
+          const rows = await env.BACKUP_DB.prepare(`SELECT id, judul, genre, deskripsi, cover_url, status FROM cerpen_series ORDER BY judul ASC`).all();
+          return cpJson({ series: rows.results || [] }, 200);
+        }
+        if (res === 'episodes') {
+          const series = q('series') || '';
+          const season = parseInt(q('season') || '', 10);
+          if (!series || series.length > 64 || !Number.isInteger(season) || season < 1 || season > 99) return cpJson({ ok: false, error: 'parameter tidak valid' }, 400);
+          const rows = await env.BACKUP_DB.prepare(`SELECT no, judul, word_count FROM cerpen_episodes WHERE series_id = ? AND season = ? ORDER BY no ASC`).bind(series, season).all();
+          return cpJson({ episodes: rows.results || [] }, 200);
+        }
+        if (res === 'episode') {
+          const series = q('series') || '';
+          const season = parseInt(q('season') || '', 10);
+          const no = parseInt(q('no') || '', 10);
+          if (!series || series.length > 64 || !Number.isInteger(season) || season < 1 || season > 99 || !Number.isInteger(no) || no < 1 || no > 9999) return cpJson({ ok: false, error: 'parameter tidak valid' }, 400);
+          const rows = await env.BACKUP_DB.prepare(`SELECT series_id, season, no, judul, isi_cipher, word_count FROM cerpen_episodes WHERE series_id = ? AND season = ? AND no = ?`).bind(series, season, no).all();
+          const ep = (rows.results || [])[0];
+          if (!ep) return cpJson({ ok: false, error: 'episode tidak ditemukan' }, 404);
+          return cpJson({ episode: ep }, 200);
+        }
+        if (res === 'komik') {
+          const rows = await env.BACKUP_DB.prepare(`SELECT id, judul, genre, deskripsi, cover_url FROM cerpen_komik ORDER BY judul ASC`).all();
+          return cpJson({ komik: rows.results || [] }, 200);
+        }
+        if (res === 'komik-episodes') {
+          const komik = q('komik') || '';
+          if (!komik || komik.length > 64) return cpJson({ ok: false, error: 'parameter tidak valid' }, 400);
+          const rows = await env.BACKUP_DB.prepare(`SELECT no, judul, panels_count FROM cerpen_komik_episodes WHERE komik_id = ? ORDER BY no ASC`).bind(komik).all();
+          return cpJson({ episodes: rows.results || [] }, 200);
+        }
+        if (res === 'komik-episode') {
+          const komik = q('komik') || '';
+          const no = parseInt(q('no') || '', 10);
+          if (!komik || komik.length > 64 || !Number.isInteger(no) || no < 1 || no > 9999) return cpJson({ ok: false, error: 'parameter tidak valid' }, 400);
+          const rows = await env.BACKUP_DB.prepare(`SELECT komik_id, no, judul, panels_cipher, panels_count FROM cerpen_komik_episodes WHERE komik_id = ? AND no = ?`).bind(komik, no).all();
+          const ep = (rows.results || [])[0];
+          if (!ep) return cpJson({ ok: false, error: 'episode tidak ditemukan' }, 404);
+          return cpJson({ episode: ep }, 200);
+        }
+        if (res === 'news') {
+          const since = q('since') || '';
+          const limit = Math.min(Math.max(parseInt(q('limit') || '50', 10) || 50, 1), 100);
+          let rows;
+          if (since && /^\d{4}-\d{2}-\d{2}$/.test(since)) {
+            rows = await env.BACKUP_DB.prepare(`SELECT id, title, summary, source_name, source_url, image_url, topic, published_at, added_at FROM cerpen_news WHERE added_at > ? ORDER BY added_at DESC LIMIT ?`).bind(since, limit).all();
+          } else {
+            rows = await env.BACKUP_DB.prepare(`SELECT id, title, summary, source_name, source_url, image_url, topic, published_at, added_at FROM cerpen_news ORDER BY added_at DESC LIMIT ?`).bind(limit).all();
+          }
+          return cpJson({ news: rows.results || [] }, 200);
+        }
+        return new Response('Not found', { status: 404 });
+      } catch (e) {
+        return cpJson({ ok: false, error: 'gagal membaca database' }, 500);
+      }
     }
 
     // ---- Laporan hasil load test (BUKAN jalur admin) ----
