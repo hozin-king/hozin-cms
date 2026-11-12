@@ -1335,7 +1335,7 @@ r = await callJson('POST', '/api/share/create', { content_type: 'video', content
 assert(r.status === 400, 'share: create content_type tidak valid ditolak 400');
 r = await callJson('POST', '/api/share/create', { content_type: 'cerpen', content_id: 'cerpen-01', device: 'POCO X6 Pro' });
 jj = await r.json();
-assert(r.status === 201 && jj.ok && /^https:\/\/hozinking\.my\.id\/s\/[A-Za-z0-9_-]+$/.test(jj.url) && !jj.url.includes('cerpen-01'), 'share: create cerpen-01 -> 201 + URL opaque (tanpa id konten)');
+assert(r.status === 201 && jj.ok && /^https:\/\/cms\.test\/s\/[A-Za-z0-9_-]+$/.test(jj.url) && !jj.url.includes('cerpen-01'), 'share: create cerpen-01 -> 201 + URL opaque (tanpa id konten, ikut origin request)');
 const shareUrl = jj.url;
 const shareToken = shareUrl.split('/s/')[1];
 const shareRow = env.BACKUP_DB.cerpenShareLinks.find(x => x.content_id === 'cerpen-01' && x.content_type === 'cerpen');
@@ -1345,7 +1345,21 @@ jj = await r.json();
 assert(r.status === 200 && jj.ok && jj.content_type === 'cerpen' && jj.content_id === 'cerpen-01' && jj.season === null && jj.episode_no === null, 'share: resolve token valid -> konten benar');
 assert(env.BACKUP_DB.cerpenShareOpens.length === 1 && env.BACKUP_DB.cerpenShareOpens[0].via === 'app' && env.BACKUP_DB.cerpenShareOpens[0].share_id === shareRow.id, 'share: resolve mencatat pembukaan via=app');
 r = await call('GET', '/s/' + shareToken); t = await r.text();
-assert(r.status === 200 && t.includes('Surat Tanpa Nama') && t.includes('Buka di Aplikasi') && t.includes('intent://hozinking.my.id/s/') && t.includes('package=com.hozinking.cerpen') && t.includes('Download Aplikasi') && t.includes('github.com/hozin-king/cerpen-hozin/releases/latest'), 'share: landing berisi judul + tombol aplikasi (intent) + download');
+assert(r.status === 200 && t.includes('Surat Tanpa Nama') && t.includes('Buka di Aplikasi') && t.includes('intent://cms.test/s/') && t.includes('package=com.hozinking.cerpen') && t.includes('Download Aplikasi') && t.includes('github.com/hozin-king/cerpen-hozin/releases/latest'), 'share: landing berisi judul + tombol aplikasi (intent) + download');
+// Backup host: request lewat workers.dev -> URL share + intent ikut host itu
+async function callHost(host, method, path, obj = null) {
+  const req = new Request(host + path, { method, headers: { 'content-type': 'application/json' }, body: obj === null ? undefined : JSON.stringify(obj) });
+  return worker.fetch(req, env);
+}
+const _linksBefore = env.BACKUP_DB.cerpenShareLinks.length; const _opensBefore = env.BACKUP_DB.cerpenShareOpens.length;
+r = await callHost('https://hozin-cms.muchammadhozin.workers.dev', 'POST', '/api/share/create', { content_type: 'cerpen', content_id: 'cerpen-01', device: 'POCO X6 Pro' });
+jj = await r.json();
+assert(r.status === 201 && jj.ok && /^https:\/\/hozin-cms\.muchammadhozin\.workers\.dev\/s\/[A-Za-z0-9_-]+$/.test(jj.url), 'share: create via workers.dev -> 201 + URL backup (bukan hozinking.my.id)');
+const wdToken = jj.url.split('/s/')[1];
+r = await callHost('https://hozin-cms.muchammadhozin.workers.dev', 'GET', '/s/' + wdToken);
+t = await r.text();
+assert(r.status === 200 && t.includes('intent://hozin-cms.muchammadhozin.workers.dev/s/') && t.includes('Surat Tanpa Nama'), 'share: landing via workers.dev -> intent ikut host backup');
+env.BACKUP_DB.cerpenShareLinks.splice(_linksBefore); env.BACKUP_DB.cerpenShareOpens.splice(_opensBefore);
 assert(Number(env.BACKUP_DB.cerpenShareLinks.find(x => x.id === shareRow.id).opens_count) === 2 && env.BACKUP_DB.cerpenShareOpens.length === 2 && env.BACKUP_DB.cerpenShareOpens[1].via === 'browser', 'share: landing mencatat pembukaan via=browser + opens_count naik');
 // Token rusak / token lain -> 404 (tidak dibedakan)
 const badToken = shareToken.slice(0, -1) + (shareToken.slice(-1) === 'A' ? 'B' : 'A');

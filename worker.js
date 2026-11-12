@@ -1045,7 +1045,7 @@ async function handleFetch(request, env) {
       } catch (e) {
         return shJson({ ok: false, error: 'gagal menyimpan link share' }, 500);
       }
-      return shJson({ ok: true, url: 'https://hozinking.my.id/s/' + token }, 201);
+      return shJson({ ok: true, url: url.origin + '/s/' + token }, 201);
     }
 
     // GET /api/share/resolve?token=... — dipakai aplikasi Cerpen untuk
@@ -1096,11 +1096,11 @@ async function handleFetch(request, env) {
       }
       if (!meta) return notFound();
       await shareLogOpen(env.BACKUP_DB, payload.share_id, request, 'browser');
-      const pageUrl = 'https://hozinking.my.id/s/' + token;
-      const intentUrl = 'intent://hozinking.my.id/s/' + token + '#Intent;scheme=https;package=' + SHARE_APP_PACKAGE + ';S.browser_fallback_url=' + encodeURIComponent(pageUrl) + ';end';
+      const pageUrl = url.origin + '/s/' + token;
+      const intentUrl = 'intent://' + url.host + '/s/' + token + '#Intent;scheme=https;package=' + SHARE_APP_PACKAGE + ';S.browser_fallback_url=' + encodeURIComponent(pageUrl) + ';end';
       const typeLabel = SHARE_TYPE_LABEL[payload.content_type] || payload.content_type;
       const epLabel = payload.episode_no ? ` · Episode ${payload.episode_no}` : (payload.season ? ` · Season ${payload.season}` : '');
-      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:4px 14px;border-radius:999px;background:rgba(59,130,246,.16);color:#3b82f6;font-weight:800;font-size:13px">${esc(typeLabel)}${esc(epLabel)}${meta.genre ? ' · ' + esc(meta.genre) : ''}</span></p><h2 style="margin:8px 0 10px">${esc(meta.title)}</h2>${meta.description ? `<p style="max-width:560px;margin:0 auto 20px;line-height:1.6">${esc(meta.description)}</p>` : ''}<p><a href="${esc(intentUrl)}" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:700;padding:12px 24px;border-radius:10px;text-decoration:none;min-height:44px;line-height:44px">Buka di Aplikasi</a></p><p><a href="https://github.com/hozin-king/cerpen-hozin/releases/latest" style="display:inline-block;font-weight:700;padding:12px 24px;border-radius:10px;border:1px solid rgba(128,128,128,.4);text-decoration:none;color:inherit">Download Aplikasi</a></p><p style="font-size:13px;opacity:.65;margin:18px 0 0">Belum memasang Cerpen Hozin? Unduh aplikasinya dulu, lalu buka lagi link ini — konten akan terbuka langsung di aplikasi.</p></div><p><a href="/">← Beranda hozinking.my.id</a></p>`;
+      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:4px 14px;border-radius:999px;background:rgba(59,130,246,.16);color:#3b82f6;font-weight:800;font-size:13px">${esc(typeLabel)}${esc(epLabel)}${meta.genre ? ' · ' + esc(meta.genre) : ''}</span></p><h2 style="margin:8px 0 10px">${esc(meta.title)}</h2>${meta.description ? `<p style="max-width:560px;margin:0 auto 20px;line-height:1.6">${esc(meta.description)}</p>` : ''}<p><a href="${esc(intentUrl)}" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:700;padding:12px 24px;border-radius:10px;text-decoration:none;min-height:44px;line-height:44px">Buka di Aplikasi</a></p><p><a href="https://github.com/hozin-king/cerpen-hozin/releases/latest" style="display:inline-block;font-weight:700;padding:12px 24px;border-radius:10px;border:1px solid rgba(128,128,128,.4);text-decoration:none;color:inherit">Download Aplikasi</a></p><p style="font-size:13px;opacity:.65;margin:18px 0 0">Belum memasang Cerpen Hozin? Unduh aplikasinya dulu, lalu buka lagi link ini — konten akan terbuka langsung di aplikasi.</p></div><p><a href="/">← Beranda</a></p>`;
       return html(await renderPage(env, meta.title, content), 200);
     }
 
