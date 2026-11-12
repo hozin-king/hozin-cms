@@ -290,6 +290,7 @@ class MockDB {
     if (s.startsWith('SELECT key_id FROM cerpen_api_keys WHERE key_hash = ?')) return this.cerpenApiKeys.filter(k => k.key_hash === a[0]);
     if (s.startsWith('SELECT key_id FROM cerpen_api_keys WHERE key_id = ?')) return this.cerpenApiKeys.filter(k => k.key_id === a[0]);
     if (s.startsWith('INSERT INTO cerpen_api_keys')) { this.cerpenApiKeys.push({ key_id: a[0], key_hash: a[1], name: a[2], created_at: a[3], revoked: 0, daily_limit: a[4] }); return []; }
+    if (s.startsWith('INSERT INTO md_backup_keys')) { this.mdBackupKeys.push({ key_id: a[0], key_hash: a[1], name: a[2], created_at: a[3], revoked: 0, daily_limit: a[4] }); return []; }
     if (s.startsWith('UPDATE cerpen_api_keys SET daily_limit = ?')) { const k = this.cerpenApiKeys.find(x => x.key_id === a[1]); if (k) k.daily_limit = a[0]; return []; }
     if (s.startsWith('UPDATE cerpen_api_keys SET revoked = ?')) { const k = this.cerpenApiKeys.find(x => x.key_id === a[1]); if (k) k.revoked = a[0]; return []; }
     if (s.startsWith('DELETE FROM cerpen_api_keys')) { this.cerpenApiKeys = this.cerpenApiKeys.filter(k => k.key_id !== a[0]); return []; }
@@ -1543,6 +1544,15 @@ r = await mdCall({ path: 'data/uji.md', content: 'x baru' }, mdAuth); assert(r.s
 r = await callJson('POST', '/api/admin/md-backup-keys/mdk-cccccccc/unrevoke', {}, admH); assert(r.status === 200, 'md-backup-admin: unrevoke key');
 r = await callJson('POST', '/api/admin/md-backup-keys/mdk-cccccccc/limit', { daily_limit: 101 }, admH); assert(r.status === 400, 'md-backup-admin: limit 101 ditolak 400');
 r = await callJson('POST', '/api/admin/md-backup-keys/mdk-00000000/revoke', {}, admH); assert(r.status === 404, 'md-backup-admin: key hilang -> 404');
+// Daftarkan kunci baru dari plaintext (v73): tanpa auth -> 401;
+// kunci pendek -> 400; berhasil -> key_id mdk-... dan plaintext TIDAK
+// kembali; kunci sama -> 409; kunci baru langsung bisa submit.
+r = await callJson('POST', '/api/admin/md-backup-keys', { name: 'uji-baru', key: 'kunci-rahasia-uji-1234', daily_limit: 50 }, {}); assert(r.status === 401, 'md-backup-admin: daftar kunci tanpa auth ditolak 401');
+r = await callJson('POST', '/api/admin/md-backup-keys', { name: 'uji-baru', key: 'pendek', daily_limit: 50 }, admH); assert(r.status === 400, 'md-backup-admin: kunci pendek ditolak 400');
+r = await callJson('POST', '/api/admin/md-backup-keys', { name: 'uji-baru', key: 'kunci-rahasia-uji-1234', daily_limit: 50 }, admH); jj = await r.json();
+assert(r.status === 200 && jj.ok && /^mdk-[0-9a-f]{8}$/.test(jj.key_id) && !('key_hash' in jj) && !('key' in jj), 'md-backup-admin: daftar kunci baru, plaintext tidak kembali');
+r = await callJson('POST', '/api/admin/md-backup-keys', { name: 'duplikat', key: 'kunci-rahasia-uji-1234', daily_limit: 50 }, admH); assert(r.status === 409, 'md-backup-admin: kunci sama ditolak 409');
+r = await mdCall({ path: 'data/baru.md', content: 'dari kunci baru' }, { Authorization: 'Bearer kunci-rahasia-uji-1234' }); assert(r.status === 201, 'md-backup: kunci baru terdaftar bisa submit');
 // Halaman admin + viewer render ala GitHub
 r = await call('GET', '/kendali/md-backup'); assert(r.status === 303 && (r.headers.get('location') || '') === '/akun?pesan=login', 'md-backup: halaman tanpa auth dialihkan ke login');
 r = await call('GET', '/kendali/md-backup', null, cookie); t = await r.text();
@@ -1561,4 +1571,10 @@ r = await call('GET', '/kendali/cerpen-api', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('.adm-row{display:flex;flex-wrap:wrap') && t.includes('.adm-row-body{flex:1 1 220px') && t.includes('.adm-row-title{') && t.includes('overflow-wrap:break-word'), 'layout-mobile: CSS baris admin membungkus + judul patah di batas kata');
 r = await call('GET', '/kendali/md-backup', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('.adm-row{display:flex;flex-wrap:wrap') && t.includes('white-space:nowrap'), 'layout-mobile: halaman md-backup memakai CSS baris yang sama');
+assert(r.status === 200 && t.includes('id="md-key-form"') && t.includes('Daftarkan kunci'), 'md-backup: form daftar kunci tampil di panel');
+// 44. Nav admin tata ulang (v73, 12 Nov 2026): dari strip scroll horizontal
+// jadi grid yang membungkus — semua menu kelihatan tanpa geser, dan nav
+// tidak lagi sticky (tidak makan layar di HP).
+r = await call('GET', '/kendali/md-backup', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('.adm-nav{display:flex;flex-wrap:wrap') && !t.includes('.adm-nav{position:sticky') && !t.includes('overflow-x:auto;padding:10px 8px'), 'layout-nav: nav admin grid membungkus, tanpa scroll horizontal dan tanpa sticky');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

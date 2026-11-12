@@ -281,9 +281,8 @@ async function routeDracin(request, env, url) {
 // tint abu-abu tembus pandang + aksen biru situs supaya cocok di tema
 // gelap maupun terang.
 const ADMIN_CSS = `<style>
-.adm-nav{position:sticky;top:0;z-index:20;display:flex;gap:8px;overflow-x:auto;padding:10px 8px;margin:0 -4px 18px;background:rgba(128,128,128,.14);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);border:1px solid rgba(128,128,128,.18);border-radius:14px;scrollbar-width:none}
-.adm-nav::-webkit-scrollbar{display:none}
-.adm-nav a{flex:none;display:inline-flex;align-items:center;padding:9px 14px;border-radius:999px;background:rgba(128,128,128,.10);border:1px solid rgba(128,128,128,.16);color:inherit;text-decoration:none;font-size:14px;font-weight:600;white-space:nowrap;min-height:44px;box-sizing:border-box}
+.adm-nav{display:flex;flex-wrap:wrap;gap:8px;padding:10px;margin:0 -4px 18px;background:rgba(128,128,128,.14);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);border:1px solid rgba(128,128,128,.18);border-radius:14px}
+.adm-nav a{flex:1 1 auto;display:inline-flex;align-items:center;justify-content:center;padding:9px 10px;border-radius:999px;background:rgba(128,128,128,.10);border:1px solid rgba(128,128,128,.16);color:inherit;text-decoration:none;font-size:14px;font-weight:600;white-space:nowrap;min-height:44px;box-sizing:border-box;text-align:center}
 .adm-nav a.on{background:#3b82f6;border-color:#3b82f6;color:#fff}
 .adm-head{display:flex;gap:14px;align-items:flex-start;margin:2px 0 6px}
 .adm-head-mark{flex:none;width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:800;box-shadow:0 4px 14px rgba(59,130,246,.35)}
@@ -1397,6 +1396,32 @@ async function handleFetch(request, env) {
             backups: byKey.get(k.key_id) || 0,
           })) });
         }
+        // POST /api/admin/md-backup-keys — daftar kunci BARU dari
+        // PLAINTEXT (v73): Worker yang hash di server (sha256Hex), plaintext
+        // TIDAK PERNAH disimpan atau dikembalikan — pemilik kunci wajib
+        // mencatatnya sendiri sebelum submit. Duplikat hash -> 409.
+        if (path === '/api/admin/md-backup-keys' && request.method === 'POST') {
+          const { body, err } = await readJsonBody();
+          if (err) return aj({ ok: false, error: err }, 400);
+          const name = String(body.name || '').trim();
+          const key = String(body.key || '');
+          const dl = body.daily_limit === undefined ? 50 : Number(body.daily_limit);
+          if (!name || name.length > 50) return aj({ ok: false, error: 'nama harus 1–50 karakter' }, 400);
+          if (key.length < 16 || key.length > 128) return aj({ ok: false, error: 'kunci harus 16–128 karakter' }, 400);
+          if (!Number.isInteger(dl) || dl < 1 || dl > 100) return aj({ ok: false, error: 'daily_limit harus 1–100' }, 400);
+          const hash = await sha256Hex(key);
+          const dup = await B.prepare(`SELECT key_id, key_hash, name, revoked, daily_limit FROM md_backup_keys WHERE key_hash = ?`).bind(hash).first();
+          if (dup) return aj({ ok: false, error: 'kunci ini sudah terdaftar' }, 409);
+          let keyId = 'mdk-' + randomHex(4);
+          for (let i = 0; i < 5; i++) {
+            const ex = await B.prepare(`SELECT key_id FROM md_backup_keys WHERE key_id = ?`).bind(keyId).first();
+            if (!ex) break;
+            keyId = 'mdk-' + randomHex(4);
+          }
+          await B.prepare(`INSERT INTO md_backup_keys (key_id, key_hash, name, created_at, revoked, daily_limit) VALUES (?, ?, ?, ?, 0, ?)`).bind(keyId, hash, name, Date.now(), dl).run();
+          await mdAudit('md_key_create', 'md_key', keyId, 'name=' + name);
+          return aj({ ok: true, key_id: keyId, name, daily_limit: dl });
+        }
         // POST /api/admin/md-backup-keys/:id/revoke|unrevoke|limit
         const mdKeyAction = path.match(/^\/api\/admin\/md-backup-keys\/([^/]+)\/(revoke|unrevoke|limit)$/);
         if (mdKeyAction && request.method === 'POST') {
@@ -2418,7 +2443,7 @@ document.getElementById('cerpen-reject').addEventListener('click', async functio
 .md-view th,.md-view td{border:1px solid rgba(128,128,128,.4);padding:6px 10px;text-align:left}
 .md-view blockquote{border-left:4px solid rgba(128,128,128,.5);margin:12px 0;padding:2px 14px;opacity:.85}
 .md-view img{max-width:100%}
-</style><div class="card"><h3>Kunci API .md</h3>${keyHtml}<p style="font-size:13px;opacity:.7">Kunci dibuat &amp; disimpan oleh pemiliknya (Sekar); di sini hanya hash-nya yang tersimpan. Backup baru masuk lewat POST /api/md-backup dengan header Authorization: Bearer &lt;key&gt;.</p></div><div class="card"><h3>File ter-backup</h3>${fileHtml}</div>${versionsHtml}${viewerHtml}<div class="card"><h3>Riwayat admin (.md)</h3>${auditHtml}</div><script>
+</style><div class="card"><h3>Kunci API .md</h3>${keyHtml}<p style="font-size:13px;opacity:.7">Kunci dibuat &amp; disimpan oleh pemiliknya (Sekar); di sini hanya hash-nya yang tersimpan. Backup baru masuk lewat POST /api/md-backup dengan header Authorization: Bearer &lt;key&gt;.</p><form id="md-key-form" style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-top:12px"><label style="flex:1 1 140px">Nama<input name="name" placeholder="cth. alyaa-md-backup" style="width:100%;box-sizing:border-box" required maxlength="50"></label><label style="flex:2 1 200px">Kunci baru<input name="key" placeholder="min. 16 karakter — ketik kunci pilihanmu" style="width:100%;box-sizing:border-box" required minlength="16" maxlength="128" autocomplete="off"></label><label style="flex:0 1 90px">Limit/hari<input name="daily_limit" type="number" value="50" min="1" max="100" style="width:100%;box-sizing:border-box"></label><button type="submit">Daftarkan kunci</button></form><p style="font-size:13px;opacity:.7">Kunci yang diketik di sini di-hash oleh server — plaintext tidak pernah disimpan atau ditampilkan lagi. Catat kuncinya di tempat aman sebelum submit; kunci yang sama dipakai di header Authorization: Bearer &lt;key&gt; saat backup.</p></div><div class="card"><h3>File ter-backup</h3>${fileHtml}</div>${versionsHtml}${viewerHtml}<div class="card"><h3>Riwayat admin (.md)</h3>${auditHtml}</div><script>
 const MD_CSRF = "${csrf}";
 const mdMsg = document.getElementById('md-msg');
 function mdEscHtml(s) { return String(s == null ? '' : s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'); }
@@ -2457,6 +2482,18 @@ document.querySelectorAll('[data-md-restore]').forEach(function (btn) {
     } catch (err) { mdShowMsg(err.message, false); }
   });
 });
+const mdKeyForm = document.getElementById('md-key-form');
+if (mdKeyForm) {
+  mdKeyForm.addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    const f = ev.target;
+    try {
+      const data = await mdCall('POST', '/api/admin/md-backup-keys', { name: f.name.value.trim(), key: f.key.value, daily_limit: Number(f.daily_limit.value) });
+      mdShowMsg('Kunci ' + data.key_id + ' (' + data.name + ') terdaftar. Simpan kuncinya — kunci tidak akan ditampilkan lagi.', true);
+      setTimeout(function () { location.reload(); }, 1200);
+    } catch (err) { mdShowMsg(err.message, false); }
+  });
+}
 document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
   btn.addEventListener('click', async function () {
     const id = btn.dataset.mdDelete;
