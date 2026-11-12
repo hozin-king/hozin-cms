@@ -821,6 +821,7 @@ r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', th
 r = await call('GET', '/'); t = await r.text();
 assert(t.includes('adsbygoogle') && t.includes('ca-pub-1234567890123456'), 'AdSense: unit tampil di beranda bila client diisi');
 assert(t.includes('class="card adsense-box"') && t.includes('data-ad-status') && t.includes('MutationObserver'), 'AdSense: unit kosong disembunyikan — wrapper adsense-box + observer data-ad-status');
+assert(t.includes('class="card adsense-box" style="text-align:center;display:none"') && t.includes("'filled'"), 'AdSense: unit mulai tersembunyi, baru tampil bila data-ad-status=filled');
 assert(r.headers.get('content-security-policy') && r.headers.get('content-security-policy').includes('pagead2.googlesyndication.com'), 'AdSense: CSP dilonggarkan hanya untuk domain Google Ads');
 // AdSense: satu kolom — tempel script lengkap diekstrak jadi ID polos
 r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: '<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-9999999999999999" crossorigin="anonymous"></script>' }, cookie); assert(r.status === 303, 'AdSense: tempelan script lengkap tersimpan');
