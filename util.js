@@ -123,7 +123,7 @@ export function stripTags(s) {
 // lagi (defense in depth) — jadi baris lama di DB pun tidak bisa menyisip
 // skrip. Catatan jujur: sanitasi regex bukan parser HTML penuh; untuk
 // situs satu admin ini cukup, dan post hanya bisa dibuat admin yang login.
-export const ALLOWED_TAGS = new Set(['p', 'h2', 'h3', 'h4', 'strong', 'b', 'em', 'i', 'u', 's', 'a', 'ul', 'ol', 'li', 'blockquote', 'br', 'hr', 'img', 'figure', 'figcaption', 'pre', 'code', 'span', 'div', 'video', 'audio', 'source']);
+export const ALLOWED_TAGS = new Set(['p', 'h1', 'h2', 'h3', 'h4', 'strong', 'b', 'em', 'i', 'u', 's', 'a', 'ul', 'ol', 'li', 'blockquote', 'br', 'hr', 'img', 'figure', 'figcaption', 'pre', 'code', 'span', 'div', 'video', 'audio', 'source', 'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td']);
 export const ALLOWED_ATTRS = {
   a: new Set(['href', 'title']),
   img: new Set(['src', 'alt', 'title', 'width', 'height']),

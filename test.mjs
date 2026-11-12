@@ -4,6 +4,7 @@ import worker from './worker.js';
 import { themes } from './themes.js';
 import { renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
 import { parseTags, tagSlug, sanitizeHtml, sha256Hex } from './util.js';
+import { renderMarkdown } from './markdown.js';
 import { checkRateLimit } from './security.js';
 import { tagLinks } from './content.js';
 
@@ -53,6 +54,13 @@ class MockDB {
     // v67: fixture share link Cerpen (tabel cerpen_share_links + cerpen_share_opens)
     this.cerpenShareLinks = [];
     this.cerpenShareOpens = [];
+    // v69: fixture auto-backup .md (md_backup_keys + md_backups)
+    this.mdBackupKeys = [
+      { key_id: 'mdk-aaaaaaaa', key_hash: 'd'.repeat(64), name: 'sekar-md-backup', created_at: nowT - 3600 * 1000, revoked: 0, daily_limit: 50 },
+    ];
+    this.mdBackups = [
+      { id: 'mdb-111111111111', key_id: 'mdk-aaaaaaaa', path: 'data/PANDUAN-MUSE-LAIN.md', content: '# Panduan Muse Lain\n\nTeks **tebal**, `kode`, dan [tautan](https://example.com).\n\n| Kolom A | Kolom B |\n|---|---|\n| 1 | 2 |\n\n- [x] selesai\n- [ ] tertunda\n', content_hash: 'h-md-1', size: 120, version: 1, created_at: nowT - 1800 * 1000 },
+    ];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { this.batchCalls = (this.batchCalls || 0) + 1; for (const s of stmts) await s.run(); }
@@ -387,6 +395,45 @@ class MockDB {
       const byId = new Map(this.cerpenShareLinks.map(x => [x.id, x]));
       return this.cerpenShareOpens.map(o => ({ ...o, content_type: (byId.get(o.share_id) || {}).content_type, content_id: (byId.get(o.share_id) || {}).content_id })).sort((x, y) => y.opened_at - x.opened_at).slice(0, 20);
     }
+    // v69: auto-backup .md (md_backup_keys + md_backups)
+    if (s.startsWith('SELECT key_id, key_hash, name, revoked, daily_limit FROM md_backup_keys WHERE key_hash = ?')) return this.mdBackupKeys.filter(k => k.key_hash === a[0]);
+    if (s.startsWith('SELECT COUNT(*) AS c FROM md_backups WHERE key_id = ? AND created_at >= ?')) return [{ c: this.mdBackups.filter(x => x.key_id === a[0] && x.created_at >= a[1]).length }];
+    if (s.startsWith('SELECT id, content_hash, version FROM md_backups WHERE path = ? ORDER BY version DESC LIMIT 1')) return this.mdBackups.filter(x => x.path === a[0]).sort((x, y) => y.version - x.version).slice(0, 1).map(x => ({ id: x.id, content_hash: x.content_hash, version: x.version }));
+    if (s.startsWith('SELECT version FROM md_backups WHERE path = ? ORDER BY version DESC LIMIT 1')) return this.mdBackups.filter(x => x.path === a[0]).sort((x, y) => y.version - x.version).slice(0, 1).map(x => ({ version: x.version }));
+    if (s.startsWith('INSERT INTO md_backups')) { this.mdBackups.push({ id: a[0], key_id: a[1], path: a[2], content: a[3], content_hash: a[4], size: a[5], version: a[6], created_at: a[7] }); return []; }
+    if (s.startsWith('DELETE FROM md_backups WHERE id = ?')) { this.mdBackups = this.mdBackups.filter(x => x.id !== a[0]); return []; }
+    if (s.startsWith('SELECT key_id, key_hash, name, created_at, revoked, daily_limit FROM md_backup_keys ORDER BY created_at DESC')) return [...this.mdBackupKeys].sort((x, y) => y.created_at - x.created_at);
+    if (s.startsWith('SELECT key_id, COUNT(*) AS c FROM md_backups GROUP BY key_id')) {
+      const map = new Map();
+      for (const x of this.mdBackups) map.set(x.key_id, (map.get(x.key_id) || 0) + 1);
+      return [...map.entries()].map(([key_id, c]) => ({ key_id, c }));
+    }
+    if (s.startsWith('SELECT path, COUNT(*) AS versions, MAX(version) AS latest_version, MAX(created_at) AS latest_at FROM md_backups GROUP BY path ORDER BY latest_at DESC LIMIT ?')) {
+      const map = new Map();
+      for (const x of this.mdBackups) {
+        const e = map.get(x.path) || { path: x.path, versions: 0, latest_version: 0, latest_at: 0 };
+        e.versions++;
+        if (x.version > e.latest_version) e.latest_version = x.version;
+        if (x.created_at > e.latest_at) e.latest_at = x.created_at;
+        map.set(x.path, e);
+      }
+      return [...map.values()].sort((x, y) => y.latest_at - x.latest_at).slice(0, a[0]);
+    }
+    if (s.startsWith('SELECT b.id, b.key_id, b.path, b.size, b.version, b.created_at FROM md_backups b WHERE b.version = (SELECT MAX(version) FROM md_backups WHERE path = b.path) ORDER BY b.created_at DESC LIMIT ?')) {
+      const latest = new Map();
+      for (const x of this.mdBackups) {
+        const cur = latest.get(x.path);
+        if (!cur || x.version > cur.version) latest.set(x.path, x);
+      }
+      return [...latest.values()].sort((x, y) => y.created_at - x.created_at).slice(0, a[0]);
+    }
+    if (s.startsWith('SELECT id, key_id, path, size, version, created_at FROM md_backups WHERE path = ? ORDER BY version DESC LIMIT ?')) return this.mdBackups.filter(x => x.path === a[0]).sort((x, y) => y.version - x.version).slice(0, a[1]);
+    if (s.startsWith('SELECT id, key_id, path, content, content_hash, size, version, created_at FROM md_backups WHERE id = ?')) return this.mdBackups.filter(x => x.id === a[0]);
+    if (s.startsWith('SELECT id, key_id, path, content, content_hash, size, version FROM md_backups WHERE id = ?')) return this.mdBackups.filter(x => x.id === a[0]);
+    if (s.startsWith('SELECT id, path, version FROM md_backups WHERE id = ?')) return this.mdBackups.filter(x => x.id === a[0]).map(x => ({ id: x.id, path: x.path, version: x.version }));
+    if (s.startsWith('SELECT key_id FROM md_backup_keys WHERE key_id = ?')) return this.mdBackupKeys.filter(k => k.key_id === a[0]);
+    if (s.startsWith('UPDATE md_backup_keys SET revoked = ?')) { const k = this.mdBackupKeys.find(x => x.key_id === a[1]); if (k) k.revoked = a[0]; return []; }
+    if (s.startsWith('UPDATE md_backup_keys SET daily_limit = ?')) { const k = this.mdBackupKeys.find(x => x.key_id === a[1]); if (k) k.daily_limit = a[0]; return []; }
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -1423,4 +1470,74 @@ r = await call('GET', '/kendali/cerpen-api', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('Auto-approve') && t.includes('data-cerpen-aa='), 'auto-approve: panel memuat status + tombol Auto-approve per key');
 // Key hilang -> 404
 r = await callJson('POST', '/api/admin/cerpen-keys/key-00000000/auto-approve', { mode: 'always' }, admH); assert(r.status === 404, 'auto-approve: key hilang -> 404');
+// 42. Auto-backup .md (v69, 12 Nov 2026): POST /api/md-backup + endpoint
+// admin /api/admin/md-backup* + halaman /kendali/md-backup + viewer.
+const mdPlain = 'md-uji-plain-1234567890';
+const mdHash = await sha256Hex(mdPlain);
+env.BACKUP_DB.mdBackupKeys.push({ key_id: 'mdk-cccccccc', key_hash: mdHash, name: 'kunci-uji-md', created_at: Date.now(), revoked: 0, daily_limit: 50 });
+const mdLimitPlain = 'md-limit-uji-abcdef';
+const mdLimitHash = await sha256Hex(mdLimitPlain);
+env.BACKUP_DB.mdBackupKeys.push({ key_id: 'mdk-dddddddd', key_hash: mdLimitHash, name: 'kunci-limit', created_at: Date.now(), revoked: 0, daily_limit: 1 });
+const mdAuth = { Authorization: 'Bearer ' + mdPlain };
+const mdCall = (p, c) => callJson('POST', '/api/md-backup', p, c);
+// Tanpa key / key salah -> 401
+r = await mdCall({ path: 'a.md', content: 'x' }, {}); assert(r.status === 401, 'md-backup: tanpa key ditolak 401');
+r = await mdCall({ path: 'a.md', content: 'x' }, { Authorization: 'Bearer salah' }); assert(r.status === 401, 'md-backup: key salah ditolak 401');
+// Path tidak valid -> 400
+r = await mdCall({ path: '../jahat.md', content: 'x' }, mdAuth); assert(r.status === 400, 'md-backup: path .. ditolak 400');
+r = await mdCall({ path: '/absolut.md', content: 'x' }, mdAuth); assert(r.status === 400, 'md-backup: path absolut ditolak 400');
+r = await mdCall({ path: 'a b.md', content: 'x' }, mdAuth); assert(r.status === 400, 'md-backup: path berisi spasi ditolak 400');
+r = await mdCall({ path: 'a.md', content: '' }, mdAuth); assert(r.status === 400, 'md-backup: content kosong ditolak 400');
+// Konten baru -> 201 v1; kirim ulang isi sama -> 409; isi beda -> 201 v2
+r = await mdCall({ path: 'data/uji.md', content: '# Uji\n\nIsi pertama.' }, mdAuth); jj = await r.json();
+assert(r.status === 201 && jj.ok && jj.version === 1 && /^mdb-[0-9a-f]{12}$/.test(jj.id) && !('content' in jj), 'md-backup: konten baru -> 201 v1 (tanpa echo content)');
+const mdIdV1 = jj.id;
+r = await mdCall({ path: 'data/uji.md', content: '# Uji\n\nIsi pertama.' }, mdAuth); assert(r.status === 409, 'md-backup: isi sama -> 409 duplicate_content');
+r = await mdCall({ path: 'data/uji.md', content: '# Uji\n\nIsi kedua.' }, mdAuth); jj = await r.json();
+assert(r.status === 201 && jj.version === 2, 'md-backup: isi beda -> 201 v2');
+const mdIdV2 = jj.id;
+// Rate limit harian: key limit 1 -> kirim ke-2 ditolak 429
+r = await mdCall({ path: 'data/limit.md', content: 'satu' }, { Authorization: 'Bearer ' + mdLimitPlain }); assert(r.status === 201, 'md-backup: key limit 1 kirim pertama 201');
+r = await mdCall({ path: 'data/limit.md', content: 'dua' }, { Authorization: 'Bearer ' + mdLimitPlain }); assert(r.status === 429, 'md-backup: key limit 1 kirim kedua 429');
+// Admin tanpa auth -> 401; tanpa CSRF -> 403
+r = await callJson('GET', '/api/admin/md-backups', null, {}); assert(r.status === 401, 'md-backup-admin: daftar tanpa auth ditolak 401');
+r = await callJson('GET', '/api/admin/md-backup-keys', null, { cookie }); assert(r.status === 403, 'md-backup-admin: daftar key tanpa CSRF ditolak 403');
+// Daftar file: tanpa content, path + jumlah versi tampil
+r = await callJson('GET', '/api/admin/md-backups', null, admH); jj = await r.json();
+assert(r.status === 200 && jj.ok && jj.files.some(f => f.path === 'data/uji.md' && f.versions === 2 && f.latest_version === 2) && !JSON.stringify(jj.files).includes('Isi pertama'), 'md-backup-admin: daftar file tanpa content (versi benar)');
+// Daftar versi satu path
+r = await callJson('GET', '/api/admin/md-backups?path=data%2Fuji.md', null, admH); jj = await r.json();
+assert(r.status === 200 && jj.versions.length === 2 && jj.versions[0].version === 2, 'md-backup-admin: daftar versi satu path');
+// Detail satu versi mengembalikan content
+r = await callJson('GET', '/api/admin/md-backups/' + mdIdV2, null, admH); jj = await r.json();
+assert(r.status === 200 && jj.backup.content.includes('Isi kedua'), 'md-backup-admin: detail versi mengembalikan content');
+// Restore membuat versi baru (v3) dengan isi v1
+r = await callJson('POST', '/api/admin/md-backups/' + mdIdV1 + '/restore', {}, admH); jj = await r.json();
+assert(r.status === 200 && jj.version === 3, 'md-backup-admin: restore membuat v3');
+r = await callJson('GET', '/api/admin/md-backups/' + jj.id, null, admH); jj = await r.json();
+assert(r.status === 200 && jj.backup.content.includes('Isi pertama'), 'md-backup-admin: hasil restore berisi isi v1');
+// Hapus satu versi -> 404 setelahnya; audit tercatat
+r = await callJson('DELETE', '/api/admin/md-backups/' + mdIdV1, null, admH); assert(r.status === 200, 'md-backup-admin: hapus versi');
+r = await callJson('GET', '/api/admin/md-backups/' + mdIdV1, null, admH); assert(r.status === 404, 'md-backup-admin: versi terhapus -> 404');
+assert(env.BACKUP_DB.cerpenAdminAudit.some(a => a.action === 'md_restore' || a.action === 'md_delete'), 'md-backup-admin: restore/hapus menulis audit');
+// Kunci .md: daftar (hash hanya 8 karakter), revoke -> submit 401, unrevoke, limit
+r = await callJson('GET', '/api/admin/md-backup-keys', null, admH); jj = await r.json();
+assert(r.status === 200 && jj.keys.some(k => k.key_id === 'mdk-cccccccc' && k.key_hash_prefix.length === 8 && !('key_hash' in k)), 'md-backup-admin: daftar key, hash hanya 8 karakter');
+r = await callJson('POST', '/api/admin/md-backup-keys/mdk-cccccccc/revoke', {}, admH); jj = await r.json();
+assert(r.status === 200 && jj.revoked === 1, 'md-backup-admin: revoke key');
+r = await mdCall({ path: 'data/uji.md', content: 'x baru' }, mdAuth); assert(r.status === 401, 'md-backup: key dicabut -> submit 401');
+r = await callJson('POST', '/api/admin/md-backup-keys/mdk-cccccccc/unrevoke', {}, admH); assert(r.status === 200, 'md-backup-admin: unrevoke key');
+r = await callJson('POST', '/api/admin/md-backup-keys/mdk-cccccccc/limit', { daily_limit: 101 }, admH); assert(r.status === 400, 'md-backup-admin: limit 101 ditolak 400');
+r = await callJson('POST', '/api/admin/md-backup-keys/mdk-00000000/revoke', {}, admH); assert(r.status === 404, 'md-backup-admin: key hilang -> 404');
+// Halaman admin + viewer render ala GitHub
+r = await call('GET', '/kendali/md-backup'); assert(r.status === 303 && (r.headers.get('location') || '') === '/akun?pesan=login', 'md-backup: halaman tanpa auth dialihkan ke login');
+r = await call('GET', '/kendali/md-backup', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('Backup .md') && t.includes('data/uji.md'), 'md-backup: halaman admin memuat daftar file');
+r = await call('GET', '/kendali/md-backup?view=mdb-111111111111', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('<h1>Panduan Muse Lain</h1>') && t.includes('<table>') && t.includes('<strong>tebal</strong>') && t.includes('☑'), 'md-backup: viewer merender heading/tabel/bold/task list');
+// Renderer unit: XSS di-escape, link jahat tidak jadi <a>
+assert(!renderMarkdown('<script>alert(1)</script>').includes('<script>'), 'md-render: script di-escape');
+assert(renderMarkdown('[klik](javascript:alert(1))').includes('klik') && !renderMarkdown('[klik](javascript:alert(1))').includes('javascript:'), 'md-render: link javascript tidak dirender sebagai <a>');
+assert(renderMarkdown('```js\nconst a = 1;\n```').includes('<pre><code>const a = 1;'), 'md-render: code block berpagar');
+assert(renderMarkdown('snake_case tetap').includes('snake_case') && !renderMarkdown('snake_case tetap').includes('<em>'), 'md-render: snake_case tidak jadi miring');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

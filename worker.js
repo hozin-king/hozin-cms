@@ -26,6 +26,7 @@
 import { themes } from './themes.js';
 import { pluginDefs } from './plugins.js';
 import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex, parseTags, tagSlug, readCappedBody, sha256Hex, b64url } from './util.js';
+import { renderMarkdown } from './markdown.js';
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie, isValidCommenterPassword, COMMENTER_PASSWORD_MIN, COMMENTER_PASSWORD_MAX } from './auth.js';
 import { checkRateLimit } from './security.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
@@ -315,7 +316,7 @@ input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/md-backup', 'Backup .md']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -935,6 +936,67 @@ async function handleFetch(request, env) {
       return csJson({ ok: true, id: subId, status: subStatus, message: aaActive ? 'Usulan diterima dan langsung disetujui (auto-approve aktif) — akan diterapkan applier.' : 'Usulan diterima dan menunggu persetujuan Alyaa.' }, 201);
     }
 
+    // ---- Auto-backup .md (publik, v69, 12 Nov 2026) ----
+    // POST /api/md-backup — simpan snapshot file .md (satu path, banyak
+    // versi). Auth: Bearer <key> (hash SHA-256 di md_backup_keys; kunci
+    // terpisah dari key Cerpen). Rate limit harian per key (default 50,
+    // pola WIB sama seperti cerpen-submit). Dedup: path + isi sama dengan
+    // versi terakhir -> 409 duplicate_content (tidak membuat versi baru);
+    // isi beda -> versi baru (version = max+1). Balasan 201 tanpa echo
+    // content. Isi .md TIDAK dienkripsi (file panduan/backup, bukan konten
+    // Cerpen) — yang dijaga: hanya pemilik key yang bisa menulis, dan
+    // baca hanya lewat panel admin.
+    if (request.method === 'POST' && path === '/api/md-backup') {
+      const mbJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!env.BACKUP_DB) return mbJson({ ok: false, error: 'database tidak tersedia' }, 503);
+      const rawKey = String(request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '').trim()
+        || String(request.headers.get('x-api-key') || '').trim();
+      if (!rawKey) return mbJson({ ok: false, error: 'unauthorized' }, 401);
+      let keyRow = null;
+      try {
+        const hash = await sha256Hex(rawKey);
+        keyRow = await env.BACKUP_DB.prepare(`SELECT key_id, key_hash, name, revoked, daily_limit FROM md_backup_keys WHERE key_hash = ?`).bind(hash).first();
+        if (!keyRow || Number(keyRow.revoked) !== 0) return mbJson({ ok: false, error: 'unauthorized' }, 401);
+        if (!timingSafeHexEqual(String(keyRow.key_hash), hash)) return mbJson({ ok: false, error: 'unauthorized' }, 401);
+      } catch (e) {
+        return mbJson({ ok: false, error: 'gagal memeriksa kunci' }, 500);
+      }
+      try {
+        const nowWib = new Date(Date.now() + 7 * 3600000);
+        const dayStart = Date.UTC(nowWib.getUTCFullYear(), nowWib.getUTCMonth(), nowWib.getUTCDate(), 0, 0, 0) - 7 * 3600000;
+        const cnt = await env.BACKUP_DB.prepare(`SELECT COUNT(*) AS c FROM md_backups WHERE key_id = ? AND created_at >= ?`).bind(keyRow.key_id, dayStart).first();
+        if (Number(cnt && cnt.c || 0) >= Number(keyRow.daily_limit || 50)) return mbJson({ ok: false, error: 'rate limit harian tercapai' }, 429);
+      } catch (e) {
+        return mbJson({ ok: false, error: 'gagal memeriksa kuota' }, 500);
+      }
+      if (Number(request.headers.get('content-length') || '0') > 1024000) return mbJson({ ok: false, error: 'payload terlalu besar' }, 413);
+      let data = null;
+      try {
+        const text = await request.text();
+        if (text.length > 1024000) return mbJson({ ok: false, error: 'payload terlalu besar' }, 413);
+        data = JSON.parse(text);
+      } catch (e) { return mbJson({ ok: false, error: 'payload bukan JSON' }, 400); }
+      const bad = (msg) => mbJson({ ok: false, error: msg }, 400);
+      const pathMd = data && typeof data.path === 'string' ? data.path : '';
+      const content = data && typeof data.content === 'string' ? data.content : '';
+      // Path aman: 1–200 karakter, hanya A-Za-z0-9._/- , tanpa '..' dan
+      // tanpa awalan '/'.
+      if (!pathMd || pathMd.length > 200 || !/^[A-Za-z0-9._\/-]+$/.test(pathMd) || pathMd.startsWith('/') || pathMd.includes('..')) return bad('path tidak valid');
+      if (!content || content.length > 1000000) return bad('content tidak valid (1–1.000.000 karakter)');
+      const contentHash = await sha256Hex(content);
+      const now = Date.now();
+      try {
+        const last = await env.BACKUP_DB.prepare(`SELECT id, content_hash, version FROM md_backups WHERE path = ? ORDER BY version DESC LIMIT 1`).bind(pathMd).first();
+        if (last && String(last.content_hash) === contentHash) return mbJson({ ok: false, error: 'duplikat', reason: 'duplicate_content' }, 409);
+        const nextVersion = last ? Number(last.version) + 1 : 1;
+        const id = 'mdb-' + randomHex(6);
+        await env.BACKUP_DB.prepare(`INSERT INTO md_backups (id, key_id, path, content, content_hash, size, version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, keyRow.key_id, pathMd, content, contentHash, content.length, nextVersion, now).run();
+        return mbJson({ ok: true, id, path: pathMd, version: nextVersion, created_at: now }, 201);
+      } catch (e) {
+        return mbJson({ ok: false, error: 'gagal menyimpan backup' }, 500);
+      }
+    }
+
     // ---- Share link Cerpen Hozin (publik, v67, 12 Nov 2026) ----
     // POST /api/share/create — buat link share terenkripsi untuk satu
     // konten (cerpen/komik/berita). Rate limit 20/jam/IP. Validasi konten
@@ -1277,6 +1339,131 @@ async function handleFetch(request, env) {
           await B.prepare(`UPDATE cerpen_share_links SET revoked = ? WHERE id = ?`).bind(revoked, shareId).run();
           await cerpenAudit(action === 'revoke' ? 'share_revoke' : 'share_unrevoke', 'share', shareId, '');
           return aj({ ok: true, id: shareId, revoked });
+        }
+        return aj({ ok: false, error: 'endpoint tidak ditemukan' }, 404);
+      } catch (e) {
+        return aj({ ok: false, error: 'kesalahan server' }, 500);
+      }
+    }
+
+    // ---- Admin: auto-backup .md (panel /kendali/md-backup, v69) ----
+    // Guard + CSRF + rate limit sama seperti /api/admin/cerpen-*.
+    // Ditempatkan di sini (sebelum blok POST admin yang memanggil
+    // request.formData()): body JSON akan error di formData() bila
+    // sampai ke sana.
+    if (path.startsWith('/api/admin/md-backup')) {
+      const aj = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
+      if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
+      if (!env.BACKUP_DB) return aj({ ok: false, error: 'database tidak tersedia' }, 503);
+      if (!(await checkRateLimit(env, 'md-backup-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
+      const B = env.BACKUP_DB;
+      const isMdKeyId = v => /^mdk-[0-9a-f]{8}$/.test(v);
+      const isMdbId = v => /^mdb-[0-9a-f]{12}$/.test(v);
+      async function mdAudit(action, targetType, targetId, note) {
+        const ok = await B.prepare(`INSERT INTO cerpen_admin_audit (id, created_at, actor, action, target_type, target_id, note) VALUES (?, ?, 'admin', ?, ?, ?, ?)`).bind('aud-' + randomHex(6), Date.now(), action, targetType, targetId, String(note || '')).run();
+        if (!ok || !ok.success) throw new Error('gagal mencatat audit');
+      }
+      async function readJsonBody() {
+        const raw = await request.text();
+        if (raw.length > 100 * 1024) return { err: 'body terlalu besar (maks 100 KB)' };
+        if (!raw.trim()) return { body: {} };
+        try { return { body: JSON.parse(raw) }; } catch (e) { return { err: 'body JSON tidak valid' }; }
+      }
+      // Daftar file: satu baris per path (jumlah versi + versi terakhir).
+      async function mdFileList(limit) {
+        const groups = await B.prepare(`SELECT path, COUNT(*) AS versions, MAX(version) AS latest_version, MAX(created_at) AS latest_at FROM md_backups GROUP BY path ORDER BY latest_at DESC LIMIT ?`).bind(limit).all();
+        const latest = await B.prepare(`SELECT b.id, b.key_id, b.path, b.size, b.version, b.created_at FROM md_backups b WHERE b.version = (SELECT MAX(version) FROM md_backups WHERE path = b.path) ORDER BY b.created_at DESC LIMIT ?`).bind(limit).all();
+        const byPath = new Map((latest.results || []).map(r => [r.path, r]));
+        return (groups.results || []).map(g => {
+          const l = byPath.get(g.path) || {};
+          return { path: g.path, versions: Number(g.versions) || 0, latest_version: Number(g.latest_version) || 0, latest_at: Number(g.latest_at) || 0, latest_size: Number(l.size) || 0, latest_id: l.id || '', key_id: l.key_id || '' };
+        });
+      }
+      try {
+        // GET /api/admin/md-backup-keys — daftar kunci .md (hash hanya
+        // 8 karakter pertama) + jumlah backup per key.
+        if (path === '/api/admin/md-backup-keys' && request.method === 'GET') {
+          const keys = await B.prepare(`SELECT key_id, key_hash, name, created_at, revoked, daily_limit FROM md_backup_keys ORDER BY created_at DESC`).all();
+          const counts = await B.prepare(`SELECT key_id, COUNT(*) AS c FROM md_backups GROUP BY key_id`).all();
+          const byKey = new Map((counts.results || []).map(r => [r.key_id, Number(r.c) || 0]));
+          return aj({ ok: true, keys: (keys.results || []).map(k => ({
+            key_id: k.key_id, name: k.name, created_at: k.created_at, revoked: Number(k.revoked) || 0,
+            daily_limit: k.daily_limit, key_hash_prefix: String(k.key_hash || '').slice(0, 8),
+            backups: byKey.get(k.key_id) || 0,
+          })) });
+        }
+        // POST /api/admin/md-backup-keys/:id/revoke|unrevoke|limit
+        const mdKeyAction = path.match(/^\/api\/admin\/md-backup-keys\/([^/]+)\/(revoke|unrevoke|limit)$/);
+        if (mdKeyAction && request.method === 'POST') {
+          const keyId = mdKeyAction[1];
+          const action = mdKeyAction[2];
+          if (!isMdKeyId(keyId)) return aj({ ok: false, error: 'key_id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT key_id FROM md_backup_keys WHERE key_id = ?`).bind(keyId).first();
+          if (!row) return aj({ ok: false, error: 'key tidak ditemukan' }, 404);
+          if (action === 'limit') {
+            const { body, err } = await readJsonBody();
+            if (err) return aj({ ok: false, error: err }, 400);
+            const dl = Number(body.daily_limit);
+            if (!Number.isInteger(dl) || dl < 1 || dl > 100) return aj({ ok: false, error: 'daily_limit harus 1–100' }, 400);
+            await B.prepare(`UPDATE md_backup_keys SET daily_limit = ? WHERE key_id = ?`).bind(dl, keyId).run();
+            await mdAudit('md_key_limit', 'md_key', keyId, 'daily_limit=' + dl);
+            return aj({ ok: true, key_id: keyId, daily_limit: dl });
+          }
+          const revoked = action === 'revoke' ? 1 : 0;
+          await B.prepare(`UPDATE md_backup_keys SET revoked = ? WHERE key_id = ?`).bind(revoked, keyId).run();
+          await mdAudit(revoked ? 'md_key_revoke' : 'md_key_unrevoke', 'md_key', keyId, '');
+          return aj({ ok: true, key_id: keyId, revoked });
+        }
+        // GET /api/admin/md-backups?path=&limit= — tanpa path: daftar file;
+        // dengan path: daftar versi file itu (tanpa content).
+        if (path === '/api/admin/md-backups' && request.method === 'GET') {
+          const fPath = url.searchParams.get('path') || '';
+          let limit = parseInt(url.searchParams.get('limit') || '50', 10);
+          if (Number.isNaN(limit)) limit = 50;
+          limit = Math.min(100, Math.max(1, limit));
+          if (fPath) {
+            const rows = await B.prepare(`SELECT id, key_id, path, size, version, created_at FROM md_backups WHERE path = ? ORDER BY version DESC LIMIT ?`).bind(fPath, limit).all();
+            return aj({ ok: true, path: fPath, versions: rows.results || [] });
+          }
+          return aj({ ok: true, files: await mdFileList(limit) });
+        }
+        // POST /api/admin/md-backups/:id/restore — pulihkan versi lama =
+        // buat versi BARU dengan isi versi itu (versi lama tetap utuh).
+        const mdRestore = path.match(/^\/api\/admin\/md-backups\/([^/]+)\/restore$/);
+        if (mdRestore && request.method === 'POST') {
+          const id = mdRestore[1];
+          if (!isMdbId(id)) return aj({ ok: false, error: 'id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT id, key_id, path, content, content_hash, size, version FROM md_backups WHERE id = ?`).bind(id).first();
+          if (!row) return aj({ ok: false, error: 'backup tidak ditemukan' }, 404);
+          const last = await B.prepare(`SELECT version FROM md_backups WHERE path = ? ORDER BY version DESC LIMIT 1`).bind(row.path).first();
+          const nextVersion = (last ? Number(last.version) : 0) + 1;
+          const newId = 'mdb-' + randomHex(6);
+          const now = Date.now();
+          await B.prepare(`INSERT INTO md_backups (id, key_id, path, content, content_hash, size, version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(newId, row.key_id, row.path, row.content, row.content_hash, row.size, nextVersion, now).run();
+          await mdAudit('md_restore', 'md_backup', newId, 'dari ' + id + ' path=' + row.path + ' v' + row.version);
+          return aj({ ok: true, id: newId, path: row.path, version: nextVersion, created_at: now });
+        }
+        // GET /api/admin/md-backups/:id — detail satu versi (satu-satunya
+        // yang mengembalikan content).
+        const mdGet = path.match(/^\/api\/admin\/md-backups\/([^/]+)$/);
+        if (mdGet && request.method === 'GET') {
+          const id = mdGet[1];
+          if (!isMdbId(id)) return aj({ ok: false, error: 'id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT id, key_id, path, content, content_hash, size, version, created_at FROM md_backups WHERE id = ?`).bind(id).first();
+          if (!row) return aj({ ok: false, error: 'backup tidak ditemukan' }, 404);
+          return aj({ ok: true, backup: row });
+        }
+        // DELETE /api/admin/md-backups/:id — hapus SATU versi.
+        const mdDel = path.match(/^\/api\/admin\/md-backups\/([^/]+)$/);
+        if (mdDel && request.method === 'DELETE') {
+          const id = mdDel[1];
+          if (!isMdbId(id)) return aj({ ok: false, error: 'id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT id, path, version FROM md_backups WHERE id = ?`).bind(id).first();
+          if (!row) return aj({ ok: false, error: 'backup tidak ditemukan' }, 404);
+          await B.prepare(`DELETE FROM md_backups WHERE id = ?`).bind(id).run();
+          await mdAudit('md_delete', 'md_backup', id, 'path=' + row.path + ' v' + row.version);
+          return aj({ ok: true, id });
         }
         return aj({ ok: false, error: 'endpoint tidak ditemukan' }, 404);
       } catch (e) {
@@ -1967,7 +2154,7 @@ async function handleFetch(request, env) {
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/md-backup')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
@@ -2164,6 +2351,119 @@ document.getElementById('cerpen-reject').addEventListener('click', async functio
 });
 </script>`;
         return html(await renderPage(env, 'Cerpen API', content));
+      }
+      // ---- Admin: auto-backup .md (v69) ----
+      // Daftar file + versi + viewer render ala GitHub (admin-only).
+      // Render Markdown dilakukan server-side (markdown.js) lalu
+      // disanitasi lagi — isi .md tidak pernah dirender mentah.
+      if (path === '/kendali/md-backup') {
+        if (!env.BACKUP_DB) {
+          const content = `<h2>Backup .md</h2>${nav}<div class="card"><p>Database Cerpen (stopwatch-db) tidak tersedia — panel tidak bisa dimuat.</p></div>`;
+          return html(await renderPage(env, 'Backup .md', content));
+        }
+        const wib = ms => new Date(Number(ms || 0) + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16);
+        const fPath = url.searchParams.get('path') || '';
+        const fView = url.searchParams.get('view') || '';
+        let fLimit = parseInt(url.searchParams.get('limit') || '50', 10);
+        if (Number.isNaN(fLimit)) fLimit = 50;
+        fLimit = Math.min(100, Math.max(1, fLimit));
+        const isMdbIdPage = v => /^mdb-[0-9a-f]{12}$/.test(v);
+        const B2 = env.BACKUP_DB;
+        const jobs = [
+          B2.prepare(`SELECT key_id, key_hash, name, created_at, revoked, daily_limit FROM md_backup_keys ORDER BY created_at DESC`).all(),
+          B2.prepare(`SELECT key_id, COUNT(*) AS c FROM md_backups GROUP BY key_id`).all(),
+          B2.prepare(`SELECT path, COUNT(*) AS versions, MAX(version) AS latest_version, MAX(created_at) AS latest_at FROM md_backups GROUP BY path ORDER BY latest_at DESC LIMIT ?`).bind(fLimit).all(),
+          B2.prepare(`SELECT b.id, b.key_id, b.path, b.size, b.version, b.created_at FROM md_backups b WHERE b.version = (SELECT MAX(version) FROM md_backups WHERE path = b.path) ORDER BY b.created_at DESC LIMIT ?`).bind(fLimit).all(),
+          B2.prepare(`SELECT id, created_at, actor, action, target_type, target_id, note FROM cerpen_admin_audit ORDER BY created_at DESC LIMIT 20`).all(),
+        ];
+        if (fPath) jobs.push(B2.prepare(`SELECT id, key_id, path, size, version, created_at FROM md_backups WHERE path = ? ORDER BY version DESC LIMIT ?`).bind(fPath, fLimit).all());
+        const [keyRows, keyCounts, groupRows, latestRows, auditRows, versionsRows] = await Promise.all(jobs);
+        let viewRow = null;
+        if (fView && isMdbIdPage(fView)) viewRow = await B2.prepare(`SELECT id, key_id, path, content, content_hash, size, version, created_at FROM md_backups WHERE id = ?`).bind(fView).first();
+        const byKey = new Map((keyCounts.results || []).map(r => [r.key_id, Number(r.c) || 0]));
+        const keys = keyRows.results || [];
+        const keyHtml = keys.map(k => {
+          const revoked = Number(k.revoked) === 1;
+          return `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(k.name)}</span> <span style="font-size:12px;font-weight:700;color:${revoked ? '#dc2626' : '#22c55e'}">${revoked ? 'DICABUT' : 'AKTIF'}</span><div class="adm-row-meta">${esc(k.key_id)} · hash ${esc(String(k.key_hash || '').slice(0, 8))}… · dibuat ${wib(k.created_at)} · limit ${esc(k.daily_limit)}/hari · ${byKey.get(k.key_id) || 0} backup tersimpan</div></div><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">${revoked ? `<button type="button" data-md-key="unrevoke" data-id="${esc(k.key_id)}">Aktifkan</button>` : `<button type="button" data-md-key="revoke" data-id="${esc(k.key_id)}">Cabut</button>`}<button type="button" data-md-key="limit" data-id="${esc(k.key_id)}" data-limit="${esc(k.daily_limit)}">Limit</button></div></div>`;
+        }).join('') || '<p>Belum ada kunci .md.</p>';
+        const byPath = new Map((latestRows.results || []).map(r => [r.path, r]));
+        const fileHtml = (groupRows.results || []).map(g => {
+          const l = byPath.get(g.path) || {};
+          return `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(g.path)}</span><div class="adm-row-meta">${Number(g.versions) || 0} versi · terakhir v${Number(g.latest_version) || 0} · ${wib(g.latest_at)} · ${(Number(l.size) || 0).toLocaleString('id-ID')} karakter</div></div><a href="/kendali/md-backup?path=${encodeURIComponent(g.path)}">Lihat versi →</a></div>`;
+        }).join('') || '<p>Belum ada file .md ter-backup.</p>';
+        let versionsHtml = '';
+        if (fPath) {
+          const rows = (versionsRows && versionsRows.results) || [];
+          versionsHtml = `<div class="card"><h3>Versi — ${esc(fPath)}</h3>` + (rows.map(v => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">v${Number(v.version)}</span><div class="adm-row-meta">${wib(v.created_at)} · ${(Number(v.size) || 0).toLocaleString('id-ID')} karakter · key ${esc(v.key_id)} · ${esc(v.id)}</div></div><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><a href="/kendali/md-backup?path=${encodeURIComponent(fPath)}&view=${esc(v.id)}">Buka</a><button type="button" data-md-restore="${esc(v.id)}">Pulihkan</button><button type="button" data-md-delete="${esc(v.id)}" style="background:#dc2626">Hapus</button></div></div>`).join('') || '<p>Tidak ada versi untuk file ini.</p>') + `</div>`;
+        }
+        let viewerHtml = '';
+        if (viewRow) {
+          viewerHtml = `<div class="card"><h3>Viewer — ${esc(viewRow.path)} (v${Number(viewRow.version)})</h3><div class="adm-row-meta">${wib(viewRow.created_at)} · ${(Number(viewRow.size) || 0).toLocaleString('id-ID')} karakter · key ${esc(viewRow.key_id)} · ${esc(viewRow.id)}</div><div class="md-view">${renderMarkdown(viewRow.content)}</div><p><button type="button" data-md-restore="${esc(viewRow.id)}">Pulihkan versi ini</button> <button type="button" data-md-delete="${esc(viewRow.id)}" style="background:#dc2626">Hapus versi ini</button></p></div>`;
+        } else if (fView) {
+          viewerHtml = `<div class="card"><h3>Viewer</h3><p>Versi tidak ditemukan.</p></div>`;
+        }
+        const auditHtml = (auditRows.results || []).filter(a => String(a.action || '').startsWith('md_')).map(a => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(a.action)}</span><div class="adm-row-meta">${wib(a.created_at)} · ${esc(a.actor)} · ${esc(a.target_type)} ${esc(a.target_id)}${a.note ? ' · ' + esc(a.note) : ''}</div></div></div>`).join('') || '<p>Belum ada aksi .md tercatat.</p>';
+        const content = `<h2>Backup .md</h2>${nav}${noticeHtml(url)}<div id="md-msg"></div><style>
+.md-view{line-height:1.65;overflow-wrap:break-word}
+.md-view h1,.md-view h2{border-bottom:1px solid rgba(128,128,128,.35);padding-bottom:6px}
+.md-view pre{background:rgba(128,128,128,.12);padding:12px;border-radius:10px;overflow-x:auto}
+.md-view code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em}
+.md-view pre code{background:none;padding:0}
+.md-view table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}
+.md-view th,.md-view td{border:1px solid rgba(128,128,128,.4);padding:6px 10px;text-align:left}
+.md-view blockquote{border-left:4px solid rgba(128,128,128,.5);margin:12px 0;padding:2px 14px;opacity:.85}
+.md-view img{max-width:100%}
+</style><div class="card"><h3>Kunci API .md</h3>${keyHtml}<p style="font-size:13px;opacity:.7">Kunci dibuat &amp; disimpan oleh pemiliknya (Sekar); di sini hanya hash-nya yang tersimpan. Backup baru masuk lewat POST /api/md-backup dengan header Authorization: Bearer &lt;key&gt;.</p></div><div class="card"><h3>File ter-backup</h3>${fileHtml}</div>${versionsHtml}${viewerHtml}<div class="card"><h3>Riwayat admin (.md)</h3>${auditHtml}</div><script>
+const MD_CSRF = "${csrf}";
+const mdMsg = document.getElementById('md-msg');
+function mdEscHtml(s) { return String(s == null ? '' : s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'); }
+function mdShowMsg(text, ok) { mdMsg.innerHTML = '<div class="card" style="border-color:' + (ok ? '#22c55e' : '#dc2626') + '"><p><b>' + (ok ? 'Berhasil:' : 'Gagal:') + '</b> ' + mdEscHtml(text) + '</p></div>'; }
+async function mdCall(method, url, body) {
+  const res = await fetch(url, { method: method, headers: { 'x-csrf': MD_CSRF, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const data = await res.json().catch(function () { return {}; });
+  if (!res.ok || !data.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+document.querySelectorAll('[data-md-key]').forEach(function (btn) {
+  btn.addEventListener('click', async function () {
+    const id = btn.dataset.id;
+    const act = btn.dataset.mdKey;
+    let body;
+    if (act === 'limit') {
+      const v = prompt('Limit baru per hari (1–100):', btn.dataset.limit || '50');
+      if (v === null) return;
+      body = { daily_limit: Number(v) };
+    }
+    if (act === 'revoke' && !confirm('Cabut kunci ' + id + '? Kunci ini tidak bisa dipakai backup lagi.')) return;
+    try {
+      await mdCall('POST', '/api/admin/md-backup-keys/' + id + '/' + act, body);
+      location.reload();
+    } catch (err) { mdShowMsg(err.message, false); }
+  });
+});
+document.querySelectorAll('[data-md-restore]').forEach(function (btn) {
+  btn.addEventListener('click', async function () {
+    const id = btn.dataset.mdRestore;
+    if (!confirm('Pulihkan versi ' + id + '? Versi baru akan dibuat dengan isi versi ini (versi lama tetap utuh).')) return;
+    try {
+      const data = await mdCall('POST', '/api/admin/md-backups/' + id + '/restore', {});
+      mdShowMsg('Dipulihkan sebagai v' + data.version + '.', true);
+      setTimeout(function () { location.reload(); }, 600);
+    } catch (err) { mdShowMsg(err.message, false); }
+  });
+});
+document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
+  btn.addEventListener('click', async function () {
+    const id = btn.dataset.mdDelete;
+    if (!confirm('Hapus versi ' + id + '? Versi ini hilang permanen.')) return;
+    try {
+      await mdCall('DELETE', '/api/admin/md-backups/' + id, null);
+      location.reload();
+    } catch (err) { mdShowMsg(err.message, false); }
+  });
+});
+</script>`;
+        return html(await renderPage(env, 'Backup .md', content));
       }
       if (path === '/kendali') {
         // Prune retensi analitik (bertahap, maks 500/pemanggilan): gagal
