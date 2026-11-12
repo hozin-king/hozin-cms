@@ -315,7 +315,7 @@ input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -496,7 +496,7 @@ export default {
       let req = request;
       let refreshedCookies = [];
       const u0 = new URL(request.url);
-      if (u0.pathname.startsWith('/kendali') && u0.pathname !== '/kendali/login' && u0.pathname !== '/kendali/logout') {
+      if ((u0.pathname.startsWith('/kendali') || u0.pathname.startsWith('/api/admin/')) && u0.pathname !== '/kendali/login' && u0.pathname !== '/kendali/logout') {
         if (!(await isAdmin(request, env))) {
           const r = await tryRefresh(request, env);
           if (r) { req = r.request; refreshedCookies = r.cookies; }
@@ -509,7 +509,7 @@ export default {
         res = new Response(res.body, { status: res.status, headers: h });
       }
       // Halaman admin tidak boleh di-cache browser / proxy (data sensitif).
-      if (u0.pathname.startsWith('/kendali') || u0.pathname.startsWith('/akun')) {
+      if (u0.pathname.startsWith('/kendali') || u0.pathname.startsWith('/akun') || u0.pathname.startsWith('/api/admin/')) {
         const h = new Headers(res.headers);
         h.set('cache-control', 'no-store');
         res = new Response(res.body, { status: res.status, headers: h });
@@ -800,6 +800,173 @@ async function handleFetch(request, env) {
         return csJson({ ok: false, error: 'gagal menyimpan usulan' }, 500);
       }
       return csJson({ ok: true, id: subId, status: 'pending', message: 'Usulan diterima dan menunggu persetujuan Alyaa.' }, 201);
+    }
+
+    // ---- Admin: kontrol API Cerpen (panel /kendali/cerpen-api, v66) ----
+    // Guard sama seperti /kendali: sesi admin (cookie cms_access HMAC).
+    // CSRF via header x-csrf (token yang sama dengan form admin) untuk
+    // SEMUA method, termasuk GET — panel selalu mengirimnya.
+    // Ditempatkan DI SINI (sebelum blok POST admin di bawah yang memanggil
+    // request.formData() untuk semua POST admin): body JSON akan melempar
+    // error di formData() bila sampai ke sana.
+    // Kunci konten Cerpen TIDAK PERNAH masuk Worker/D1 — approve di sini
+    // hanya mengubah status -> 'approved'; applier VM yang menerapkan
+    // (review_submissions.py apply-approved) ke konten kanonis + D1.
+    if (path.startsWith('/api/admin/cerpen-')) {
+      const aj = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
+      if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
+      if (!env.BACKUP_DB) return aj({ ok: false, error: 'database tidak tersedia' }, 503);
+      if (!(await checkRateLimit(env, 'cerpen-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
+      const B = env.BACKUP_DB;
+      const CERPEN_KINDS = ['cerpen', 'season', 'edit', 'delete', 'komik', 'komik-episode'];
+      const SUB_STATUSES = ['pending', 'approved', 'applied', 'rejected'];
+      const isKeyId = v => /^key-[0-9a-f]{8}$/.test(v);
+      const isSubId = v => /^sub-[0-9a-f]{12}$/.test(v);
+      const isHash64 = v => /^[0-9a-f]{64}$/.test(v);
+      async function cerpenAudit(action, targetType, targetId, note) {
+        const ok = await B.prepare(`INSERT INTO cerpen_admin_audit (id, created_at, actor, action, target_type, target_id, note) VALUES (?, ?, 'admin', ?, ?, ?, ?)`).bind('aud-' + randomHex(6), Date.now(), action, targetType, targetId, String(note || '')).run();
+        if (!ok || !ok.success) throw new Error('gagal mencatat audit');
+      }
+      async function readJsonBody() {
+        const raw = await request.text();
+        if (raw.length > 100 * 1024) return { err: 'body terlalu besar (maks 100 KB)' };
+        if (!raw.trim()) return { body: {} };
+        try { return { body: JSON.parse(raw) }; } catch (e) { return { err: 'body JSON tidak valid' }; }
+      }
+      try {
+        // GET /api/admin/cerpen-keys — daftar key (hash hanya 8 karakter pertama).
+        if (path === '/api/admin/cerpen-keys' && request.method === 'GET') {
+          const keys = await B.prepare(`SELECT key_id, key_hash, name, created_at, revoked, daily_limit FROM cerpen_api_keys ORDER BY created_at DESC`).all();
+          const counts = await B.prepare(`SELECT key_id, COUNT(*) AS total, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending FROM cerpen_submissions GROUP BY key_id`).all();
+          const byKey = new Map((counts.results || []).map(r => [r.key_id, r]));
+          return aj({ ok: true, keys: (keys.results || []).map(k => {
+            const c = byKey.get(k.key_id) || {};
+            return { key_id: k.key_id, name: k.name, created_at: k.created_at, revoked: Number(k.revoked) || 0, daily_limit: k.daily_limit, key_hash_prefix: String(k.key_hash || '').slice(0, 8), submissions: Number(c.total) || 0, pending: Number(c.pending) || 0 };
+          }) });
+        }
+        // POST /api/admin/cerpen-keys — daftar key baru dari HASH (bukan plaintext).
+        if (path === '/api/admin/cerpen-keys' && request.method === 'POST') {
+          const { body, err } = await readJsonBody();
+          if (err) return aj({ ok: false, error: err }, 400);
+          const keyHash = String(body.key_hash || '');
+          const name = String(body.name || '').trim();
+          const dailyLimit = Number(body.daily_limit);
+          if (!isHash64(keyHash)) return aj({ ok: false, error: 'key_hash harus 64 karakter hex lowercase' }, 400);
+          if (!name || name.length > 80) return aj({ ok: false, error: 'name wajib 1–80 karakter' }, 400);
+          if (!Number.isInteger(dailyLimit) || dailyLimit < 1 || dailyLimit > 100) return aj({ ok: false, error: 'daily_limit harus 1–100' }, 400);
+          const dup = await B.prepare(`SELECT key_id FROM cerpen_api_keys WHERE key_hash = ?`).bind(keyHash).first();
+          if (dup) return aj({ ok: false, error: 'hash sudah terdaftar' }, 409);
+          const keyId = 'key-' + randomHex(4);
+          const createdAt = Date.now();
+          await B.prepare(`INSERT INTO cerpen_api_keys (key_id, key_hash, name, created_at, revoked, daily_limit) VALUES (?, ?, ?, ?, 0, ?)`).bind(keyId, keyHash, name, createdAt, dailyLimit).run();
+          await cerpenAudit('key_create', 'key', keyId, 'name=' + name + ' limit=' + dailyLimit);
+          return aj({ ok: true, key_id: keyId, name, created_at: createdAt, revoked: 0, daily_limit: dailyLimit, key_hash_prefix: keyHash.slice(0, 8) }, 201);
+        }
+        // POST /api/admin/cerpen-keys/:id/revoke|unrevoke|limit
+        const keyAction = path.match(/^\/api\/admin\/cerpen-keys\/([^/]+)\/(revoke|unrevoke|limit)$/);
+        if (keyAction && request.method === 'POST') {
+          const keyId = keyAction[1];
+          const action = keyAction[2];
+          if (!isKeyId(keyId)) return aj({ ok: false, error: 'key_id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT key_id FROM cerpen_api_keys WHERE key_id = ?`).bind(keyId).first();
+          if (!row) return aj({ ok: false, error: 'key tidak ditemukan' }, 404);
+          if (action === 'limit') {
+            const { body, err } = await readJsonBody();
+            if (err) return aj({ ok: false, error: err }, 400);
+            const dl = Number(body.daily_limit);
+            if (!Number.isInteger(dl) || dl < 1 || dl > 100) return aj({ ok: false, error: 'daily_limit harus 1–100' }, 400);
+            await B.prepare(`UPDATE cerpen_api_keys SET daily_limit = ? WHERE key_id = ?`).bind(dl, keyId).run();
+            await cerpenAudit('key_limit', 'key', keyId, 'daily_limit=' + dl);
+            return aj({ ok: true, key_id: keyId, daily_limit: dl });
+          }
+          const revoked = action === 'revoke' ? 1 : 0;
+          await B.prepare(`UPDATE cerpen_api_keys SET revoked = ? WHERE key_id = ?`).bind(revoked, keyId).run();
+          await cerpenAudit(revoked ? 'key_revoke' : 'key_unrevoke', 'key', keyId, '');
+          return aj({ ok: true, key_id: keyId, revoked });
+        }
+        // DELETE /api/admin/cerpen-keys/:id (submission lama tetap tersimpan).
+        const keyDel = path.match(/^\/api\/admin\/cerpen-keys\/([^/]+)$/);
+        if (keyDel && request.method === 'DELETE') {
+          const keyId = keyDel[1];
+          if (!isKeyId(keyId)) return aj({ ok: false, error: 'key_id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT key_id FROM cerpen_api_keys WHERE key_id = ?`).bind(keyId).first();
+          if (!row) return aj({ ok: false, error: 'key tidak ditemukan' }, 404);
+          await B.prepare(`DELETE FROM cerpen_api_keys WHERE key_id = ?`).bind(keyId).run();
+          await cerpenAudit('key_delete', 'key', keyId, '');
+          return aj({ ok: true, key_id: keyId });
+        }
+        // GET /api/admin/cerpen-submissions/stats (cek SEBELUM rute :id).
+        if (path === '/api/admin/cerpen-submissions/stats' && request.method === 'GET') {
+          const byStatus = await B.prepare(`SELECT status, COUNT(*) AS c FROM cerpen_submissions GROUP BY status`).all();
+          const byKey = await B.prepare(`SELECT key_id, status, COUNT(*) AS c FROM cerpen_submissions GROUP BY key_id, status`).all();
+          const total = await B.prepare(`SELECT COUNT(*) AS c FROM cerpen_submissions`).first();
+          const last24 = await B.prepare(`SELECT COUNT(*) AS c FROM cerpen_submissions WHERE created_at >= ?`).bind(Date.now() - 24 * 3600 * 1000).first();
+          const perStatus = { pending: 0, approved: 0, applied: 0, rejected: 0 };
+          for (const r of (byStatus.results || [])) if (r.status in perStatus) perStatus[r.status] = Number(r.c) || 0;
+          const perKey = {};
+          for (const r of (byKey.results || [])) {
+            if (!perKey[r.key_id]) perKey[r.key_id] = { total: 0, pending: 0, approved: 0, applied: 0, rejected: 0 };
+            if (r.status in perKey[r.key_id]) perKey[r.key_id][r.status] = Number(r.c) || 0;
+            perKey[r.key_id].total += Number(r.c) || 0;
+          }
+          return aj({ ok: true, total: Number(total && total.c) || 0, per_status: perStatus, per_key: perKey, last_24h: Number(last24 && last24.c) || 0 });
+        }
+        // GET /api/admin/cerpen-submissions?status=&key_id=&kind=&limit=
+        if (path === '/api/admin/cerpen-submissions' && request.method === 'GET') {
+          const status = url.searchParams.get('status') || '';
+          const keyId = url.searchParams.get('key_id') || '';
+          const kind = url.searchParams.get('kind') || '';
+          let limit = parseInt(url.searchParams.get('limit') || '50', 10);
+          if (Number.isNaN(limit)) limit = 50;
+          limit = Math.min(100, Math.max(1, limit));
+          if (status && !SUB_STATUSES.includes(status)) return aj({ ok: false, error: 'status tidak valid' }, 400);
+          if (keyId && !isKeyId(keyId)) return aj({ ok: false, error: 'key_id tidak valid' }, 400);
+          if (kind && !CERPEN_KINDS.includes(kind)) return aj({ ok: false, error: 'kind tidak valid' }, 400);
+          let sql = `SELECT id, key_id, kind, target_id, title, status, created_at, reviewed_at, review_note FROM cerpen_submissions WHERE 1 = 1`;
+          const args = [];
+          if (status) { sql += ` AND status = ?`; args.push(status); }
+          if (keyId) { sql += ` AND key_id = ?`; args.push(keyId); }
+          if (kind) { sql += ` AND kind = ?`; args.push(kind); }
+          sql += ` ORDER BY created_at DESC LIMIT ?`;
+          args.push(limit);
+          const rows = await B.prepare(sql).bind(...args).all();
+          return aj({ ok: true, submissions: rows.results || [] });
+        }
+        // GET /api/admin/cerpen-submissions/:id (satu-satunya yang mengembalikan payload_json).
+        const subGet = path.match(/^\/api\/admin\/cerpen-submissions\/([^/]+)$/);
+        if (subGet && request.method === 'GET') {
+          const subId = subGet[1];
+          if (!isSubId(subId)) return aj({ ok: false, error: 'id tidak valid' }, 400);
+          const row = await B.prepare(`SELECT id, key_id, kind, target_id, title, dedup_hash, payload_json, status, created_at, reviewed_at, review_note FROM cerpen_submissions WHERE id = ?`).bind(subId).first();
+          if (!row) return aj({ ok: false, error: 'submission tidak ditemukan' }, 404);
+          return aj({ ok: true, submission: row });
+        }
+        // POST /api/admin/cerpen-submissions/:id/approve|reject
+        // (hanya dari status pending; approve di sini HANYA mengubah status
+        // -> 'approved', applier VM yang menerapkan ke konten — kunci konten
+        // tidak pernah keluar VM).
+        const subAction = path.match(/^\/api\/admin\/cerpen-submissions\/([^/]+)\/(approve|reject)$/);
+        if (subAction && request.method === 'POST') {
+          const subId = subAction[1];
+          const action = subAction[2];
+          if (!isSubId(subId)) return aj({ ok: false, error: 'id tidak valid' }, 400);
+          const { body, err } = await readJsonBody();
+          if (err) return aj({ ok: false, error: err }, 400);
+          const note = String(body.note || '').trim();
+          if (action === 'reject' && note.length < 3) return aj({ ok: false, error: 'note wajib diisi (min 3 karakter) untuk reject' }, 400);
+          const row = await B.prepare(`SELECT id, status FROM cerpen_submissions WHERE id = ?`).bind(subId).first();
+          if (!row) return aj({ ok: false, error: 'submission tidak ditemukan' }, 404);
+          if (row.status !== 'pending') return aj({ ok: false, error: 'submission sudah ' + row.status }, 409);
+          const to = action === 'approve' ? 'approved' : 'rejected';
+          await B.prepare(`UPDATE cerpen_submissions SET status = ?, reviewed_at = ?, review_note = ? WHERE id = ? AND status = 'pending'`).bind(to, Date.now(), note, subId).run();
+          await cerpenAudit(action === 'approve' ? 'submission_approve' : 'submission_reject', 'submission', subId, note);
+          return aj({ ok: true, id: subId, status: to });
+        }
+        return aj({ ok: false, error: 'endpoint tidak ditemukan' }, 404);
+      } catch (e) {
+        return aj({ ok: false, error: 'kesalahan server' }, 500);
+      }
     }
 
     // ---- Publik: konten Cerpen Hozin dari D1 (aplikasi Android, v63, 12 Nov 2026) ----
@@ -1485,10 +1652,139 @@ async function handleFetch(request, env) {
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
+      // ---- Admin: panel kontrol API Cerpen (v66) ----
+      // Statistik + keys + submissions + audit, semua dari D1 stopwatch-db
+      // (binding BACKUP_DB). Aksi lewat fetch ke /api/admin/cerpen-*.
+      if (path === '/kendali/cerpen-api') {
+        if (!env.BACKUP_DB) {
+          const content = `<h2>Cerpen API</h2>${nav}<div class="card"><p>Database Cerpen (stopwatch-db) tidak tersedia — panel tidak bisa dimuat.</p></div>`;
+          return html(await renderPage(env, 'Cerpen API', content));
+        }
+        const wib = ms => new Date(Number(ms || 0) + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16);
+        const fStatus = url.searchParams.get('status') || '';
+        const fKey = url.searchParams.get('key_id') || '';
+        const fKind = url.searchParams.get('kind') || '';
+        let fLimit = parseInt(url.searchParams.get('limit') || '50', 10);
+        if (Number.isNaN(fLimit)) fLimit = 50;
+        fLimit = Math.min(100, Math.max(1, fLimit));
+        const B2 = env.BACKUP_DB;
+        let subSql = `SELECT id, key_id, kind, target_id, title, status, created_at, reviewed_at, review_note FROM cerpen_submissions WHERE 1 = 1`;
+        const subArgs = [];
+        if (fStatus) { subSql += ` AND status = ?`; subArgs.push(fStatus); }
+        if (fKey) { subSql += ` AND key_id = ?`; subArgs.push(fKey); }
+        if (fKind) { subSql += ` AND kind = ?`; subArgs.push(fKind); }
+        subSql += ` ORDER BY created_at DESC LIMIT ?`;
+        subArgs.push(fLimit);
+        const [keyRows, keyCounts, subRows, statRows, auditRows, last24Row] = await Promise.all([
+          B2.prepare(`SELECT key_id, key_hash, name, created_at, revoked, daily_limit FROM cerpen_api_keys ORDER BY created_at DESC`).all(),
+          B2.prepare(`SELECT key_id, COUNT(*) AS total, SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending FROM cerpen_submissions GROUP BY key_id`).all(),
+          B2.prepare(subSql).bind(...subArgs).all(),
+          B2.prepare(`SELECT status, COUNT(*) AS c FROM cerpen_submissions GROUP BY status`).all(),
+          B2.prepare(`SELECT id, created_at, actor, action, target_type, target_id, note FROM cerpen_admin_audit ORDER BY created_at DESC LIMIT 20`).all(),
+          B2.prepare(`SELECT COUNT(*) AS c FROM cerpen_submissions WHERE created_at >= ?`).bind(Date.now() - 24 * 3600 * 1000).first(),
+        ]);
+        const perStatus = { pending: 0, approved: 0, applied: 0, rejected: 0 };
+        for (const r of (statRows.results || [])) if (r.status in perStatus) perStatus[r.status] = Number(r.c) || 0;
+        const keys = keyRows.results || [];
+        const activeKeys = keys.filter(k => Number(k.revoked) !== 1).length;
+        const byKey = new Map((keyCounts.results || []).map(r => [r.key_id, r]));
+        const totalSubs = perStatus.pending + perStatus.approved + perStatus.applied + perStatus.rejected;
+        const last24h = Number(last24Row && last24Row.c) || 0;
+        const badge = s => {
+          const colors = { pending: '#d97706', approved: '#3b82f6', applied: '#22c55e', rejected: '#dc2626' };
+          return `<span style="display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:800;color:#fff;background:${colors[s] || '#6b7280'}">${esc(s)}</span>`;
+        };
+        const statsHtml = `<div class="adm-stats"><div class="adm-stat"><span class="adm-stat-num">${keys.length}</span><span class="adm-stat-label">Total key</span><span class="adm-stat-sub">${activeKeys} aktif</span></div><div class="adm-stat"><span class="adm-stat-num">${perStatus.pending}</span><span class="adm-stat-label">Pending</span><span class="adm-stat-sub">menunggu review</span></div><div class="adm-stat"><span class="adm-stat-num">${perStatus.approved}</span><span class="adm-stat-label">Approved</span><span class="adm-stat-sub">menunggu applier VM</span></div><div class="adm-stat"><span class="adm-stat-num">${perStatus.applied}</span><span class="adm-stat-label">Applied</span><span class="adm-stat-sub">sudah masuk konten</span></div><div class="adm-stat"><span class="adm-stat-num">${perStatus.rejected}</span><span class="adm-stat-label">Rejected</span></div><div class="adm-stat"><span class="adm-stat-num">${last24h}</span><span class="adm-stat-label">24 jam terakhir</span><span class="adm-stat-sub">${totalSubs} submission total</span></div></div>`;
+        const keyHtml = keys.map(k => {
+          const c = byKey.get(k.key_id) || {};
+          const revoked = Number(k.revoked) === 1;
+          return `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(k.name)}</span> <span style="font-size:12px;font-weight:700;color:${revoked ? '#dc2626' : '#22c55e'}">${revoked ? 'DICABUT' : 'AKTIF'}</span><div class="adm-row-meta">${esc(k.key_id)} · hash ${esc(String(k.key_hash || '').slice(0, 8))}… · dibuat ${wib(k.created_at)} · limit ${esc(k.daily_limit)}/hari · ${Number(c.total) || 0} submission (${Number(c.pending) || 0} pending)</div></div><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">${revoked ? `<button type="button" data-cerpen-key="unrevoke" data-id="${esc(k.key_id)}">Aktifkan</button>` : `<button type="button" data-cerpen-key="revoke" data-id="${esc(k.key_id)}">Cabut</button>`}<button type="button" data-cerpen-key="limit" data-id="${esc(k.key_id)}" data-limit="${esc(k.daily_limit)}">Limit</button><button type="button" data-cerpen-key="delete" data-id="${esc(k.key_id)}" style="background:#dc2626">Hapus</button></div></div>`;
+        }).join('') || '<p>Belum ada key.</p>';
+        const opt = (val, cur, label) => `<option value="${val}"${val === cur ? ' selected' : ''}>${label}</option>`;
+        const statusOpts = [''].concat(['pending', 'approved', 'applied', 'rejected']).map(v => opt(v, fStatus, v === '' ? 'Semua status' : v)).join('');
+        const kindOpts = [''].concat(['cerpen', 'season', 'edit', 'delete', 'komik', 'komik-episode']).map(v => opt(v, fKind, v === '' ? 'Semua kind' : v)).join('');
+        const keyOpts = [''].concat(keys.map(k => k.key_id)).map(v => opt(v, fKey, v === '' ? 'Semua key' : v)).join('');
+        const limitOpts = [10, 25, 50, 100].map(v => `<option value="${v}"${v === fLimit ? ' selected' : ''}>${v}</option>`).join('');
+        const subHtml = (subRows.results || []).map(s => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(s.title || '(tanpa judul)')}</span> ${badge(s.status)}<div class="adm-row-meta">${wib(s.created_at)} · ${esc(s.kind)} · key ${esc(s.key_id)} · target ${esc(s.target_id || '-')} · ${esc(s.id)}${s.review_note ? ' · catatan: ' + esc(s.review_note) : ''}</div></div><button type="button" data-cerpen-detail="${esc(s.id)}">Detail</button></div>`).join('') || '<p>Tidak ada submission untuk filter ini.</p>';
+        const auditHtml = (auditRows.results || []).map(a => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(a.action)}</span><div class="adm-row-meta">${wib(a.created_at)} · ${esc(a.actor)} · ${esc(a.target_type)} ${esc(a.target_id)}${a.note ? ' · ' + esc(a.note) : ''}</div></div></div>`).join('') || '<p>Belum ada aksi admin tercatat.</p>';
+        const content = `<h2>Cerpen API</h2>${nav}${noticeHtml(url)}<div id="cerpen-api-msg"></div><div class="card"><h3>Statistik</h3>${statsHtml}</div><div class="card"><h3>API Keys</h3>${keyHtml}<h4>Daftarkan key baru</h4><form id="cerpen-key-form"><label>Hash SHA-256 key baru (64 hex, BUKAN plaintext key)<input name="key_hash" required pattern="[0-9a-f]{64}" minlength="64" maxlength="64" placeholder="64 karakter hex lowercase" style="font-family:monospace" autocomplete="off"></label><label>Nama<input name="name" required maxlength="80" placeholder="mis. muse-kedua"></label><label>Limit per hari<input name="daily_limit" type="number" min="1" max="100" value="10" required></label><p><button type="submit">Daftarkan key</button></p><p style="font-size:13px;opacity:.7">Key plaintext TIDAK PERNAH ditulis di sini — yang didaftarkan hanya hash-nya. Key plaintext dibuat &amp; disimpan oleh pemilik key di pihaknya sendiri.</p></form></div><div class="card"><h3>Submissions</h3><form method="get" action="/kendali/cerpen-api" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">Status<select name="status">${statusOpts}</select></label><label style="margin:0">Key<select name="key_id">${keyOpts}</select></label><label style="margin:0">Kind<select name="kind">${kindOpts}</select></label><label style="margin:0">Tampil<select name="limit">${limitOpts}</select></label><button type="submit">Filter</button></form>${subHtml}</div><div class="card" id="cerpen-detail" hidden><h3>Detail submission</h3><div id="cerpen-detail-body"><p>Pilih tombol Detail pada salah satu submission.</p></div><div id="cerpen-detail-actions" hidden><button type="button" id="cerpen-approve">Setujui (approve)</button> <button type="button" id="cerpen-reject" style="background:#dc2626">Tolak (reject)</button></div><p style="font-size:13px;opacity:.7">Approve di sini hanya mengubah status jadi approved — konten diterapkan oleh applier VM (tiap ~15 menit), kunci enkripsi tidak pernah keluar VM.</p></div><div class="card"><h3>Riwayat admin (audit)</h3>${auditHtml}</div><script>
+const CERPEN_CSRF = "${csrf}";
+const cerpenMsg = document.getElementById('cerpen-api-msg');
+function escHtml(s) { return String(s == null ? '' : s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'); }
+function cerpenShowMsg(text, ok) { cerpenMsg.innerHTML = '<div class="card" style="border-color:' + (ok ? '#22c55e' : '#dc2626') + '"><p><b>' + (ok ? 'Berhasil:' : 'Gagal:') + '</b> ' + escHtml(text) + '</p></div>'; }
+async function cerpenCall(method, url, body) {
+  const res = await fetch(url, { method: method, headers: { 'x-csrf': CERPEN_CSRF, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const data = await res.json().catch(function () { return {}; });
+  if (!res.ok || !data.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+document.getElementById('cerpen-key-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await cerpenCall('POST', '/api/admin/cerpen-keys', { key_hash: f.key_hash.value.trim().toLowerCase(), name: f.name.value.trim(), daily_limit: Number(f.daily_limit.value) });
+    cerpenShowMsg('Key berhasil didaftarkan.', true);
+    setTimeout(function () { location.reload(); }, 600);
+  } catch (err) { cerpenShowMsg(err.message, false); }
+});
+document.querySelectorAll('[data-cerpen-key]').forEach(function (btn) {
+  btn.addEventListener('click', async function () {
+    const id = btn.dataset.id;
+    const act = btn.dataset.cerpenKey;
+    let body;
+    if (act === 'limit') {
+      const v = prompt('Limit baru per hari (1–100):', btn.dataset.limit || '10');
+      if (v === null) return;
+      body = { daily_limit: Number(v) };
+    }
+    if (act === 'delete' && !confirm('Hapus key ' + id + '? Submission lama tetap tersimpan.')) return;
+    if (act === 'revoke' && !confirm('Cabut key ' + id + '? Key ini tidak bisa dipakai submit lagi.')) return;
+    try {
+      await cerpenCall(act === 'delete' ? 'DELETE' : 'POST', '/api/admin/cerpen-keys/' + id + (act === 'delete' ? '' : '/' + act), body);
+      location.reload();
+    } catch (err) { cerpenShowMsg(err.message, false); }
+  });
+});
+async function cerpenShowDetail(subId) {
+  const box = document.getElementById('cerpen-detail');
+  const bodyEl = document.getElementById('cerpen-detail-body');
+  const actions = document.getElementById('cerpen-detail-actions');
+  box.hidden = false;
+  actions.hidden = true;
+  bodyEl.innerHTML = '<p>Memuat…</p>';
+  try {
+    const data = await cerpenCall('GET', '/api/admin/cerpen-submissions/' + subId);
+    const s = data.submission;
+    let payload = s.payload_json || '';
+    try { payload = JSON.stringify(JSON.parse(payload), null, 2); } catch (e) {}
+    bodyEl.innerHTML = '<p><b>' + escHtml(s.title || '-') + '</b> · ' + escHtml(s.kind) + ' · ' + escHtml(s.status) + '</p><p>Key: ' + escHtml(s.key_id) + ' · Target: ' + escHtml(s.target_id || '-') + ' · ' + escHtml(s.id) + '</p>' + (s.review_note ? '<p>Catatan: ' + escHtml(s.review_note) + '</p>' : '') + '<pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;background:rgba(128,128,128,.08);padding:12px;border-radius:10px"></pre>';
+    bodyEl.querySelector('pre').textContent = payload;
+    actions.hidden = s.status !== 'pending';
+    actions.dataset.id = s.id;
+  } catch (err) { bodyEl.innerHTML = '<p>Gagal memuat detail: ' + escHtml(err.message) + '</p>'; }
+}
+document.querySelectorAll('[data-cerpen-detail]').forEach(function (btn) {
+  btn.addEventListener('click', function () { cerpenShowDetail(btn.dataset.cerpenDetail); });
+});
+document.getElementById('cerpen-approve').addEventListener('click', async function () {
+  const id = document.getElementById('cerpen-detail-actions').dataset.id;
+  try { await cerpenCall('POST', '/api/admin/cerpen-submissions/' + id + '/approve', {}); location.reload(); }
+  catch (err) { cerpenShowMsg(err.message, false); }
+});
+document.getElementById('cerpen-reject').addEventListener('click', async function () {
+  const id = document.getElementById('cerpen-detail-actions').dataset.id;
+  const note = prompt('Alasan reject (min 3 karakter):');
+  if (note === null) return;
+  try { await cerpenCall('POST', '/api/admin/cerpen-submissions/' + id + '/reject', { note: note }); location.reload(); }
+  catch (err) { cerpenShowMsg(err.message, false); }
+});
+</script>`;
+        return html(await renderPage(env, 'Cerpen API', content));
+      }
       if (path === '/kendali') {
         // Prune retensi analitik (bertahap, maks 500/pemanggilan): gagal
         // prune tidak merusak dashboard — tanpa Cron, ini satu-satunya
