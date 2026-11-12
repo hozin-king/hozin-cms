@@ -30,6 +30,7 @@ import { renderMarkdown } from './markdown.js';
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie, isValidCommenterPassword, COMMENTER_PASSWORD_MIN, COMMENTER_PASSWORD_MAX } from './auth.js';
 import { checkRateLimit } from './security.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
+import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, STOPWATCH_EVENTS, nextEventMs, readingTrackerScript, HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
 import { ensureSchema, getSetting, getAllSettings, getEnabledPlugins, doBackup, renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
 import { editorCard } from './editor.js';
 import { hasLink, hasDirtyWord, hasJudol } from './plugins.js';
@@ -322,7 +323,7 @@ input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/md-backup', 'Backup .md']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/md-backup', 'Backup .md']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -1733,13 +1734,16 @@ async function handleFetch(request, env) {
       // akan makin berat seiring post bertambah.
       const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1);
       const offset = (page - 1) * 10;
-      // Percepat: query independen ini jalan barengan, bukan berurutan.
-      // 11 Nov 2026: 5 getSetting iklan + 3 getSetting renderPage diganti
-      // SATU getAllSettings — halaman publik tinggal 1 gelombang D1.
-      const [rows, plugins, settingsMap] = await Promise.all([
+      // First-visit (v81): pengunjung baru di halaman 1 — tanpa sesi admin,
+      // tanpa akun komentator, tanpa cookie cms_fv. Mereka dapat komposisi
+      // campuran (terbaru + terpopuler + rotasi harian); yang lain tidak
+      // berubah perilakunya.
+      const isFirstVisit = !admin && !commenter && !parseCookies(request).cms_fv && page === 1;
+      const [rows, plugins, settingsMap, popularRows] = await Promise.all([
         env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY publish_at DESC LIMIT 11 OFFSET ?`).bind(nowIso, offset).all(),
         getEnabledPlugins(env),
         getAllSettings(env),
+        isFirstVisit ? env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY views DESC LIMIT 10`).bind(nowIso).all() : Promise.resolve({ results: [] }),
       ]);
       const adImage = settingsMap.get('ad_image') || '';
       const adLink = settingsMap.get('ad_link') || '';
@@ -1756,10 +1760,25 @@ async function handleFetch(request, env) {
         ? `<a href="/kendali/posts/new" class="fab" id="fabPost" aria-label="Buat post">+</a><script>(function(){var f=document.getElementById('fabPost');if(!f)return;var t=null;window.addEventListener('scroll',function(){f.classList.add('fab-hidden');if(t)clearTimeout(t);t=setTimeout(function(){f.classList.remove('fab-hidden')},300)},{passive:true})})();<\/script>`
         : '';
       const nav = (page > 1 ? `<p><a href="/?page=${page - 1}">← Post baru</a></p>` : '') + (hasNext ? `<p><a href="/?page=${page + 1}">Post lama →</a></p>` : '');
-      const content = adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot) + (posts.length
-        ? posts.map(p => postCard(p, plugins, admin)).join('')
+      let displayPosts = posts;
+      let welcome = '';
+      if (isFirstVisit && allPosts.length) {
+        const mix = pickFirstVisit([...allPosts, ...(popularRows.results || [])], wibParts(Date.now()).date);
+        if (mix.ordered.length >= 4) {
+          displayPosts = mix.ordered;
+          welcome = `<div class="card"><h2>Selamat datang!</h2><p>Baru pertama ke sini? Ini campuran untukmu: <b>terbaru</b>, <b>paling banyak dibaca</b>, dan <b>pilihan hari ini</b> — berubah tiap hari.</p></div>`;
+        }
+      }
+      const content = adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot) + welcome + (displayPosts.length
+        ? displayPosts.map(p => postCard(p, plugins, admin)).join('')
         : '<div class="card"><p>Belum ada post.</p></div>') + nav + fab;
-      return html(await renderPage(env, 'Beranda', content, pageOpts(settingsMap, env)), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
+      const res = html(await renderPage(env, 'Beranda', content, pageOpts(settingsMap, env)), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
+      if (isFirstVisit && welcome) {
+        const h = new Headers(res.headers);
+        h.append('set-cookie', 'cms_fv=1; Path=/; Max-Age=2592000; SameSite=Lax; Secure');
+        return new Response(res.body, { status: res.status, headers: h });
+      }
+      return res;
     }
 
     // ---- Publik: arsip tag (hanya post publik yang sudah terbit) ----
@@ -2047,7 +2066,26 @@ size();
 window.addEventListener('resize',size);
 requestAnimationFrame(draw);
 })();`;
-      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Seret globe untuk memutar. Ketuk titik untuk melihat detail serangan. Warna busur = negara penyerang (tiap negara warnanya beda). Semua busur menuju hozinking.my.id.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">${esc(feedStatus)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><p class="meta" id="globe-detail">Ketuk titik di globe untuk melihat detail serangan.</p><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul>${feedListHtml}</div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
+      // Stopwatch Abadi (v81): sama seperti aplikasi Hozin Tools — penghitung
+      // naik abadi sejak start_time di D1 stopwatch-db (BACKUP_DB, tabel
+      // eternal_stopwatch, user default_user). Dibaca server-side tiap buka
+      // halaman; gagal baca = kartu tidak tampil (fail-open).
+      let stopwatchCard = '';
+      try {
+        if (env.BACKUP_DB) {
+          const sw = await env.BACKUP_DB.prepare(`SELECT start_time FROM eternal_stopwatch WHERE user_id = ?`).bind('default_user').first();
+          const startMs = Number(sw && sw.start_time) || 0;
+          if (startMs > 0) {
+            const startWib = new Date(startMs).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+            const cdRows = STOPWATCH_EVENTS.map(ev => {
+              const ms = nextEventMs(ev, Date.now());
+              return `<div style="display:flex;justify-content:space-between;gap:8px;margin:6px 0"><span style="text-align:left">${esc(ev.title)}</span><b data-cd="${ms}" style="white-space:nowrap">…</b></div>`;
+            }).join('');
+            stopwatchCard = `<div class="card" style="margin-top:16px;padding:28px 20px;text-align:center"><p class="meta" style="margin:0 0 4px">Stopwatch Abadi — sama seperti aplikasi Hozin Tools</p><h2 style="margin:0 0 4px">⏱ Stopwatch Abadi</h2><p id="eternal-sub" class="meta" style="margin:0">…</p><p id="eternal-timer" style="font-family:monospace;font-size:34px;font-weight:800;line-height:1.3;margin:10px 0;color:#0284c7;white-space:pre-line">${esc(formatStopwatch(Date.now() - startMs, false))}</p><p><button type="button" id="eternal-mode">Mode Detail</button></p><p class="meta">Mulai ${esc(startWib)} WIB · dihitung dari database stopwatch</p><h3 style="margin:18px 0 6px;font-size:15px">Countdown Hari Besar &amp; Event</h3>${cdRows}</div><script>(function(){var start=${startMs};var detailed=false;var el=document.getElementById('eternal-timer');var sub=document.getElementById('eternal-sub');var btn=document.getElementById('eternal-mode');function pad2(n){return String(n).padStart(2,'0')}function fmt(ms){var e=Math.max(0,ms);if(!detailed){var ts=Math.floor(e/1000);var h=Math.floor(ts/3600),m=Math.floor(ts%3600/60),s=ts%60,cs=Math.floor(e%1000/10);return String(h).padStart(3,'0')+':'+pad2(m)+':'+pad2(s)+'.'+pad2(cs)}var sec=Math.floor(e/1000),min=Math.floor(sec/60),hr=Math.floor(min/60),d=Math.floor(hr/24);var wk=Math.floor(d/7),mo=Math.floor(d/30),yr=Math.floor(d/365);var parts=[];if(yr>0)parts.push(yr+' Thn');if(mo>0||yr>0)parts.push((mo%12)+' Bln');if(wk>0||mo>0||yr>0)parts.push(wk+' Mgg');if(d>0||wk>0||mo>0||yr>0)parts.push((d%30)+' Hari');return (parts.length?parts.join(' ')+'\\n':'')+pad2(hr%24)+':'+pad2(min%60)+':'+pad2(sec%60)+'.'+String(e%1000).padStart(3,'0')}function tick(){var e=Date.now()-start;el.textContent=fmt(e);sub.textContent=detailed?'Rincian Akumulasi Waktu:':Math.floor(e/3600000)+' Jam +'}btn.onclick=function(){detailed=!detailed;btn.textContent=detailed?'Mode Digital':'Mode Detail';tick()};setInterval(tick,50);tick();function tickCd(){var now=Date.now();document.querySelectorAll('[data-cd]').forEach(function(b){var diff=Math.max(0,Number(b.getAttribute('data-cd'))-now);var d=Math.floor(diff/86400000),h=Math.floor(diff/3600000)%24,m=Math.floor(diff/60000)%60,s=Math.floor(diff/1000)%60;b.textContent=d+'d '+h+'h '+m+'m '+s+'s'})}setInterval(tickCd,1000);tickCd();})();<\/script>`;
+          }
+        }
+      } catch (e) { stopwatchCard = ''; }
+      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div>${stopwatchCard}<div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Seret globe untuk memutar. Ketuk titik untuk melihat detail serangan. Warna busur = negara penyerang (tiap negara warnanya beda). Semua busur menuju hozinking.my.id.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">${esc(feedStatus)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><p class="meta" id="globe-detail">Ketuk titik di globe untuk melihat detail serangan.</p><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul>${feedListHtml}</div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
       return html(await renderPage(env, 'Status Situs', content), 200);
     }
 
@@ -2091,6 +2129,67 @@ requestAnimationFrame(draw);
       } catch (e) {
         return new Response(JSON.stringify({ ok: false, error: 'layanan statistik tidak tersedia' }), { status: 502, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=60' } });
       }
+    }
+
+    // ---- Waktu baca: heartbeat + statistik (v81) ----
+    // Algoritma lengkap di reading.js. Heartbeat hanya dari akun
+    // komentator (anonim 401, admin tidak dilacak). Statistik hanya untuk
+    // pemilik akun + super admin (fase 1; tampilan publik fase 2).
+    async function getReadingStats(env, userId) {
+      const [dayRows, hourRows] = await Promise.all([
+        env.DB.prepare(`SELECT day_wib, SUM(seconds) AS s FROM cms_reading_sessions WHERE user_id = ? GROUP BY day_wib`).bind(userId).all(),
+        env.DB.prepare(`SELECT hour_wib, SUM(seconds) AS s FROM cms_reading_hours WHERE user_id = ? GROUP BY hour_wib ORDER BY s DESC`).bind(userId).all(),
+      ]);
+      const sessions = (dayRows.results || []).map(r => ({ day_wib: r.day_wib, seconds: Number(r.s) || 0 }));
+      const hours = (hourRows.results || []).map(r => ({ hour_wib: Number(r.hour_wib), seconds: Number(r.s) || 0 }));
+      return computeReadingStats(sessions, hours);
+    }
+    if (request.method === 'POST' && path === '/api/reading/heartbeat') {
+      const hbJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!commenter) return hbJson({ ok: false, error: 'butuh akun komentator' }, 401);
+      let data = null;
+      try { data = await request.json(); } catch (e) { return hbJson({ ok: false, error: 'body tidak valid' }, 400); }
+      const csrfNeed = await userCsrf(env, commenter.id);
+      if (!data || String(data.csrf || '') !== csrfNeed) return hbJson({ ok: false, error: 'token tidak valid' }, 403);
+      const seconds = Number(data.seconds);
+      if (!Number.isInteger(seconds) || seconds < 1 || seconds > HEARTBEAT_MAX_SECONDS) return hbJson({ ok: false, error: 'detik tidak valid' }, 400);
+      const postId = String(data.post_id || '').replace(/[^A-Za-z0-9_-]/g, '');
+      if (!postId) return hbJson({ ok: false, error: 'post tidak valid' }, 400);
+      const maxScroll = Math.max(0, Math.min(1000, Number(data.max_scroll) || 0));
+      if (!(await checkRateLimit(env, 'reading:' + commenter.id, READING_RATE_LIMIT, READING_RATE_WINDOW_MS))) return hbJson({ ok: false, error: 'terlalu sering' }, 429);
+      const { date, hour } = wibParts(Date.now());
+      const todayRow = await env.DB.prepare(`SELECT SUM(seconds) AS total FROM cms_reading_sessions WHERE user_id = ? AND day_wib = ?`).bind(commenter.id, date).first();
+      const todayTotal = Number(todayRow && todayRow.total) || 0;
+      const allowed = Math.max(0, Math.min(seconds, READING_DAILY_CAP_SECONDS - todayTotal));
+      if (allowed <= 0) return hbJson({ ok: true, stored: 0, capped: true });
+      const nowIsoHb = new Date().toISOString();
+      await env.DB.batch([
+        env.DB.prepare(`INSERT INTO cms_reading_sessions (user_id, day_wib, post_id, seconds, max_scroll, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, day_wib, post_id) DO UPDATE SET seconds = cms_reading_sessions.seconds + excluded.seconds, max_scroll = MAX(cms_reading_sessions.max_scroll, excluded.max_scroll), updated_at = excluded.updated_at`).bind(commenter.id, date, postId, allowed, maxScroll, nowIsoHb),
+        env.DB.prepare(`INSERT INTO cms_reading_hours (user_id, day_wib, hour_wib, seconds) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, day_wib, hour_wib) DO UPDATE SET seconds = cms_reading_hours.seconds + excluded.seconds`).bind(commenter.id, date, hour, allowed),
+      ]);
+      return hbJson({ ok: true, stored: allowed, capped: allowed < seconds });
+    }
+    if (request.method === 'GET' && path === '/api/reading/stats') {
+      const stJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      const wantId = String(url.searchParams.get('user') || '');
+      let targetId = '';
+      let targetName = '';
+      if (admin) {
+        if (wantId) {
+          const u = await env.DB.prepare(`SELECT id, username FROM cms_users WHERE id = ?`).bind(wantId).first();
+          if (!u) return stJson({ ok: false, error: 'akun tidak ditemukan' }, 404);
+          targetId = u.id; targetName = u.username;
+        } else {
+          return stJson({ ok: false, error: 'parameter user wajib untuk admin' }, 400);
+        }
+      } else if (commenter) {
+        if (wantId && wantId !== commenter.id) return stJson({ ok: false, error: 'bukan statistikmu' }, 403);
+        targetId = commenter.id; targetName = commenter.username;
+      } else {
+        return stJson({ ok: false, error: 'butuh login' }, 401);
+      }
+      const stats = await getReadingStats(env, targetId);
+      return stJson({ ok: true, user_id: targetId, username: targetName, ...stats });
     }
 
     // ---- Publik: detail post + komentar (metadata dulu, body belakangan) ----
@@ -2187,7 +2286,9 @@ requestAnimationFrame(draw);
         const views = Number(post.views) || 0;
         const bodyHtml = post.body_mode === 'html' ? sanitizeHtml(post.body) : para(post.body);
         const detailTags = tagLinks(post);
-        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${metaHtml}</p>${detailTags ? `<p class="meta">${detailTags}</p>` : ''}${bodyHtml}</article>${adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}`;
+        // Tracker waktu baca (v81): hanya untuk akun komentator yang login.
+        const tracker = commenter ? readingTrackerScript(post.id, csrfForComment) : '';
+        const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${metaHtml}</p>${detailTags ? `<p class="meta">${detailTags}</p>` : ''}${bodyHtml}</article>${adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}${tracker}`;
         const res = html(await renderPage(env, post.title, content, pageOpts(settingsMap, env)), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
         if (viewCookie) {
           const h = new Headers(res.headers);
@@ -2353,7 +2454,12 @@ requestAnimationFrame(draw);
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Kamu login sebagai Admin. Admin tidak perlu akun komentator.</p><p><a href="/kendali">Ke dashboard admin</a></p></div>'));
       }
       if (commenter) {
-        return html(await renderPage(env, 'Akun', `<div class="card"><h2>Akun Saya</h2><p>Login sebagai <b>${esc(commenter.username)}</b>.</p><form method="post" action="/akun/logout"><button type="submit">Keluar</button></form></div>`));
+        // Statistik waktu baca pemilik akun (v81): hanya pemilik yang lihat.
+        const stats = await getReadingStats(env, commenter.id);
+        const statsHtml = stats.totalSeconds > 0
+          ? `<div class="card"><h3>Waktu Baca</h3><p>Total membaca: <b>${stats.totalMinutes} menit</b> (${stats.daysActive} hari aktif).</p><p>Hari paling sering baca: <b>${stats.topDay ? esc(stats.topDay.name) + ' (' + esc(stats.topDay.date) + ') · ' + stats.topDay.minutes + ' menit' : '—'}</b></p><p>Jam biasa baca: <b>${stats.hourRange ? esc(stats.hourRange.label) : '—'}</b></p><p class="meta">Waktu baca hanya terhitung saat kamu scroll ke bawah sambil membaca; diam lebih dari 15 detik tidak dihitung.</p></div>`
+          : `<div class="card"><h3>Waktu Baca</h3><p>Belum ada waktu baca tercatat. Baca post sambil scroll ke bawah saat login — menitmu tercatat di sini.</p></div>`;
+        return html(await renderPage(env, 'Akun', `<div class="card"><h2>Akun Saya</h2><p>Login sebagai <b>${esc(commenter.username)}</b>.</p><form method="post" action="/akun/logout"><button type="submit">Keluar</button></form></div>${statsHtml}`));
       }
       const pesan = url.searchParams.get('pesan') === 'login' ? '<div class="card"><p>Login dulu atau buat akun untuk berkomentar.</p></div>' : '';
       // Halaman akun dibuat profesional dan tidak ramai: satu kartu sempit
@@ -2471,7 +2577,7 @@ requestAnimationFrame(draw);
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/md-backup')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/md-backup')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
@@ -2881,6 +2987,41 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
         const userRows = (users.results || []).map(u => `<div class="card"><b>${esc(u.username)}</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}<form method="post" action="/kendali/users/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${esc(u.id)}"><button type="submit">Hapus Akun</button></form></div>`).join('') || '<p>Belum ada akun komentator.</p>';
         const content = `<h2>Akun Komentator</h2>${nav}${noticeHtml(url)}${userRows}${pageNav('/kendali/users', page, totalPages)}`;
         return html(await renderPage(env, 'Akun Komentator', content));
+      }
+      if (path === '/kendali/baca') {
+        // Waktu baca per akun (v81): daftar akun + total menit + pola hari/jam.
+        // Hanya super admin (fase 1). Agregat diambil 3 query total, lalu
+        // pola dihitung di JS (computeReadingStats) — bukan N query per akun.
+        const page = parseAdminPage(url);
+        const [countRow, totals, dayRows, hourRows, userRows] = await Promise.all([
+          env.DB.prepare(`SELECT COUNT(DISTINCT user_id) AS n FROM cms_reading_sessions`).first(),
+          env.DB.prepare(`SELECT user_id, SUM(seconds) AS total FROM cms_reading_sessions GROUP BY user_id ORDER BY total DESC LIMIT ? OFFSET ?`).bind(ADMIN_PAGE_SIZE, (page - 1) * ADMIN_PAGE_SIZE).all(),
+          env.DB.prepare(`SELECT user_id, day_wib, SUM(seconds) AS s FROM cms_reading_sessions GROUP BY user_id, day_wib`).all(),
+          env.DB.prepare(`SELECT user_id, hour_wib, SUM(seconds) AS s FROM cms_reading_hours GROUP BY user_id, hour_wib`).all(),
+          env.DB.prepare(`SELECT id, username FROM cms_users`).all(),
+        ]);
+        const totalPages = Math.max(1, Math.ceil((Number(countRow && countRow.n) || 0) / ADMIN_PAGE_SIZE));
+        const names = new Map((userRows.results || []).map(u => [u.id, u.username]));
+        const daysByUser = new Map();
+        for (const r of (dayRows.results || [])) {
+          const arr = daysByUser.get(r.user_id) || [];
+          arr.push({ day_wib: r.day_wib, seconds: Number(r.s) || 0 });
+          daysByUser.set(r.user_id, arr);
+        }
+        const hoursByUser = new Map();
+        for (const r of (hourRows.results || [])) {
+          const arr = hoursByUser.get(r.user_id) || [];
+          arr.push({ hour_wib: Number(r.hour_wib), seconds: Number(r.s) || 0 });
+          hoursByUser.set(r.user_id, arr);
+        }
+        const rows = (totals.results || []).map(t => {
+          const stats = computeReadingStats(daysByUser.get(t.user_id) || [], hoursByUser.get(t.user_id) || []);
+          const topDay = stats.topDay ? `${esc(stats.topDay.name)} (${esc(stats.topDay.date)}) · ${stats.topDay.minutes} mnt` : '—';
+          const jam = stats.hourRange ? esc(stats.hourRange.label) : '—';
+          return `<div class="card"><b>${esc(names.get(t.user_id) || t.user_id)}</b> · total <b>${stats.totalMinutes} menit</b> · hari tersering: ${topDay} · jam biasa: ${jam} · ${stats.daysActive} hari aktif</div>`;
+        }).join('') || '<p>Belum ada data waktu baca.</p>';
+        const content = `<h2>Waktu Baca</h2>${nav}<p class="meta">Waktu baca hanya terhitung saat scroll ke bawah (aktif membaca); diam &gt; 15 detik tidak dihitung, scroll ke atas tidak menambah. Statistik ini hanya terlihat super admin (fase 1).</p>${rows}${pageNav('/kendali/baca', page, totalPages)}`;
+        return html(await renderPage(env, 'Waktu Baca', content));
       }
       if (path === '/kendali/plugins') {
         const pluginRows = await env.DB.prepare(`SELECT id, enabled FROM cms_plugins`).all();

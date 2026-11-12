@@ -7,6 +7,7 @@ import { parseTags, tagSlug, sanitizeHtml, sha256Hex } from './util.js';
 import { renderMarkdown } from './markdown.js';
 import { checkRateLimit } from './security.js';
 import { tagLinks } from './content.js';
+import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, nextEventMs, countActiveSeconds } from './reading.js';
 
 class Stmt {
   constructor(db, sql) { this.db = db; this.sql = sql; this.args = []; }
@@ -27,6 +28,7 @@ class MockDB {
   constructor() {
     this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = []; this.refreshTokens = []; this.viewEvents = [];
     this.users = new Map(); this.votes = []; this.rateLimits = new Map(); this.loadtestRuns = [];
+    this.readingSessions = []; this.readingHours = []; this.eternalStopwatch = null;
     this.dracinKeys = []; this.dracinCatalog = []; this.dracinEpisodes = []; this.dracinSeeds = []; this.dracinUsage = [];
     this.viewEventSeq = 0; this.attemptSeq = 0;
     // v62: fixture konten Cerpen (D1 stopwatch-db) untuk tes API /api/c/*/cerpen/*
@@ -181,6 +183,10 @@ class MockDB {
     if (s.startsWith('SELECT * FROM cms_settings ORDER')) return [...this.settings.entries()].map(([key, value]) => ({ key, value })).sort((x, y) => x.key.localeCompare(y.key));
     if (s.startsWith('SELECT * FROM cms_plugins ORDER')) return [...this.plugins.entries()].map(([id, enabled]) => ({ id, enabled })).sort((x, y) => x.id.localeCompare(y.id));
     if (s.startsWith('SELECT * FROM cms_plugins') || s.startsWith('SELECT id, enabled FROM cms_plugins')) return [...this.plugins.entries()].map(([id, enabled]) => ({ id, enabled }));
+    if (s.startsWith('SELECT * FROM cms_posts WHERE status') && s.includes('ORDER BY views DESC')) {
+      const all = [...this.posts].filter(p => p.status === 'published' && p.visibility === 'public' && String(p.publish_at || p.created_at) <= a[0]).sort((x, y) => (y.views || 0) - (x.views || 0));
+      return all.slice(0, 10);
+    }
     if (s.startsWith('SELECT * FROM cms_posts WHERE status')) {
       if (s.includes("visibility = 'public'")) {
         const all = [...this.posts].filter(p => p.status === 'published' && p.visibility === 'public' && String(p.publish_at || p.created_at) <= a[0]).sort((x, y) => String(y.publish_at || y.created_at).localeCompare(String(x.publish_at || x.created_at)));
@@ -454,6 +460,50 @@ class MockDB {
     if (s.startsWith('SELECT key_id FROM md_backup_keys WHERE key_id = ?')) return this.mdBackupKeys.filter(k => k.key_id === a[0]);
     if (s.startsWith('UPDATE md_backup_keys SET revoked = ?')) { const k = this.mdBackupKeys.find(x => x.key_id === a[1]); if (k) k.revoked = a[0]; return []; }
     if (s.startsWith('UPDATE md_backup_keys SET daily_limit = ?')) { const k = this.mdBackupKeys.find(x => x.key_id === a[1]); if (k) k.daily_limit = a[0]; return []; }
+    // v81: waktu baca + stopwatch abadi (mock upsert/agregasi meniru D1).
+    if (s.startsWith('SELECT start_time FROM eternal_stopwatch WHERE user_id')) return this.eternalStopwatch ? [{ start_time: this.eternalStopwatch.start_time }] : [];
+    if (s.startsWith('SELECT SUM(seconds) AS total FROM cms_reading_sessions WHERE user_id')) return [{ total: this.readingSessions.filter(x => x.user_id === a[0] && x.day_wib === a[1]).reduce((n, x) => n + x.seconds, 0) }];
+    if (s.startsWith('INSERT INTO cms_reading_sessions')) {
+      const ex = this.readingSessions.find(x => x.user_id === a[0] && x.day_wib === a[1] && x.post_id === a[2]);
+      if (ex) { ex.seconds += a[3]; ex.max_scroll = Math.max(ex.max_scroll, a[4]); ex.updated_at = a[5]; }
+      else this.readingSessions.push({ user_id: a[0], day_wib: a[1], post_id: a[2], seconds: a[3], max_scroll: a[4], updated_at: a[5] });
+      return [];
+    }
+    if (s.startsWith('INSERT INTO cms_reading_hours')) {
+      const ex = this.readingHours.find(x => x.user_id === a[0] && x.day_wib === a[1] && x.hour_wib === a[2]);
+      if (ex) ex.seconds += a[3];
+      else this.readingHours.push({ user_id: a[0], day_wib: a[1], hour_wib: a[2], seconds: a[3] });
+      return [];
+    }
+    if (s.startsWith('SELECT day_wib, SUM(seconds) AS s FROM cms_reading_sessions WHERE user_id')) {
+      const m = new Map();
+      for (const x of this.readingSessions.filter(y => y.user_id === a[0])) m.set(x.day_wib, (m.get(x.day_wib) || 0) + x.seconds);
+      return [...m.entries()].map(([day_wib, s]) => ({ day_wib, s }));
+    }
+    if (s.startsWith('SELECT hour_wib, SUM(seconds) AS s FROM cms_reading_hours WHERE user_id')) {
+      const m = new Map();
+      for (const x of this.readingHours.filter(y => y.user_id === a[0])) m.set(x.hour_wib, (m.get(x.hour_wib) || 0) + x.seconds);
+      return [...m.entries()].map(([hour_wib, s]) => ({ hour_wib, s })).sort((x, y) => y.s - x.s);
+    }
+    if (s.startsWith('SELECT COUNT(DISTINCT user_id) AS n FROM cms_reading_sessions')) return [{ n: new Set(this.readingSessions.map(x => x.user_id)).size }];
+    if (s.startsWith('SELECT user_id, SUM(seconds) AS total FROM cms_reading_sessions GROUP BY user_id')) {
+      const m = new Map();
+      for (const x of this.readingSessions) m.set(x.user_id, (m.get(x.user_id) || 0) + x.seconds);
+      const all = [...m.entries()].map(([user_id, total]) => ({ user_id, total })).sort((x, y) => y.total - x.total);
+      return all.slice(a[1], a[1] + a[0]);
+    }
+    if (s.startsWith('SELECT user_id, day_wib, SUM(seconds) AS s FROM cms_reading_sessions GROUP BY user_id, day_wib')) {
+      const m = new Map();
+      for (const x of this.readingSessions) { const k = x.user_id + '|' + x.day_wib; m.set(k, { user_id: x.user_id, day_wib: x.day_wib, s: (m.get(k) ? m.get(k).s : 0) + x.seconds }); }
+      return [...m.values()];
+    }
+    if (s.startsWith('SELECT user_id, hour_wib, SUM(seconds) AS s FROM cms_reading_hours GROUP BY user_id, hour_wib')) {
+      const m = new Map();
+      for (const x of this.readingHours) { const k = x.user_id + '|' + x.hour_wib; m.set(k, { user_id: x.user_id, hour_wib: x.hour_wib, s: (m.get(k) ? m.get(k).s : 0) + x.seconds }); }
+      return [...m.values()];
+    }
+    if (s.startsWith('SELECT id, username FROM cms_users WHERE id')) return [...this.users.values()].filter(u => u.id === a[0]).map(u => ({ id: u.id, username: u.username }));
+    if (s.startsWith('SELECT id, username FROM cms_users')) return [...this.users.values()].map(u => ({ id: u.id, username: u.username }));
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -765,8 +815,10 @@ assert(!t.includes('javascript:alert(1)') && !t.includes('Iklan'), 'foto + iklan
 for (let i = 1; i <= 12; i++) {
   env.DB.posts.push({ id: 'pg-' + i, slug: 'paginasi-' + i, title: 'Paginasi ' + String(i).padStart(2, '0'), body: 'Isi paginasi ' + i, category: 'Umum', status: 'published', created_at: '2026-01-01T00:' + String(i).padStart(2, '0') + ':00.000Z', updated_at: '2026-01-01T00:00:00.000Z', body_mode: 'text', visibility: 'public', publish_at: '2026-01-01T00:' + String(i).padStart(2, '0') + ':00.000Z', post_password_hash: '', post_password_salt: '', views: 0 });
 }
-r = await call('GET', '/'); t = await r.text();
+r = await call('GET', '/', null, 'cms_fv=1'); t = await r.text();
 assert(t.includes('Paginasi 12') && !t.includes('Paginasi 01') && t.includes('Post lama'), 'pagination halaman 1: 10 terbaru + link Post lama');
+// (v81: cookie cms_fv=1 di atas = pengunjung kembali; pengunjung baru dapat
+// komposisi first-visit yang memang boleh memuat item halaman 2 di rotasi.)
 r = await call('GET', '/?page=2'); t = await r.text();
 assert(t.includes('Paginasi 01') && !t.includes('Paginasi 12') && t.includes('Post baru'), 'pagination halaman 2: sisanya + link Post baru');
 // 17. Halaman /akun profesional: satu kartu tab, bukan dua kartu bertumpuk
@@ -1644,4 +1696,120 @@ assert(r.status === 200 && t.includes('id="md-key-form"') && t.includes('Daftark
 // tidak lagi sticky (tidak makan layar di HP).
 r = await call('GET', '/kendali/md-backup', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('.adm-nav{display:flex;flex-wrap:wrap') && !t.includes('.adm-nav{position:sticky') && !t.includes('overflow-x:auto;padding:10px 8px'), 'layout-nav: nav admin grid membungkus, tanpa scroll horizontal dan tanpa sticky');
+// 45. Waktu baca — logika murni reading.js (v81, 12 Nov 2026)
+// 45a. WIB = UTC+7, nama hari Indonesia.
+{
+  const p = wibParts(Date.UTC(2026, 10, 12, 16, 0, 0)); // 23:00 WIB 12 Nov
+  assert(p.date === '2026-11-12' && p.hour === 23 && p.dayName === 'Kamis', 'reading: wibParts tanggal/jam/nama hari WIB benar');
+}
+// 45b. Agregasi statistik: total, hari tersering, rentang jam.
+{
+  const st = computeReadingStats(
+    [{ day_wib: '2026-11-10', seconds: 3600 }, { day_wib: '2026-11-11', seconds: 7200 }, { day_wib: '2026-11-12', seconds: 1800 }],
+    [{ hour_wib: 20, seconds: 9000 }, { hour_wib: 21, seconds: 3000 }, { hour_wib: 22, seconds: 1000 }, { hour_wib: 9, seconds: 600 }]);
+  assert(st.totalSeconds === 12600 && st.totalMinutes === 210 && st.daysActive === 3, 'reading: total menit + hari aktif');
+  assert(st.topDay && st.topDay.date === '2026-11-11' && st.topDay.name === 'Rabu' && st.topDay.minutes === 120, 'reading: hari tersering = hari dengan detik terbanyak');
+  assert(st.hourRange && st.hourRange.startHour === 20 && st.hourRange.endHour === 21 && st.hourRange.label === '20:00–21:00', 'reading: rentang jam tersering 20:00-21:00 (jam puncak + tetangga >=50%)');
+  const empty = computeReadingStats([], []);
+  assert(empty.totalSeconds === 0 && empty.topDay === null && empty.hourRange === null, 'reading: tanpa data -> nol + null');
+  const wrap = computeReadingStats([{ day_wib: '2026-11-12', seconds: 60 }], [{ hour_wib: 23, seconds: 5000 }, { hour_wib: 0, seconds: 4000 }, { hour_wib: 1, seconds: 3000 }]);
+  assert(wrap.hourRange && wrap.hourRange.startHour === 23 && wrap.hourRange.endHour === 2 && wrap.hourRange.label === '23:00–02:00', 'reading: rentang jam melintasi tengah malam');
+}
+// 45c. First-visit: komposisi 4+3+3, tanpa duplikat, rotasi deterministik.
+{
+  const mk = (i) => ({ id: 'p' + i, slug: 's' + i, title: 'T' + i, publish_at: i <= 11 ? `2026-11-${String(12 - i).padStart(2, '0')}T00:00:00.000Z` : '2026-10-31T00:00:00.000Z', views: i * 10 });
+  const posts = Array.from({ length: 12 }, (_, i) => mk(i + 1)); // p1 terbaru; p12 paling banyak dilihat
+  const mixA = pickFirstVisit(posts, '2026-11-12');
+  assert(mixA.ordered.length === 10 && new Set(mixA.ordered.map(p => p.id)).size === 10, 'first-visit: 10 item tanpa duplikat');
+  assert(mixA.newest.length === 4 && mixA.popular.length === 3 && mixA.rotation.length === 3, 'first-visit: komposisi 4 terbaru + 3 populer + 3 rotasi');
+  assert(mixA.ordered.slice(0, 4).map(p => p.id).join() === 'p1,p2,p3,p4', 'first-visit: 4 slot pertama = terbaru');
+  assert(mixA.ordered.slice(4, 7).map(p => p.id).join() === 'p12,p11,p10', 'first-visit: 3 slot berikut = terpopuler');
+  const mixA2 = pickFirstVisit(posts, '2026-11-12');
+  assert(mixA.ordered.map(p => p.id).join() === mixA2.ordered.map(p => p.id).join(), 'first-visit: tanggal sama -> campuran sama (deterministik)');
+  const rotSets = new Set();
+  for (let d = 1; d <= 30; d++) rotSets.add(pickFirstVisit(posts, `2026-11-${String(d).padStart(2, '0')}`).ordered.slice(7).map(p => p.id).join());
+  assert(rotSets.size >= 2, 'first-visit: rotasi berubah antar tanggal');
+  const small = pickFirstVisit(posts.slice(0, 5), '2026-11-12');
+  assert(small.ordered.length === 5 && new Set(small.ordered.map(p => p.id)).size === 5, 'first-visit: kurang dari 10 post -> semua tampil tanpa duplikat');
+}
+// 45d. Stopwatch abadi: format digital/detail + countdown tahunan/tetap.
+{
+  assert(formatStopwatch(3661040, false) === '001:01:01.04', 'stopwatch: mode digital 1 jam 1 mnt 1 dtk');
+  assert(formatStopwatch(90061000, true) === '1 Hari\n01:01:01.000', 'stopwatch: mode detail 1 hari');
+  const now = Date.UTC(2026, 10, 12, 10, 0, 0);
+  const nxt = nextEventMs({ month: 1, day: 1 }, now);
+  assert(new Date(nxt).toLocaleDateString('en-CA', { timeZone: 'Asia/Jakarta' }) === '2027-01-01', 'stopwatch: countdown tahunan lompat ke tahun berikut');
+  const gta = nextEventMs({ month: 11, day: 15 }, now);
+  assert(new Date(gta).toLocaleDateString('en-CA', { timeZone: 'Asia/Jakarta' }) === '2026-11-15', 'stopwatch: countdown tanggal tetap');
+}
+// 45e. Detik aktif: hanya scroll bawah; idle >15 dtk dipotong; scroll atas nol.
+{
+  const evs = [
+    { t: 0, y: 0, type: 'scroll' },
+    { t: 1000, y: 100, type: 'scroll' },
+    { t: 2000, y: 200, type: 'scroll' },
+    { t: 20000, y: 300, type: 'scroll' },
+    { t: 21000, y: 200, type: 'scroll' },
+    { t: 22000, y: 400, type: 'scroll' },
+  ];
+  assert(countActiveSeconds(evs, 15000) === 3, 'reading: detik aktif hanya saat scroll bawah, idle >15 dtk dipotong');
+  const evs2 = [
+    { t: 0, y: 0, type: 'scroll' },
+    { t: 1000, y: 100, type: 'scroll' },
+    { t: 12000, y: 100, type: 'input' },
+    { t: 13000, y: 200, type: 'scroll' },
+  ];
+  assert(countActiveSeconds(evs2, 15000) === 2, 'reading: input menjaga sesi tetap hidup tanpa menambah detik sendiri');
+}
+// 46. Waktu baca end-to-end (v81): heartbeat -> statistik -> panel admin.
+r = await callJson('POST', '/api/reading/heartbeat', { seconds: 120, post_id: 'post-uji', max_scroll: 500, csrf: userCsrf });
+assert(r.status === 401, 'reading: heartbeat anonim ditolak 401');
+r = await callJson('POST', '/api/reading/heartbeat', { seconds: 120, post_id: 'post-uji', max_scroll: 500, csrf: userCsrf }, { cookie: userCookie });
+let hb = await r.json();
+assert(r.status === 200 && hb.ok && hb.stored === 120, 'reading: heartbeat akun tersimpan 120 detik');
+r = await callJson('POST', '/api/reading/heartbeat', { seconds: 60, post_id: 'post-uji', max_scroll: 800, csrf: userCsrf }, { cookie: userCookie });
+hb = await r.json();
+assert(r.status === 200 && hb.stored === 60, 'reading: heartbeat kedua menumpuk 60 detik');
+r = await callJson('POST', '/api/reading/heartbeat', { seconds: 0, post_id: 'post-uji', max_scroll: 0, csrf: userCsrf }, { cookie: userCookie });
+assert(r.status === 400, 'reading: heartbeat 0 detik ditolak 400');
+r = await callJson('POST', '/api/reading/heartbeat', { seconds: 121, post_id: 'post-uji', max_scroll: 0, csrf: userCsrf }, { cookie: userCookie });
+assert(r.status === 400, 'reading: heartbeat >120 detik ditolak 400');
+r = await callJson('POST', '/api/reading/heartbeat', { seconds: 30, post_id: 'post-uji', max_scroll: 0, csrf: 'salah' }, { cookie: userCookie });
+assert(r.status === 403, 'reading: heartbeat CSRF salah ditolak 403');
+r = await call('GET', '/api/reading/stats');
+assert(r.status === 401, 'reading: statistik tanpa login ditolak 401');
+r = await call('GET', '/api/reading/stats', null, userCookie);
+const st1 = await r.json();
+assert(r.status === 200 && st1.totalSeconds === 180 && st1.totalMinutes === 3 && st1.daysActive === 1, 'reading: statistik pemilik = 180 detik / 3 menit / 1 hari');
+assert(st1.topDay && st1.topDay.minutes === 3 && typeof st1.topDay.date === 'string', 'reading: hari tersering = hari ini, 3 menit');
+assert(st1.hourRange && typeof st1.hourRange.label === 'string' && st1.hourRange.label.includes(':'), 'reading: rentang jam terisi');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/akun/daftar', { username: 'siti', password: 'password123' });
+const sitiCookie = cookieHeader(cookiesOf(r));
+const budi = [...env.DB.users.values()].find(u => u.username === 'budi');
+r = await call('GET', '/api/reading/stats?user=' + budi.id, null, sitiCookie);
+assert(r.status === 403, 'reading: akun lain tidak boleh lihat statistik budi');
+r = await call('GET', '/api/reading/stats?user=' + budi.id, null, cookie);
+const stAdmin = await r.json();
+assert(r.status === 200 && stAdmin.username === 'budi' && stAdmin.totalSeconds === 180, 'reading: admin bisa lihat statistik akun mana pun');
+r = await call('GET', '/akun', null, userCookie); t = await r.text();
+assert(t.includes('Waktu Baca') && t.includes('3 menit'), 'reading: profil akun menampilkan total menit baca pemilik');
+r = await call('GET', '/kendali/baca', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('/kendali/baca') && t.includes('budi') && t.includes('3 menit'), 'reading: panel admin waktu baca menampilkan akun + total');
+r = await call('GET', '/post/post-uji', null, userCookie); t = await r.text();
+assert(t.includes('data-reading-tracker') && t.includes('/api/reading/heartbeat'), 'reading: tracker tersuntik di halaman post untuk akun login');
+r = await call('GET', '/post/post-uji'); t = await r.text();
+assert(!t.includes('data-reading-tracker'), 'reading: tracker tidak disuntik untuk anonim');
+// 47. Stopwatch abadi di /uptime (v81): fail-open tanpa data, tampil bila ada.
+r = await call('GET', '/uptime'); t = await r.text();
+assert(r.status === 200 && !t.includes('Stopwatch Abadi'), 'stopwatch: tanpa data D1, kartu tidak tampil (fail-open)');
+env.BACKUP_DB.eternalStopwatch = { start_time: 1790229011336 };
+r = await call('GET', '/uptime'); t = await r.text();
+assert(t.includes('Stopwatch Abadi') && t.includes('id="eternal-timer"') && t.includes('data-cd=') && t.includes('Mode Detail'), 'stopwatch: kartu + timer + countdown tampil dari D1');
+env.BACKUP_DB.eternalStopwatch = null;
+// 48. First-visit di beranda (v81): campuran + cookie untuk pengunjung baru.
+r = await call('GET', '/'); t = await r.text();
+assert(t.includes('Selamat datang!') && (r.headers.get('set-cookie') || '').includes('cms_fv=1'), 'first-visit: pengunjung baru dapat campuran + cookie cms_fv');
+r = await call('GET', '/', null, 'cms_fv=1'); t = await r.text();
+assert(!t.includes('Selamat datang!'), 'first-visit: pengunjung kembali dapat beranda normal');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

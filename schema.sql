@@ -12,7 +12,17 @@ CREATE TABLE IF NOT EXISTS cms_plugins (id TEXT PRIMARY KEY, enabled INTEGER NOT
 CREATE TABLE IF NOT EXISTS cms_login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cms_backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, status TEXT NOT NULL, posts INTEGER NOT NULL DEFAULT 0, comments INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS cms_refresh_tokens (id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, device TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_used_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, replaced_by TEXT NOT NULL DEFAULT '', remember INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS cms_users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cms_users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL, reading_private INTEGER NOT NULL DEFAULT 0);
+
+-- Waktu baca (v81): lihat reading.js untuk aturan algoritma lengkap.
+-- cms_reading_sessions: detik aktif per akun/hari/post (upsert heartbeat).
+-- cms_reading_hours: detik aktif per akun/hari/jam WIB (untuk rentang jam).
+-- reading_private di cms_users: 0 = terlihat pengguna lain (default, fase 2),
+-- 1 = private. Fase 1: kolom disiapkan saja; tampilan publik belum dibangun.
+CREATE TABLE IF NOT EXISTS cms_reading_sessions (user_id TEXT NOT NULL, day_wib TEXT NOT NULL, post_id TEXT NOT NULL, seconds INTEGER NOT NULL DEFAULT 0, max_scroll INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (user_id, day_wib, post_id));
+CREATE TABLE IF NOT EXISTS cms_reading_hours (user_id TEXT NOT NULL, day_wib TEXT NOT NULL, hour_wib INTEGER NOT NULL, seconds INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, day_wib, hour_wib));
+CREATE INDEX IF NOT EXISTS idx_reading_sessions_user ON cms_reading_sessions (user_id);
+CREATE INDEX IF NOT EXISTS idx_reading_hours_user ON cms_reading_hours (user_id);
 CREATE TABLE IF NOT EXISTS cms_comment_votes (comment_id INTEGER NOT NULL, user_key TEXT NOT NULL, vote INTEGER NOT NULL, PRIMARY KEY (comment_id, user_key));
 CREATE TABLE IF NOT EXISTS cms_rate_limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, window_start TEXT NOT NULL);
 
