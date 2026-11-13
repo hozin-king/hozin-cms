@@ -926,6 +926,41 @@ async function handleFetch(request, env) {
       return new Response(up.body, { status: 200, headers: h });
     }
 
+    // ---- Publik: gambar Cerpen Hozin (cover/panel terenkripsi, v86) ----
+    // Aplikasi mengambil blob dari D1 stopwatch-db (binding BACKUP_DB,
+    // tabel cerpen_images) supaya tidak bergantung pada GitHub — path
+    // bersifat opaque, thumbnail adalah baris biasa dengan path turunan
+    // "<path>.thumb.enc". Tanpa auth (blob AES-GCM, kunci hanya di
+    // aplikasi). Rate limit 1000/jam/IP: satu sesi baca (~600 gambar)
+    // masih lolos, banjir dari satu IP tertahan.
+    if (request.method === 'GET' && path.startsWith('/api/cerpen-img/')) {
+      const ciJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!env.BACKUP_DB) return ciJson({ ok: false, error: 'database tidak tersedia' }, 503);
+      let imgPath;
+      try { imgPath = decodeURIComponent(path.slice('/api/cerpen-img/'.length)); } catch (e) { return ciJson({ ok: false, error: 'path gambar tidak valid' }, 400); }
+      if (!imgPath || imgPath.includes('..') || !/^[A-Za-z0-9._\/-]+$/.test(imgPath)) return ciJson({ ok: false, error: 'path gambar tidak valid' }, 400);
+      if (!(await checkRateLimit(env, 'cerpen-img:' + clientIp(request), 1000, 3600 * 1000))) return ciJson({ ok: false, error: 'terlalu banyak permintaan' }, 429);
+      const row = await env.BACKUP_DB.prepare(`SELECT data FROM cerpen_images WHERE path = ?`).bind(imgPath).first();
+      if (!row || row.data == null) return ciJson({ ok: false, error: 'gambar tidak ditemukan' }, 404);
+      // D1 mengembalikan BLOB sebagai ArrayBuffer; mock tes memakai string.
+      const bytes = typeof row.data === 'string' ? new TextEncoder().encode(row.data) : row.data instanceof ArrayBuffer ? new Uint8Array(row.data) : row.data;
+      return new Response(bytes, { status: 200, headers: { 'content-type': 'application/octet-stream', 'cache-control': 'public, max-age=3600' } });
+    }
+
+    // ---- Publik: versi terbaru Cerpen Hozin (aplikasi Android, v86) ----
+    // Aplikasi mengecek ini saat dibuka untuk update in-app; datanya dari
+    // D1 stopwatch-db (binding BACKUP_DB, tabel cerpen_version, baris
+    // key 'latest' yang ditulis proses sync). Tanpa auth. Rate limit
+    // 60/jam/IP: cek versi berkala aplikasi jauh di bawah batas ini.
+    if (request.method === 'GET' && path === '/api/cerpen-version') {
+      const cvJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!env.BACKUP_DB) return cvJson({ ok: false, error: 'database tidak tersedia' }, 503);
+      if (!(await checkRateLimit(env, 'cerpen-version:' + clientIp(request), 60, 3600 * 1000))) return cvJson({ ok: false, error: 'terlalu banyak permintaan' }, 429);
+      const row = await env.BACKUP_DB.prepare(`SELECT tag, version, apk_url, published_at FROM cerpen_version WHERE key = ?`).bind('latest').first();
+      if (!row) return cvJson({ ok: false, error: 'versi belum tersedia' }, 404);
+      return cvJson({ tag: row.tag, version: row.version, apk_url: row.apk_url, published_at: row.published_at }, 200);
+    }
+
     // ---- Publik: laporan tamper Hozin FB Manager (aplikasi Android, v1.0.33) ----
     // Aplikasi yang mendeteksi repack (paket/label/signer tidak cocok dengan
     // nilai resmi) mengirim laporan ke sini. Tanpa auth — laporan datang dari

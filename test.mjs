@@ -74,6 +74,9 @@ class MockDB {
     this.securityEventSeq = 3;
     // v1.0.33: laporan tamper FB Manager (tabel app_tamper_reports)
     this.tamperReports = [];
+    // v86: fixture gambar + versi Cerpen (tabel cerpen_images + cerpen_version, D1 stopwatch-db)
+    this.cerpenImages = [{ path: 'covers/cover_01.jpg.enc', data: 'GAMBAR-ENKRIPSI-UJI', sha256: 'abc123', size: 20 }];
+    this.cerpenVersion = [{ key: 'latest', tag: 'v1.1.29', version: '1.1.29', apk_url: 'https://example.com/cerpen-1.1.29.apk', published_at: '2026-11-13T19:00:00+07:00' }];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { this.batchCalls = (this.batchCalls || 0) + 1; for (const s of stmts) await s.run(); }
@@ -310,6 +313,9 @@ class MockDB {
     if (s.startsWith('SELECT * FROM hacklab_lessons')) return [];
     // v62: mock tabel konten Cerpen (dipakai endpoint /api/c/*/cerpen/*)
     if (s.startsWith('SELECT key, value FROM cerpen_manifest')) return this.cerpenManifest;
+    // v86: mock tabel gambar + versi Cerpen (dipakai /api/cerpen-img/* + /api/cerpen-version)
+    if (s.startsWith('SELECT data FROM cerpen_images WHERE path = ?')) return this.cerpenImages.filter(x => x.path === a[0]);
+    if (s.startsWith('SELECT tag, version, apk_url, published_at FROM cerpen_version WHERE key = ?')) return this.cerpenVersion.filter(x => x.key === a[0]);
     if (s.startsWith('SELECT id, judul, genre, deskripsi, cover_url, status FROM cerpen_series')) return this.cerpenSeries;
     // v63: dump penuh `all` — cek dulu (prefix sama dengan endpoint satuan, tanpa WHERE)
     if (s.startsWith('SELECT series_id, season, no, judul, isi_cipher, word_count FROM cerpen_episodes') && s.includes('ORDER BY series_id ASC')) return this.cerpenEpisodes;
@@ -2043,4 +2049,20 @@ r = await call('GET', '/api/fbm-apk');
 assert(r.status === 429, 'fbm-apk: unduhan ke-11 dalam 1 jam ditolak 429');
 delete env.GITHUB_PAT_READ;
 globalThis.fetch = fetchBeforeFbm;
+// v86: endpoint publik Cerpen — gambar + versi dari D1 stopwatch-db.
+r = await call('GET', '/api/cerpen-img/covers/cover_01.jpg.enc');
+assert(r.status === 200 && r.headers.get('content-type') === 'application/octet-stream' && (r.headers.get('cache-control') || '').includes('max-age=3600'), 'cerpen-img: 200 + octet-stream + cache 1 jam');
+assert((await r.text()) === 'GAMBAR-ENKRIPSI-UJI', 'cerpen-img: byte gambar diteruskan apa adanya');
+r = await call('GET', '/api/cerpen-img/covers/tidak-ada.jpg.enc');
+assert(r.status === 404 && (await r.text()).includes('gambar tidak ditemukan'), 'cerpen-img: path tidak ada -> 404');
+r = await call('GET', '/api/cerpen-img/..%2Fcover.jpg.enc');
+assert(r.status === 400 && (await r.text()).includes('path gambar tidak valid'), 'cerpen-img: traversal ../ -> 400');
+r = await call('GET', '/api/cerpen-version'); t = await r.text();
+assert(r.status === 200 && (r.headers.get('cache-control') || '').includes('no-store'), 'cerpen-version: 200 + no-store');
+let cerpenV = {};
+try { cerpenV = JSON.parse(t); } catch (e) {}
+assert(cerpenV.tag === 'v1.1.29' && cerpenV.version === '1.1.29' && cerpenV.apk_url === 'https://example.com/cerpen-1.1.29.apk' && cerpenV.published_at === '2026-11-13T19:00:00+07:00', 'cerpen-version: keempat field benar');
+env.BACKUP_DB.cerpenVersion = [];
+r = await call('GET', '/api/cerpen-version');
+assert(r.status === 404 && (await r.text()).includes('versi belum tersedia'), 'cerpen-version: tanpa baris -> 404');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
