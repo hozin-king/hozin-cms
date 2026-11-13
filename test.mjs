@@ -77,13 +77,34 @@ class MockDB {
     // v86: fixture gambar + versi Cerpen (tabel cerpen_images + cerpen_version, D1 stopwatch-db)
     this.cerpenImages = [{ path: 'covers/cover_01.jpg.enc', data: 'GAMBAR-ENKRIPSI-UJI', sha256: 'abc123', size: 20 }];
     this.cerpenVersion = [{ key: 'latest', tag: 'v1.1.29', version: '1.1.29', apk_url: 'https://example.com/cerpen-1.1.29.apk', published_at: '2026-11-13T19:00:00+07:00' }];
+    // v87: state Sistem Koin Cerpen (cms-db) — dompet, unlock, voucher, VIP,
+    // ban, pantauan, ledger, audit + tabel pelacak baca v81 (dipakai papan
+    // peringkat/riwayat). BACKUP_DB memakai instance MockDB yang sama,
+    // jadi fixture konten Cerpen di atas juga melayani resolveVoucherEpisodes.
+    this.coinWallets = new Map(); // owner_key -> {owner_key, owner_type, user_id, device_id, balance}
+    this.coinDevices = new Map(); // device_id -> {device_id, user_id, android_id, label, first_seen, last_seen}
+    this.coinUnlocks = []; // {owner_key, kind, target_id, season, no, created_at}
+    this.coinLedger = []; // {id, owner_key, user_id, device_id, delta, balance_after, reason, ref, created_at}
+    this.coinBatches = new Map(); // batch_id -> {batch_id, reward_type, reward_coins, reward_value, reward_target_kind, reward_target_id, reward_season, reward_no, total_max, per_device_max, valid_from, expires_at, redeemed_count, active, note, created_at}
+    this.coinVouchers = new Map(); // code_hash -> {code_hash, batch_id, code_prefix, redeemed_count, active, created_at}
+    this.coinRedemptions = []; // {id, code_hash, owner_key, device_id, user_id, created_at}
+    this.coinPricing = new Map(); // kind:target -> {kind, target_id, price, free_episodes}
+    this.coinAudit = []; // {id, created_at, action, target_type, target_id, note}
+    this.coinBans = []; // {id, target_type, target_id, reason, banned_by, created_at, expires_at, active, unbanned_at, unbanned_by, unban_note}
+    this.coinWatch = new Map(); // device_id -> {device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at}
+    this.coinEvents = []; // {id, kind, device_id, android_id, user_id, detail, created_at}
+    this.coinVip = new Map(); // user_id -> {user_id, expires_at, granted_by, reason, created_at}
+    // v81: agregat waktu baca (sudah ada array-nya di constructor; isi di
+    // sini hanya penegas — handler upsert ada di bawah).
+    this.readingSessions = this.readingSessions || [];
+    this.readingHours = this.readingHours || [];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { this.batchCalls = (this.batchCalls || 0) + 1; for (const s of stmts) await s.run(); }
   exec(sql, a, mode) {
     const s = sql.replace(/\s+/g, ' ').trim();
     if (s.startsWith('CREATE TABLE')) return [];
-    if (s.startsWith('CREATE INDEX')) return [];
+    if (s.startsWith('CREATE INDEX') || s.startsWith('CREATE UNIQUE INDEX')) return [];
     if (s.startsWith('PRAGMA table_info(cms_posts)')) return [{ name: 'id' }, { name: 'slug' }, { name: 'title' }, { name: 'body' }, { name: 'category' }, { name: 'status' }, { name: 'created_at' }, { name: 'updated_at' }, { name: 'body_mode' }, { name: 'visibility' }, { name: 'publish_at' }, { name: 'post_password_hash' }, { name: 'post_password_salt' }, { name: 'views' }, { name: 'tags' }];
     if (s.startsWith('PRAGMA table_info(cms_comments)')) return [{ name: 'id' }, { name: 'post_id' }, { name: 'name' }, { name: 'text' }, { name: 'status' }, { name: 'created_at' }, { name: 'parent_id' }];
     // v83: kolom email/email_verified BELUM ada di mock — jalur migrasi ALTER teruji.
@@ -534,6 +555,303 @@ class MockDB {
     }
     if (s.startsWith('SELECT id, username FROM cms_users WHERE id')) return [...this.users.values()].filter(u => u.id === a[0]).map(u => ({ id: u.id, username: u.username }));
     if (s.startsWith('SELECT id, username FROM cms_users')) return [...this.users.values()].map(u => ({ id: u.id, username: u.username }));
+    // v87: pola SQL Sistem Koin Cerpen (coins.js) + episode BACKUP_DB.
+    // --- Dompet ---
+    if (s.startsWith('SELECT owner_key, owner_type, user_id, device_id, balance FROM cerpen_wallets WHERE owner_key = ?')) return this.coinWallets.has(a[0]) ? [{ ...this.coinWallets.get(a[0]) }] : [];
+    if (s.startsWith('INSERT OR IGNORE INTO cerpen_wallets')) {
+      if (!this.coinWallets.has(a[0])) this.coinWallets.set(a[0], { owner_key: a[0], owner_type: a[1], user_id: a[2], device_id: a[3], balance: 0 });
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_wallets SET balance = balance - ?, updated_at = ? WHERE owner_key = ? AND balance >= ?')) {
+      const w = this.coinWallets.get(a[2]);
+      if (w && (Number(w.balance) || 0) >= a[3]) { w.balance = (Number(w.balance) || 0) - a[0]; return { changes: 1 }; }
+      return { changes: 0 };
+    }
+    if (s.startsWith('UPDATE cerpen_wallets SET balance = balance + ?, updated_at = ? WHERE owner_key = ? AND balance + ? >= 0')) {
+      const w = this.coinWallets.get(a[2]);
+      if (w && (Number(w.balance) || 0) + a[3] >= 0) { w.balance = (Number(w.balance) || 0) + a[0]; return { changes: 1 }; }
+      return { changes: 0 };
+    }
+    if (s.startsWith('UPDATE cerpen_wallets SET balance = balance + ?, updated_at = ? WHERE owner_key = ?')) {
+      const w = this.coinWallets.get(a[2]);
+      if (w) w.balance = (Number(w.balance) || 0) + a[0];
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_wallets SET balance = ?, updated_at = ? WHERE owner_key = ?')) {
+      const w = this.coinWallets.get(a[2]);
+      if (w) w.balance = a[0];
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_wallets SET balance = 0, updated_at = ? WHERE owner_key = ?')) {
+      const w = this.coinWallets.get(a[1]);
+      if (w) w.balance = 0;
+      return [];
+    }
+    if (s.startsWith('SELECT COALESCE(SUM(balance), 0) AS s FROM cerpen_wallets')) return [{ s: [...this.coinWallets.values()].reduce((t, w) => t + (Number(w.balance) || 0), 0) }];
+    if (s.startsWith('SELECT user_id, balance FROM cerpen_wallets WHERE user_id IS NOT NULL')) return [...this.coinWallets.values()].filter(w => w.user_id).map(w => ({ user_id: w.user_id, balance: w.balance }));
+    // --- Unlock ---
+    if (s.startsWith('INSERT OR IGNORE INTO cerpen_unlocks')) {
+      const key = [a[0], a[1], a[2], a[3], a[4]].join('|');
+      if (this.coinUnlocks.some(u => [u.owner_key, u.kind, u.target_id, u.season, u.no].join('|') === key)) return { changes: 0 };
+      this.coinUnlocks.push({ owner_key: a[0], kind: a[1], target_id: a[2], season: a[3], no: a[4], created_at: a[5] });
+      return { changes: 1 };
+    }
+    if (s.startsWith('DELETE FROM cerpen_unlocks WHERE owner_key = ?')) { this.coinUnlocks = this.coinUnlocks.filter(u => u.owner_key !== a[0]); return []; }
+    if (s.startsWith('SELECT owner_key FROM cerpen_unlocks WHERE owner_key = ? AND kind = ?')) return this.coinUnlocks.filter(u => u.owner_key === a[0] && u.kind === a[1] && u.target_id === a[2] && u.season === a[3] && u.no === a[4]).map(u => ({ owner_key: u.owner_key }));
+    if (s.startsWith('SELECT kind, target_id, season, no FROM cerpen_unlocks WHERE owner_key = ? ORDER BY created_at ASC')) return [...this.coinUnlocks].filter(u => u.owner_key === a[0]).sort((x, y) => x.created_at - y.created_at).map(u => ({ kind: u.kind, target_id: u.target_id, season: u.season, no: u.no }));
+    if (s.startsWith('SELECT kind, target_id, season, no, created_at FROM cerpen_unlocks WHERE owner_key = ?')) return [...this.coinUnlocks].filter(u => u.owner_key === a[0]).map(u => ({ kind: u.kind, target_id: u.target_id, season: u.season, no: u.no, created_at: u.created_at }));
+    if (s.startsWith('SELECT kind, target_id, season, no, created_at FROM cerpen_unlocks WHERE owner_key = ? ORDER BY created_at DESC LIMIT 100')) return [...this.coinUnlocks].filter(u => u.owner_key === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 100);
+    if (s.startsWith('SELECT kind, target_id, season, no FROM cerpen_unlocks WHERE owner_key = ?')) return this.coinUnlocks.filter(u => u.owner_key === a[0]).map(u => ({ kind: u.kind, target_id: u.target_id, season: u.season, no: u.no }));
+    if (s.startsWith('SELECT owner_key, COUNT(*) AS n FROM cerpen_unlocks GROUP BY owner_key')) {
+      const m = new Map();
+      for (const u of this.coinUnlocks) m.set(u.owner_key, (m.get(u.owner_key) || 0) + 1);
+      return [...m.entries()].map(([owner_key, n]) => ({ owner_key, n }));
+    }
+    // --- Ledger ---
+    if (s.startsWith('INSERT INTO cerpen_coin_ledger')) { this.coinLedger.push({ id: a[0], owner_key: a[1], user_id: a[2], device_id: a[3], delta: a[4], balance_after: a[5], reason: a[6], ref: a[7], created_at: a[8] }); return []; }
+    if (s.startsWith('SELECT owner_key, user_id, device_id, delta, balance_after, reason, ref, created_at FROM cerpen_coin_ledger WHERE owner_key = ? ORDER BY created_at DESC LIMIT ?')) return [...this.coinLedger].filter(l => l.owner_key === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, a[1]);
+    if (s.startsWith('SELECT owner_key, user_id, device_id, delta, balance_after, reason, ref, created_at FROM cerpen_coin_ledger ORDER BY created_at DESC LIMIT ?')) return [...this.coinLedger].sort((x, y) => y.created_at - x.created_at).slice(0, a[0]);
+    if (s.startsWith('SELECT owner_key, user_id, device_id, delta, balance_after, reason, ref, created_at FROM cerpen_coin_ledger ORDER BY created_at DESC LIMIT 20')) return [...this.coinLedger].sort((x, y) => y.created_at - x.created_at).slice(0, 20);
+    if (s.startsWith('SELECT delta, balance_after, reason, ref, created_at FROM cerpen_coin_ledger WHERE owner_key = ? ORDER BY created_at DESC LIMIT 50')) return [...this.coinLedger].filter(l => l.owner_key === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 50).map(l => ({ delta: l.delta, balance_after: l.balance_after, reason: l.reason, ref: l.ref, created_at: l.created_at }));
+    if (s.startsWith('SELECT owner_key, delta, balance_after, reason, ref, created_at FROM cerpen_coin_ledger WHERE device_id = ? ORDER BY created_at DESC LIMIT 50')) return [...this.coinLedger].filter(l => l.device_id === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 50);
+    if (s.startsWith('SELECT device_id, COUNT(*) AS n FROM cerpen_coin_ledger GROUP BY device_id')) {
+      const m = new Map();
+      for (const l of this.coinLedger) { if (l.device_id) m.set(l.device_id, (m.get(l.device_id) || 0) + 1); }
+      return [...m.entries()].map(([device_id, n]) => ({ device_id, n }));
+    }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_coin_ledger WHERE created_at >= ?')) return [{ c: this.coinLedger.filter(l => Number(l.created_at) >= a[0]).length }];
+    // --- Harga ---
+    if (s.startsWith('SELECT kind, target_id, price, free_episodes FROM cerpen_coin_pricing')) return [...this.coinPricing.values()];
+    if (s.startsWith('INSERT OR REPLACE INTO cerpen_coin_pricing')) { this.coinPricing.set(a[0] + ':' + a[1], { kind: a[0], target_id: a[1], price: a[2], free_episodes: a[3] }); return []; }
+    if (s.startsWith('DELETE FROM cerpen_coin_pricing WHERE kind = ? AND target_id = ?')) { this.coinPricing.delete(a[0] + ':' + a[1]); return []; }
+    // --- Audit / events ---
+    if (s.startsWith('INSERT INTO coin_admin_audit')) { this.coinAudit.push({ id: a[0], created_at: a[1], action: a[2], target_type: a[3], target_id: a[4], note: a[5] }); return []; }
+    if (s.startsWith('SELECT action, target_type, target_id, note, created_at FROM coin_admin_audit ORDER BY created_at DESC LIMIT 20')) return [...this.coinAudit].sort((x, y) => y.created_at - x.created_at).slice(0, 20);
+    if (s.startsWith('INSERT INTO cerpen_coin_events')) { this.coinEvents.push({ id: a[0], kind: a[1], device_id: a[2], android_id: a[3], user_id: a[4], detail: a[5], created_at: a[6] }); return []; }
+    if (s.startsWith('SELECT kind, detail, created_at FROM cerpen_coin_events WHERE device_id = ? ORDER BY created_at DESC LIMIT 100')) return [...this.coinEvents].filter(e => e.device_id === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 100);
+    if (s.startsWith("SELECT device_id, COUNT(*) AS n FROM cerpen_coin_events WHERE kind = 'redeem_failed' AND created_at >= ? GROUP BY device_id")) {
+      const m = new Map();
+      for (const e of this.coinEvents) if (e.kind === 'redeem_failed' && Number(e.created_at) >= a[0]) m.set(e.device_id, (m.get(e.device_id) || 0) + 1);
+      return [...m.entries()].map(([device_id, n]) => ({ device_id, n }));
+    }
+    // --- Pantauan perangkat ---
+    if (s.startsWith('INSERT INTO cerpen_device_watch (device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at) VALUES (?, ?, 0, 0,')) {
+      const cur = this.coinWatch.get(a[0]);
+      if (cur) { cur.updated_at = a[4]; cur.android_id = a[5] || cur.android_id; }
+      else this.coinWatch.set(a[0], { device_id: a[0], android_id: a[1] || '', watched: 0, auto_flag: 0, flag_reason: '', note: '', created_at: a[2], updated_at: a[3] });
+      return [];
+    }
+    if (s.startsWith("INSERT INTO cerpen_device_watch (device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at) VALUES (?, '', ?, 0, '', ?, ?, ?)")) {
+      const cur = this.coinWatch.get(a[0]);
+      if (cur) { cur.watched = a[5]; cur.note = a[6]; cur.updated_at = a[7]; }
+      else this.coinWatch.set(a[0], { device_id: a[0], android_id: '', watched: a[1], auto_flag: 0, flag_reason: '', note: a[2], created_at: a[3], updated_at: a[4] });
+      return [];
+    }
+    if (s.startsWith('SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch WHERE device_id = ?')) return this.coinWatch.has(a[0]) ? [{ ...this.coinWatch.get(a[0]) }] : [];
+    if (s.startsWith('SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch WHERE device_id LIKE ? OR android_id LIKE ?')) {
+      const t = String(a[0]).replace(/%/g, '');
+      return [...this.coinWatch.values()].filter(w => w.device_id.includes(t) || (w.android_id || '').includes(t)).sort((x, y) => y.updated_at - x.updated_at).slice(0, a[2]);
+    }
+    if (s.startsWith('SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch ORDER BY updated_at DESC LIMIT ?')) return [...this.coinWatch.values()].sort((x, y) => y.updated_at - x.updated_at).slice(0, a[0]);
+    if (s.startsWith('UPDATE cerpen_device_watch SET auto_flag = ?, flag_reason = ?, updated_at = ? WHERE device_id = ?')) {
+      const w = this.coinWatch.get(a[3]);
+      if (w) { w.auto_flag = a[0]; w.flag_reason = a[1]; w.updated_at = a[2]; }
+      return [];
+    }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_device_watch WHERE watched = 1 OR auto_flag = 1')) return [{ c: [...this.coinWatch.values()].filter(w => w.watched === 1 || w.auto_flag === 1).length }];
+    // --- Ban ---
+    if (s.startsWith('UPDATE cerpen_bans SET active = 0 WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?')) {
+      for (const b of this.coinBans) if (b.active === 1 && b.expires_at != null && Number(b.expires_at) <= a[0]) b.active = 0;
+      return [];
+    }
+    if (s.startsWith("SELECT id, reason, expires_at FROM cerpen_bans WHERE target_type = 'user' AND target_id = ? AND active = 1")) return this.coinBans.filter(b => b.target_type === 'user' && b.target_id === a[0] && b.active === 1).map(b => ({ id: b.id, reason: b.reason, expires_at: b.expires_at }));
+    if (s.startsWith('INSERT INTO cerpen_bans')) {
+      if (this.coinBans.some(b => b.target_type === 'user' && b.target_id === a[1] && b.active === 1)) throw new Error('UNIQUE constraint failed: cerpen_bans');
+      this.coinBans.push({ id: a[0], target_type: 'user', target_id: a[1], reason: a[2], banned_by: 'admin', created_at: a[3], expires_at: a[4], active: 1, unbanned_at: null, unbanned_by: null, unban_note: '' });
+      return [];
+    }
+    if (s.startsWith("SELECT id, target_id, reason, banned_by, created_at, expires_at, active FROM cerpen_bans WHERE target_type = 'user' AND active = 1 ORDER BY created_at DESC LIMIT 100")) return [...this.coinBans].filter(b => b.target_type === 'user' && b.active === 1).sort((x, y) => y.created_at - x.created_at).slice(0, 100);
+    if (s.startsWith("SELECT id, target_id, reason, banned_by, created_at, expires_at, active, unbanned_at, unban_note FROM cerpen_bans WHERE target_type = 'user' ORDER BY created_at DESC LIMIT 100")) return [...this.coinBans].filter(b => b.target_type === 'user').sort((x, y) => y.created_at - x.created_at).slice(0, 100);
+    if (s.startsWith("SELECT id, target_id, reason, banned_by, created_at, expires_at FROM cerpen_bans WHERE target_type = 'user' AND active = 1 ORDER BY created_at DESC LIMIT 50")) return [...this.coinBans].filter(b => b.target_type === 'user' && b.active === 1).sort((x, y) => y.created_at - x.created_at).slice(0, 50);
+    if (s.startsWith('SELECT target_id FROM cerpen_bans WHERE target_type =')) return this.coinBans.filter(b => b.target_type === 'user' && b.active === 1).map(b => ({ target_id: b.target_id }));
+    if (s.startsWith('SELECT target_id FROM cerpen_bans WHERE id = ?')) return this.coinBans.filter(b => b.id === a[0]).map(b => ({ target_id: b.target_id }));
+    if (s.startsWith("SELECT id, reason, banned_by, created_at, expires_at, active, unbanned_at, unban_note FROM cerpen_bans WHERE target_type = 'user' AND target_id = ? ORDER BY created_at DESC LIMIT 10")) return [...this.coinBans].filter(b => b.target_type === 'user' && b.target_id === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 10);
+    if (s.startsWith('UPDATE cerpen_bans SET active = 0, unbanned_at = ?, unbanned_by =')) {
+      const b = this.coinBans.find(x => x.id === a[2] && x.active === 1);
+      if (!b) return { changes: 0 };
+      b.active = 0; b.unbanned_at = a[0]; b.unbanned_by = 'admin'; b.unban_note = a[1];
+      return { changes: 1 };
+    }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_bans WHERE target_type =')) return [{ c: this.coinBans.filter(b => b.target_type === 'user' && b.active === 1).length }];
+    // --- Perangkat terikat ---
+    if (s.startsWith('SELECT user_id FROM cerpen_devices WHERE device_id = ?')) return this.coinDevices.has(a[0]) ? [{ user_id: this.coinDevices.get(a[0]).user_id }] : [];
+    if (s.startsWith('INSERT INTO cerpen_devices')) { this.coinDevices.set(a[0], { device_id: a[0], user_id: a[1], android_id: a[2] || '', label: '', first_seen: a[3], last_seen: a[4] }); return []; }
+    if (s.startsWith('UPDATE cerpen_devices SET last_seen = ?, android_id = ? WHERE device_id = ?')) { const d = this.coinDevices.get(a[2]); if (d) { d.last_seen = a[0]; d.android_id = a[1]; } return []; }
+    if (s.startsWith('UPDATE cerpen_devices SET last_seen = ? WHERE device_id = ? AND user_id = ?')) { const d = this.coinDevices.get(a[1]); if (d && d.user_id === a[2]) d.last_seen = a[0]; return []; }
+    if (s.startsWith('DELETE FROM cerpen_devices WHERE device_id = ?')) { this.coinDevices.delete(a[0]); return []; }
+    if (s.startsWith('SELECT device_id, android_id, label, first_seen, last_seen FROM cerpen_devices WHERE user_id = ? ORDER BY last_seen DESC')) return [...this.coinDevices.values()].filter(d => d.user_id === a[0]).sort((x, y) => y.last_seen - x.last_seen);
+    if (s.startsWith('SELECT device_id, user_id, android_id, first_seen, last_seen FROM cerpen_devices WHERE device_id = ? ORDER BY last_seen DESC')) return [...this.coinDevices.values()].filter(d => d.device_id === a[0]).sort((x, y) => y.last_seen - x.last_seen);
+    if (s.startsWith('SELECT device_id, user_id FROM cerpen_devices')) return [...this.coinDevices.values()].map(d => ({ device_id: d.device_id, user_id: d.user_id }));
+    if (s.startsWith('SELECT device_id, COUNT(DISTINCT user_id) AS n FROM cerpen_devices GROUP BY device_id')) {
+      const m = new Map();
+      for (const d of this.coinDevices.values()) m.set(d.device_id, (m.get(d.device_id) || 0) + 1);
+      return [...m.entries()].map(([device_id, n]) => ({ device_id, n }));
+    }
+    if (s.startsWith("SELECT android_id, COUNT(DISTINCT user_id) AS n FROM cerpen_devices WHERE android_id != '' GROUP BY android_id")) {
+      const m = new Map();
+      for (const d of this.coinDevices.values()) if (d.android_id) m.set(d.android_id, (m.get(d.android_id) || 0) + 1);
+      return [...m.entries()].map(([android_id, n]) => ({ android_id, n }));
+    }
+    if (s.startsWith('SELECT user_id, COUNT(*) AS n FROM cerpen_devices GROUP BY user_id')) {
+      const m = new Map();
+      for (const d of this.coinDevices.values()) m.set(d.user_id, (m.get(d.user_id) || 0) + 1);
+      return [...m.entries()].map(([user_id, n]) => ({ user_id, n }));
+    }
+    if (s.startsWith('SELECT COUNT(DISTINCT user_id) AS c FROM cerpen_devices WHERE device_id = ? OR android_id = ?')) {
+      const set = new Set([...this.coinDevices.values()].filter(d => d.device_id === a[0] || d.android_id === a[1]).map(d => d.user_id));
+      return [{ c: set.size }];
+    }
+    if (s.startsWith('SELECT COUNT(DISTINCT user_id) AS c FROM cerpen_devices WHERE device_id = ?')) {
+      const set = new Set([...this.coinDevices.values()].filter(d => d.device_id === a[0]).map(d => d.user_id));
+      return [{ c: set.size }];
+    }
+    if (s.startsWith('SELECT COUNT(DISTINCT user_id) AS c FROM cerpen_devices WHERE android_id = ?')) {
+      const set = new Set([...this.coinDevices.values()].filter(d => d.android_id === a[0]).map(d => d.user_id));
+      return [{ c: set.size }];
+    }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_devices')) return [{ c: this.coinDevices.size }];
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_unlocks')) return [{ c: this.coinUnlocks.length }];
+    // --- VIP ---
+    if (s.startsWith('SELECT expires_at FROM cerpen_vip WHERE user_id = ?')) return this.coinVip.has(a[0]) ? [{ expires_at: this.coinVip.get(a[0]).expires_at }] : [];
+    if (s.startsWith('INSERT INTO cerpen_vip')) {
+      this.coinVip.set(a[0], { user_id: a[0], expires_at: a[1], granted_by: a[2], reason: a[3], created_at: a[4] });
+      return [];
+    }
+    if (s.startsWith('DELETE FROM cerpen_vip WHERE user_id = ?')) return { changes: this.coinVip.delete(a[0]) ? 1 : 0 };
+    if (s.startsWith('SELECT user_id, expires_at, granted_by, reason, created_at FROM cerpen_vip WHERE expires_at IS NULL OR expires_at > ? ORDER BY expires_at ASC')) return [...this.coinVip.values()].filter(v => v.expires_at == null || Number(v.expires_at) > a[0]).sort((x, y) => (x.expires_at || 0) - (y.expires_at || 0));
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_vip WHERE expires_at IS NULL OR expires_at > ?')) return [{ c: [...this.coinVip.values()].filter(v => v.expires_at == null || Number(v.expires_at) > a[0]).length }];
+    // --- Voucher ---
+    if (s.startsWith('SELECT v.code_hash, v.batch_id, v.redeemed_count, v.active, b.reward_type')) {
+      const v = this.coinVouchers.get(a[0]);
+      if (!v) return [];
+      const b = this.coinBatches.get(v.batch_id);
+      if (!b) return [];
+      return [{ code_hash: v.code_hash, batch_id: v.batch_id, redeemed_count: v.redeemed_count, active: v.active, reward_type: b.reward_type, reward_coins: b.reward_coins, reward_value: b.reward_value, reward_target_kind: b.reward_target_kind, reward_target_id: b.reward_target_id, reward_season: b.reward_season, reward_no: b.reward_no, total_max: b.total_max, per_device_max: b.per_device_max, valid_from: b.valid_from, expires_at: b.expires_at, batch_active: b.active }];
+    }
+    if (s.startsWith('INSERT INTO cerpen_voucher_batches')) {
+      this.coinBatches.set(a[0], { batch_id: a[0], reward_type: a[1], reward_coins: a[2], reward_value: a[3], reward_target_kind: a[4], reward_target_id: a[5], reward_season: a[6], reward_no: a[7], total_max: a[8], per_device_max: a[9], valid_from: a[10], expires_at: a[11], redeemed_count: 0, active: a[12], note: a[13], created_at: a[14] });
+      return [];
+    }
+    if (s.startsWith('INSERT INTO cerpen_vouchers')) { this.coinVouchers.set(a[0], { code_hash: a[0], batch_id: a[1], code_prefix: a[2], redeemed_count: 0, active: 1, created_at: a[3] }); return []; }
+    if (s.startsWith('SELECT batch_id, reward_type, reward_coins, reward_value, reward_target_kind, reward_target_id, reward_season, reward_no, total_max, per_device_max, valid_from, expires_at, redeemed_count, active, note, created_at FROM cerpen_voucher_batches ORDER BY created_at DESC LIMIT 50')) return [...this.coinBatches.values()].sort((x, y) => y.created_at - x.created_at).slice(0, 50);
+    if (s.startsWith('SELECT batch_id, reward_type, reward_coins, reward_value, reward_target_kind, reward_target_id, reward_season, reward_no, total_max, per_device_max, valid_from, expires_at, redeemed_count, active, note, created_at FROM cerpen_voucher_batches WHERE batch_id = ?')) return this.coinBatches.has(a[0]) ? [{ ...this.coinBatches.get(a[0]) }] : [];
+    if (s.startsWith('SELECT batch_id, COUNT(*) AS total FROM cerpen_vouchers GROUP BY batch_id')) {
+      const m = new Map();
+      for (const v of this.coinVouchers.values()) m.set(v.batch_id, (m.get(v.batch_id) || 0) + 1);
+      return [...m.entries()].map(([batch_id, total]) => ({ batch_id, total }));
+    }
+    if (s.startsWith('SELECT batch_id, active FROM cerpen_voucher_batches WHERE batch_id = ?')) return this.coinBatches.has(a[0]) ? [{ batch_id: a[0], active: this.coinBatches.get(a[0]).active }] : [];
+    if (s.startsWith('SELECT batch_id FROM cerpen_voucher_batches WHERE batch_id = ?')) return this.coinBatches.has(a[0]) ? [{ batch_id: a[0] }] : [];
+    if (s.startsWith('SELECT batch_id, reward_type, reward_target_kind, reward_target_id, reward_season, reward_no, active FROM cerpen_voucher_batches WHERE batch_id = ?')) {
+      const b = this.coinBatches.get(a[0]);
+      return b ? [{ batch_id: b.batch_id, reward_type: b.reward_type, reward_target_kind: b.reward_target_kind, reward_target_id: b.reward_target_id, reward_season: b.reward_season, reward_no: b.reward_no, active: b.active }] : [];
+    }
+    if (s.startsWith('UPDATE cerpen_voucher_batches SET reward_type = ?')) {
+      const b = this.coinBatches.get(a[9]);
+      if (b) { b.reward_type = a[0]; b.reward_coins = a[1]; b.reward_value = a[2]; b.reward_target_kind = a[3]; b.reward_target_id = a[4]; b.reward_season = a[5]; b.reward_no = a[6]; b.valid_from = a[7]; b.expires_at = a[8]; }
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_voucher_batches SET total_max = ? WHERE batch_id = ?')) { const b = this.coinBatches.get(a[1]); if (b) b.total_max = a[0]; return []; }
+    if (s.startsWith('UPDATE cerpen_voucher_batches SET per_device_max = ? WHERE batch_id = ?')) { const b = this.coinBatches.get(a[1]); if (b) b.per_device_max = a[0]; return []; }
+    if (s.startsWith('UPDATE cerpen_voucher_batches SET note = ? WHERE batch_id = ?')) { const b = this.coinBatches.get(a[1]); if (b) b.note = a[0]; return []; }
+    if (s.startsWith('UPDATE cerpen_voucher_batches SET active = 1 WHERE batch_id = ?')) { const b = this.coinBatches.get(a[0]); if (b) b.active = 1; return []; }
+    if (s.startsWith('UPDATE cerpen_voucher_batches SET active = 0 WHERE batch_id = ?')) { const b = this.coinBatches.get(a[0]); if (b) b.active = 0; return []; }
+    if (s.startsWith('UPDATE cerpen_voucher_batches SET redeemed_count = redeemed_count + 1 WHERE batch_id = ? AND active = 1 AND redeemed_count < ?')) {
+      const b = this.coinBatches.get(a[0]);
+      if (b && b.active === 1 && (Number(b.redeemed_count) || 0) < a[1]) { b.redeemed_count = (Number(b.redeemed_count) || 0) + 1; return { changes: 1 }; }
+      return { changes: 0 };
+    }
+    if (s.startsWith('UPDATE cerpen_vouchers SET redeemed_count = redeemed_count + 1 WHERE code_hash = ? AND active = 1')) { const v = this.coinVouchers.get(a[0]); if (v && v.active === 1) v.redeemed_count = (Number(v.redeemed_count) || 0) + 1; return []; }
+    if (s.startsWith('UPDATE cerpen_vouchers SET active = 0 WHERE code_hash = ?')) { const v = this.coinVouchers.get(a[0]); if (v) v.active = 0; return []; }
+    if (s.startsWith('SELECT code_hash FROM cerpen_vouchers WHERE code_hash = ?')) return this.coinVouchers.has(a[0]) ? [{ code_hash: a[0] }] : [];
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_vouchers WHERE active = 1')) return [{ c: [...this.coinVouchers.values()].filter(v => v.active === 1).length }];
+    if (s.startsWith('INSERT INTO cerpen_voucher_redemptions')) { this.coinRedemptions.push({ id: a[0], code_hash: a[1], owner_key: a[2], device_id: a[3], user_id: a[4], created_at: a[5] }); return []; }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_voucher_redemptions r JOIN cerpen_vouchers v ON v.code_hash = r.code_hash WHERE v.batch_id = ? AND r.device_id = ?')) {
+      const n = this.coinRedemptions.filter(r => { const v = this.coinVouchers.get(r.code_hash); return v && v.batch_id === a[0] && r.device_id === a[1]; }).length;
+      return [{ c: n }];
+    }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_voucher_redemptions r JOIN cerpen_vouchers v ON v.code_hash = r.code_hash WHERE v.batch_id = ? AND r.user_id = ?')) {
+      const n = this.coinRedemptions.filter(r => { const v = this.coinVouchers.get(r.code_hash); return v && v.batch_id === a[0] && r.user_id === a[1]; }).length;
+      return [{ c: n }];
+    }
+    if (s.startsWith('SELECT device_id, COUNT(*) AS n FROM cerpen_voucher_redemptions GROUP BY device_id')) {
+      const m = new Map();
+      for (const r of this.coinRedemptions) m.set(r.device_id, (m.get(r.device_id) || 0) + 1);
+      return [...m.entries()].map(([device_id, n]) => ({ device_id, n }));
+    }
+    if (s.startsWith('SELECT device_id, COUNT(DISTINCT code_hash) AS n FROM cerpen_voucher_redemptions WHERE created_at >= ? GROUP BY device_id')) {
+      const m = new Map();
+      for (const r of this.coinRedemptions) if (Number(r.created_at) >= a[0]) { const set = m.get(r.device_id) || new Set(); set.add(r.code_hash); m.set(r.device_id, set); }
+      return [...m.entries()].map(([device_id, set]) => ({ device_id, n: set.size }));
+    }
+    if (s.startsWith('SELECT code_hash, owner_key, user_id, created_at FROM cerpen_voucher_redemptions WHERE device_id = ? ORDER BY created_at DESC LIMIT 50')) return [...this.coinRedemptions].filter(r => r.device_id === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 50);
+    // --- Waktu baca v81 (dipakai leaderboard + riwayat) ---
+    if (s.startsWith('SELECT SUM(seconds) AS total FROM cms_reading_sessions WHERE user_id = ? AND day_wib = ?')) return [{ total: this.readingSessions.filter(x => x.user_id === a[0] && x.day_wib === a[1]).reduce((t, x) => t + (Number(x.seconds) || 0), 0) }];
+    if (s.startsWith('INSERT INTO cms_reading_sessions')) {
+      const cur = this.readingSessions.find(x => x.user_id === a[0] && x.day_wib === a[1] && x.post_id === a[2]);
+      if (cur) { cur.seconds = (Number(cur.seconds) || 0) + a[3]; cur.max_scroll = Math.max(Number(cur.max_scroll) || 0, a[4]); cur.updated_at = a[5]; }
+      else this.readingSessions.push({ user_id: a[0], day_wib: a[1], post_id: a[2], seconds: a[3], max_scroll: a[4], updated_at: a[5] });
+      return [];
+    }
+    if (s.startsWith('INSERT INTO cms_reading_hours')) {
+      const cur = this.readingHours.find(x => x.user_id === a[0] && x.day_wib === a[1] && x.hour_wib === a[2]);
+      if (cur) cur.seconds = (Number(cur.seconds) || 0) + a[3];
+      else this.readingHours.push({ user_id: a[0], day_wib: a[1], hour_wib: a[2], seconds: a[3] });
+      return [];
+    }
+    if (s.startsWith("SELECT user_id, SUM(seconds) AS total FROM cms_reading_sessions WHERE day_wib >= ? AND (post_id LIKE 'cerpen:%' OR post_id LIKE 'komik:%') GROUP BY user_id ORDER BY total DESC LIMIT ?")) {
+      const m = new Map();
+      for (const x of this.readingSessions) if (x.day_wib >= a[0] && (x.post_id.startsWith('cerpen:') || x.post_id.startsWith('komik:'))) m.set(x.user_id, (m.get(x.user_id) || 0) + (Number(x.seconds) || 0));
+      return [...m.entries()].map(([user_id, total]) => ({ user_id, total })).sort((x, y) => y.total - x.total).slice(0, a[1]);
+    }
+    if (s.startsWith("SELECT user_id, SUM(seconds) AS total FROM cms_reading_sessions WHERE post_id LIKE 'cerpen:%' OR post_id LIKE 'komik:%' GROUP BY user_id ORDER BY total DESC LIMIT ?")) {
+      const m = new Map();
+      for (const x of this.readingSessions) if (x.post_id.startsWith('cerpen:') || x.post_id.startsWith('komik:')) m.set(x.user_id, (m.get(x.user_id) || 0) + (Number(x.seconds) || 0));
+      return [...m.entries()].map(([user_id, total]) => ({ user_id, total })).sort((x, y) => y.total - x.total).slice(0, a[0]);
+    }
+    if (s.startsWith("SELECT post_id, SUM(seconds) AS s, MAX(day_wib) AS last_day FROM cms_reading_sessions WHERE user_id = ? AND (post_id LIKE 'cerpen:%' OR post_id LIKE 'komik:%') GROUP BY post_id ORDER BY last_day DESC LIMIT 50")) {
+      const m = new Map();
+      for (const x of this.readingSessions) if (x.user_id === a[0] && (x.post_id.startsWith('cerpen:') || x.post_id.startsWith('komik:'))) { const e = m.get(x.post_id) || { post_id: x.post_id, s: 0, last_day: '' }; e.s += Number(x.seconds) || 0; if (x.day_wib > e.last_day) e.last_day = x.day_wib; m.set(x.post_id, e); }
+      return [...m.values()].sort((x, y) => y.last_day.localeCompare(x.last_day)).slice(0, 50);
+    }
+    if (s.startsWith("SELECT post_id, SUM(seconds) AS s, MAX(day_wib) AS last_day FROM cms_reading_sessions WHERE user_id = ? AND (post_id LIKE 'cerpen:%' OR post_id LIKE 'komik:%') GROUP BY post_id ORDER BY last_day DESC LIMIT 20")) {
+      const m = new Map();
+      for (const x of this.readingSessions) if (x.user_id === a[0] && (x.post_id.startsWith('cerpen:') || x.post_id.startsWith('komik:'))) { const e = m.get(x.post_id) || { post_id: x.post_id, s: 0, last_day: '' }; e.s += Number(x.seconds) || 0; if (x.day_wib > e.last_day) e.last_day = x.day_wib; m.set(x.post_id, e); }
+      return [...m.values()].sort((x, y) => y.last_day.localeCompare(x.last_day)).slice(0, 20);
+    }
+    // --- User koin (admin) ---
+    if (s.startsWith('SELECT id, username, reading_private FROM cms_users')) return [...this.users.values()].map(u => ({ id: u.id, username: u.username, reading_private: Number(u.reading_private) || 0 }));
+    if (s.startsWith('SELECT id FROM cms_users WHERE id')) return [...this.users.values()].filter(u => u.id === a[0]).map(u => ({ id: u.id }));
+    if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked FROM cms_users WHERE username LIKE ? OR email LIKE ?')) {
+      const t = String(a[0]).replace(/%/g, '');
+      return [...this.users.values()].filter(u => u.username.includes(t) || (u.email || '').includes(t)).sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, a[2]).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0 }));
+    }
+    if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked FROM cms_users ORDER BY created_at DESC LIMIT')) return [...this.users.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, a[0] || 20).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0 }));
+    if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked, reading_private FROM cms_users WHERE id = ?')) return [...this.users.values()].filter(u => u.id === a[0]).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0, reading_private: Number(u.reading_private) || 0 }));
+    if (s.startsWith('UPDATE cms_users SET locked = ? WHERE id = ?')) { const u = this.users.get(a[1]); if (u) u.locked = a[0]; return []; }
+    if (s.startsWith('UPDATE cms_users SET reading_private = ? WHERE id = ?')) { const u = this.users.get(a[1]); if (u) u.reading_private = a[0]; return []; }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cms_users')) return [{ c: this.users.size }];
+    // --- Episode BACKUP_DB (resolveVoucherEpisodes + targets) ---
+    if (s.startsWith('SELECT series_id FROM cerpen_episodes WHERE series_id = ? AND season = ? AND no = ?')) return this.cerpenEpisodes.filter(e => e.series_id === a[0] && e.season === a[1] && e.no === a[2]).map(e => ({ series_id: e.series_id }));
+    if (s.startsWith('SELECT komik_id FROM cerpen_komik_episodes WHERE komik_id = ? AND no = ?')) return this.cerpenKomikEpisodes.filter(e => e.komik_id === a[0] && e.no === a[1]).map(e => ({ komik_id: e.komik_id }));
+    if (s.startsWith('SELECT season, no FROM cerpen_episodes WHERE series_id = ? AND season = ? ORDER BY no ASC')) return this.cerpenEpisodes.filter(e => e.series_id === a[0] && e.season === a[1]).sort((x, y) => x.no - y.no).map(e => ({ season: e.season, no: e.no }));
+    if (s.startsWith('SELECT no FROM cerpen_komik_episodes WHERE komik_id = ? ORDER BY no ASC')) return this.cerpenKomikEpisodes.filter(e => e.komik_id === a[0]).sort((x, y) => x.no - y.no).map(e => ({ no: e.no }));
+    if (s.startsWith('SELECT season, no FROM cerpen_episodes WHERE series_id = ? ORDER BY season ASC, no ASC')) return this.cerpenEpisodes.filter(e => e.series_id === a[0]).sort((x, y) => (x.season - y.season) || (x.no - y.no)).map(e => ({ season: e.season, no: e.no }));
+    if (s.startsWith('SELECT id, judul FROM cerpen_series ORDER BY judul ASC LIMIT 200')) return [...this.cerpenSeries].sort((x, y) => x.judul.localeCompare(y.judul)).slice(0, 200).map(x => ({ id: x.id, judul: x.judul }));
+    if (s.startsWith('SELECT id, judul FROM cerpen_komik ORDER BY judul ASC LIMIT 200')) return [...this.cerpenKomik].sort((x, y) => x.judul.localeCompare(y.judul)).slice(0, 200).map(x => ({ id: x.id, judul: x.judul }));
+    if (s.startsWith('SELECT DISTINCT season FROM cerpen_episodes WHERE series_id = ? ORDER BY season ASC')) return [...new Set(this.cerpenEpisodes.filter(e => e.series_id === a[0]).map(e => e.season))].sort((x, y) => x - y).map(season => ({ season }));
+    if (s.startsWith('SELECT season, no, judul FROM cerpen_episodes WHERE series_id = ? ORDER BY season ASC, no ASC LIMIT 500')) return this.cerpenEpisodes.filter(e => e.series_id === a[0]).sort((x, y) => (x.season - y.season) || (x.no - y.no)).slice(0, 500).map(e => ({ season: e.season, no: e.no, judul: e.judul }));
+    if (s.startsWith('SELECT no, judul FROM cerpen_komik_episodes WHERE komik_id = ? ORDER BY no ASC LIMIT 500')) return this.cerpenKomikEpisodes.filter(e => e.komik_id === a[0]).sort((x, y) => x.no - y.no).slice(0, 500).map(e => ({ no: e.no, judul: e.judul }));
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -1392,6 +1710,19 @@ r = await call('GET', '/api/cerpen-config'); t = await r.text();
 let cerpenCfg = JSON.parse(t);
 assert(r.status === 200 && r.headers.get('content-type').includes('application/json') && cerpenCfg.version === 1 && Array.isArray(cerpenCfg.tabs) && cerpenCfg.tabs.length === 4 && cerpenCfg.tabs[0].id === 'cerbung' && cerpenCfg.tabs[0].label === 'Cerita' && cerpenCfg.banner === '' && cerpenCfg.accent === '', 'cerpen-config: endpoint publik mengembalikan default saat belum diset');
 assert(r.headers.get('cache-control') === 'public, max-age=60', 'cerpen-config: header cache 60 detik');
+// 13 Nov 2026 (v87): link donasi disalurkan ke config aplikasi.
+env.DB.settings.set('donate_url', 'https://saweria.co/hozinking');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(cerpenCfg.donate_url === 'https://saweria.co/hozinking', 'cerpen-config: donate_url valid ikut ke respons');
+env.DB.settings.set('donate_url', 'http://saweria.co/hozinking');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(!('donate_url' in cerpenCfg), 'cerpen-config: donate_url http (bukan https) tidak disertakan');
+env.DB.settings.set('donate_url', 'https://saweria.co/hozinking\nhttps://jahat.test');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(!('donate_url' in cerpenCfg), 'cerpen-config: donate_url berisi whitespace/baris baru tidak disertakan');
+env.DB.settings.set('donate_url', '');
+r = await call('GET', '/api/cerpen-config'); cerpenCfg = JSON.parse(await r.text());
+assert(!('donate_url' in cerpenCfg), 'cerpen-config: donate_url kosong -> kunci tidak ada (aplikasi sembunyikan baris)');
 r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
 const csrf38 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 assert(t.includes('name="cerpen_config"') && t.includes('Remote Config — Cerpen Hozin'), 'cerpen-config: textarea + kartu tampil di Pengaturan');
@@ -2065,4 +2396,256 @@ assert(cerpenV.tag === 'v1.1.29' && cerpenV.version === '1.1.29' && cerpenV.apk_
 env.BACKUP_DB.cerpenVersion = [];
 r = await call('GET', '/api/cerpen-version');
 assert(r.status === 404 && (await r.text()).includes('versi belum tersedia'), 'cerpen-version: tanpa baris -> 404');
+// v87: Sistem Koin Cerpen — auth aplikasi, dompet, voucher, VIP, leaderboard, riwayat, ban, pantauan.
+const DEV_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const DEV_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const DEV_C = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const DEV_D = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const DEV_E = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+const DEV_F = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+const DEV_G = '11111111-2222-4333-8444-555555555555';
+const DEV_H = '66666666-7777-4888-8999-aaaaaaaaaaaa';
+const DEV_I = '99999999-8888-4777-8666-555555555555';
+async function coinCall(method, path, obj, headers = {}) {
+  const h = { 'content-type': 'application/json', ...headers };
+  const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
+  return worker.fetch(req, env);
+}
+async function coinAdmin(path, method, obj) {
+  return coinCall(method, path, obj, { 'x-csrf': coinCsrf, cookie });
+}
+// CSRF admin untuk endpoint koin: dibaca dari panel /kendali/koin.
+r = await call('GET', '/kendali/koin', null, cookie);
+t = await r.text();
+assert(r.status === 200 && t.includes('Koin Cerpen') && t.includes('Papan Peringkat') && t.includes('Daftar Pantauan'), 'koin panel: /kendali/koin tampil + kartu VIP/leaderboard/pantauan');
+const coinCsrf = (t.match(/COIN_CSRF = "([^"]+)"/) || [])[1] || '';
+assert(coinCsrf.length > 10, 'koin panel: token CSRF terbaca dari panel');
+r = await coinCall('GET', '/api/cerpen-coins/pricing', null);
+let pj = {};
+try { pj = JSON.parse(await r.text()); } catch (e) {}
+assert(r.status === 200 && pj.ok === true && pj.default_price === 10 && pj.free_episodes_default === 1, 'koin pricing: default 10 koin, 1 episode gratis');
+r = await coinCall('GET', '/api/cerpen-coins/me?device_id=' + DEV_A, null);
+let me = JSON.parse(await r.text());
+assert(r.status === 200 && me.balance === 0 && Array.isArray(me.unlocks) && me.unlocks.length === 0, 'koin me guest: saldo 0, tanpa unlock');
+// Auth aplikasi: daftar -> verifikasi OTP -> login.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-auth/register', { username: 'koinuji', password: 'password123', email: 'koinuji@example.com', device_id: DEV_A, android_id: 'android-uji-001' });
+let rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.needs_verification === true, 'koin register: 201 + butuh verifikasi OTP');
+r = await coinCall('POST', '/api/cerpen-auth/verify', { email: 'koinuji@example.com', code: kodeTerakhir(), device_id: DEV_A, android_id: 'android-uji-001' });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && typeof rj.session === 'string' && rj.session.length > 10, 'koin verify: sesi didapat');
+const koinUserCookie = 'cms_user=' + rj.session;
+const koinUser = [...env.DB.users.values()].find(u => u.username === 'koinuji');
+assert(koinUser && rj.balance === 0, 'koin verify: akun dibuat, saldo 0');
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-auth/login', { username: 'koinuji', password: 'salahsalah', device_id: DEV_A });
+assert(r.status === 403, 'koin login: password salah ditolak 403');
+r = await coinCall('POST', '/api/cerpen-auth/login', { username: 'koinuji', password: 'password123', device_id: DEV_A });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.username === 'koinuji', 'koin login: benar -> sesi + username');
+// Voucher koin: buat batch, tukar, batas per batch, kode tak dikenal.
+env.DB.rateLimits = new Map();
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'coins', reward_value: 50, count: 5, total_max: 5, per_device_max: 1, active: 1, note: 'uji' });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.ok === true && Array.isArray(rj.codes) && rj.codes.length === 5, 'koin voucher: batch 5 kode dibuat');
+const coinCodes = rj.codes;
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: coinCodes[0], device_id: DEV_A, android_id: 'android-uji-001' });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.coins === 50 && rj.balance === 50, 'koin redeem: guest dapat 50 koin');
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: coinCodes[0], device_id: DEV_A, android_id: 'android-uji-001' });
+assert(r.status === 409, 'koin redeem: kode sama + perangkat sama ditolak (batas per batch)');
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: coinCodes[1], device_id: DEV_A, android_id: 'android-uji-001' });
+assert(r.status === 409, 'koin redeem: kode lain batch sama + perangkat sama ditolak (batas per batch)');
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: coinCodes[1], device_id: DEV_B, android_id: 'android-uji-002' });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.balance === 50, 'koin redeem: perangkat lain bisa tukar kode lain batch sama');
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: 'CERPEN-XXXX-XXXX-XXXX', device_id: DEV_B });
+assert(r.status === 404, 'koin redeem: kode tidak dikenal -> 404');
+// Kuota total batch = 1 ("1 orang saja").
+env.DB.rateLimits = new Map();
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'coins', reward_value: 10, count: 2, total_max: 1, per_device_max: 5, active: 1 });
+rj = JSON.parse(await r.text());
+const oneCodes = rj.codes;
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: oneCodes[0], device_id: DEV_C });
+assert(r.status === 200, 'koin redeem: batch total_max=1, penukaran pertama lolos');
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: oneCodes[1], device_id: DEV_D });
+assert(r.status === 409, 'koin redeem: batch total_max=1, penukaran kedua (perangkat lain) ditolak kuota habis');
+// Migrasi guest -> akun saat login ulang dengan device yang sama.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-auth/login', { username: 'koinuji', password: 'password123', device_id: DEV_A, android_id: 'android-uji-001' });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.balance === 50 && rj.migrated === 50, 'koin migrasi: saldo guest 50 pindah ke akun saat login');
+r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
+me = JSON.parse(await r.text());
+assert(me.balance === 50, 'koin me: saldo akun 50 setelah migrasi');
+// Beli episode: bayar, beli ulang, gratis, saldo kurang.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 2, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.balance === 40 && rj.price === 10, 'koin purchase: episode 2 (10 koin) -> saldo 40');
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 2, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.already === true, 'koin purchase: beli ulang episode yang sama -> already');
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 1, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.free === true && rj.balance === 40, 'koin purchase: episode 1 gratis, saldo tetap 40');
+r = await coinAdmin('/api/admin/cerpen-koin/pricing', 'POST', { default_price: 100 });
+assert(r.status === 200, 'koin pricing: ubah default jadi 100');
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 3, device_id: DEV_A }, { cookie: koinUserCookie });
+assert(r.status === 402, 'koin purchase: saldo 40 < harga 100 -> 402');
+r = await coinAdmin('/api/admin/cerpen-koin/pricing', 'POST', { default_price: 10 });
+assert(r.status === 200, 'koin pricing: kembalikan default 10');
+// VIP: grant -> beli gratis -> revoke -> harga berlaku lagi.
+r = await coinAdmin('/api/admin/cerpen-koin/vip', 'POST', { user_id: koinUser.id, days: 30, reason: 'uji' });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.ok === true && rj.vip_until > Date.now(), 'koin VIP: grant 30 hari');
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 3, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.vip === true && rj.balance === 40, 'koin VIP: purchase episode terkunci gratis, saldo tetap');
+r = await coinAdmin('/api/admin/cerpen-koin/vip/' + koinUser.id + '/revoke', 'POST', {});
+assert(r.status === 200, 'koin VIP: revoke ok');
+r = await coinAdmin('/api/admin/cerpen-koin/pricing', 'POST', { default_price: 100 });
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 4, device_id: DEV_A }, { cookie: koinUserCookie });
+assert(r.status === 402, 'koin VIP: setelah revoke, harga berlaku lagi -> 402');
+r = await coinAdmin('/api/admin/cerpen-koin/pricing', 'POST', { default_price: 10 });
+// Voucher fleksibel: episode / series / season.
+env.DB.rateLimits = new Map();
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'episode', reward_target_kind: 'cerpen', reward_target_id: 'cerpen-01', reward_season: 1, reward_no: 2, count: 2, total_max: 10, per_device_max: 1, active: 1 });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.codes.length === 2, 'koin voucher episode: batch dibuat');
+const epCodes = rj.codes;
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: epCodes[0], device_id: DEV_E });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.reward_type === 'episode' && rj.unlocks_granted === 1, 'koin redeem episode: unlock ditulis server-side');
+r = await coinCall('GET', '/api/cerpen-coins/me?device_id=' + DEV_E, null);
+me = JSON.parse(await r.text());
+assert(me.unlocks.some(u => u.kind === 'cerpen' && u.target_id === 'cerpen-01' && u.season === 1 && u.no === 2), 'koin me: unlock episode dari voucher tampil');
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'series', reward_target_kind: 'cerpen', reward_target_id: 'cerpen-01', count: 1, total_max: 10, per_device_max: 1, active: 1 });
+rj = JSON.parse(await r.text());
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: rj.codes[0], device_id: DEV_G });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.unlocks_granted === 2 && rj.unlocks_total === 2, 'koin redeem series: 2 episode cerpen-01 terbuka sekaligus');
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'season', reward_target_kind: 'cerpen', reward_target_id: 'cerpen-01', reward_season: 1, count: 1, total_max: 10, per_device_max: 1, active: 1 });
+rj = JSON.parse(await r.text());
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: rj.codes[0], device_id: DEV_H });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.unlocks_granted === 2, 'koin redeem season: season 1 (2 episode) terbuka');
+// Voucher VIP: guest ditolak, akun lolos.
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'vip', reward_value: 7, count: 2, total_max: 10, per_device_max: 1, active: 1 });
+rj = JSON.parse(await r.text());
+const vipCodes = rj.codes;
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: vipCodes[0], device_id: DEV_I });
+assert(r.status === 409, 'koin redeem VIP: guest ditolak (butuh akun)');
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: vipCodes[0], device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.reward_type === 'vip' && rj.vip_days === 7 && rj.vip_until > Date.now(), 'koin redeem VIP: akun dapat VIP 7 hari');
+// Voucher draf: buat tanpa target -> isi belakangan -> aktifkan -> aktif tidak bisa diubah.
+env.DB.rateLimits = new Map();
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'episode', count: 2, total_max: 10, per_device_max: 1, active: 0 });
+rj = JSON.parse(await r.text());
+assert(r.status === 201, 'koin voucher draf: batch tanpa target bisa dibuat sebagai draf');
+const draftId = rj.batch_id;
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers/' + draftId, 'POST', { reward_type: 'episode', reward_target_kind: 'cerpen', reward_target_id: 'cerpen-01', reward_season: 1, reward_no: 1 });
+assert(r.status === 200, 'koin voucher draf: target bisa diisi belakangan');
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers/' + draftId + '/activate', 'POST', {});
+assert(r.status === 200, 'koin voucher draf: aktivasi ok setelah target diisi');
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers/' + draftId, 'POST', { reward_type: 'coins', reward_value: 5 });
+assert(r.status === 409, 'koin voucher: batch aktif tidak bisa diubah');
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'episode', reward_target_kind: 'cerpen', reward_target_id: 'tidak-ada', reward_season: 1, reward_no: 1, count: 1, total_max: 1, per_device_max: 1, active: 1 });
+assert(r.status === 400, 'koin voucher: batch aktif target tidak ada ditolak 400');
+// valid_from + expires_at unix detik (bukan ms).
+const nowS = Math.floor(Date.now() / 1000);
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'coins', reward_value: 5, count: 1, total_max: 5, per_device_max: 1, valid_from: nowS + 3600, active: 1 });
+rj = JSON.parse(await r.text());
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: rj.codes[0], device_id: DEV_F });
+assert(r.status === 409, 'koin redeem: kode belum berlaku (valid_from) ditolak');
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'coins', reward_value: 5, count: 1, total_max: 5, per_device_max: 1, expires_at: nowS + 3600, active: 1 });
+rj = JSON.parse(await r.text());
+r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: rj.codes[0], device_id: DEV_F });
+assert(r.status === 200, 'koin redeem: expires_at unix detik — kode belum kedaluwarsa bisa ditebus');
+// Targets untuk dropdown voucher.
+r = await coinAdmin('/api/admin/cerpen-koin/targets?kind=cerpen&target_id=cerpen-01', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.cerpen.some(x => x.id === 'cerpen-01') && JSON.stringify(rj.seasons) === '[1]' && rj.episodes.length === 2, 'koin targets: daftar series + season/episode cerpen-01');
+// Waktu baca + leaderboard + privasi.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-coins/reading', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 1, seconds: 60, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.stored === 60, 'koin reading: heartbeat 60 detik tersimpan');
+r = await coinCall('POST', '/api/cerpen-coins/reading', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 2, seconds: 200 }, { cookie: koinUserCookie });
+assert(r.status === 400, 'koin reading: >120 detik per flush ditolak');
+r = await coinCall('POST', '/api/cerpen-coins/reading', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 1, seconds: 60, device_id: DEV_F });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.stored === 0 && rj.tracked === false, 'koin reading: guest tidak ditulis ke tabel baca bersama (stored 0, tracked false)');
+r = await coinCall('GET', '/api/cerpen-coins/leaderboard?period=all', null);
+rj = JSON.parse(await r.text());
+assert(!rj.leaderboard.some(x => x.seconds === 60 && x.username !== 'koinuji'), 'koin leaderboard: tidak ada baris hantu dari guest');
+r = await coinCall('GET', '/api/cerpen-coins/leaderboard?period=weekly', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.leaderboard.some(x => x.username === 'koinuji' && x.seconds === 60), 'koin leaderboard: koinuji tampil mingguan (60 detik)');
+r = await coinCall('POST', '/api/cerpen-auth/reading-privacy', { private: true }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.reading_private === 1, 'koin reading-privacy: sembunyikan diri ok');
+r = await coinCall('GET', '/api/cerpen-coins/leaderboard?period=weekly', null);
+rj = JSON.parse(await r.text());
+assert(!rj.leaderboard.some(x => x.username === 'koinuji'), 'koin leaderboard: akun private tidak tampil');
+r = await coinCall('POST', '/api/cerpen-auth/reading-privacy', { private: false }, { cookie: koinUserCookie });
+r = await coinCall('GET', '/api/cerpen-coins/leaderboard?period=all', null);
+rj = JSON.parse(await r.text());
+assert(rj.leaderboard.some(x => x.username === 'koinuji'), 'koin leaderboard: setelah dibuka lagi, tampil di sepanjang waktu');
+// Riwayat: unlock + terakhir dibaca.
+r = await coinCall('GET', '/api/cerpen-coins/history', null, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.unlocks.some(u => u.kind === 'cerpen' && u.target_id === 'cerpen-01' && u.no === 2) && rj.reading.some(x => x.target_id === 'cerpen-01' && x.no === 1 && x.seconds === 60), 'koin history: unlock + terakhir dibaca tampil');
+// Admin adjust / ban / lock.
+r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/adjust', 'POST', { delta: 100, reason: 'uji beri' });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.balance === 140, 'koin adjust: +100 -> saldo 140');
+r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/adjust', 'POST', { delta: -200, reason: 'uji kurang' });
+assert(r.status === 402, 'koin adjust: kurangi melebihi saldo ditolak 402');
+env.DB.rateLimits = new Map();
+r = await coinAdmin('/api/admin/cerpen-koin/bans', 'POST', { user_id: koinUser.id, reason: 'uji ban' });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.username === 'koinuji', 'koin ban: ban akun dibuat');
+const banId = rj.id;
+r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 403 && rj.error === 'banned' && rj.reason === 'uji ban', 'koin ban: /me akun dibanned -> 403 + alasan');
+r = await coinCall('POST', '/api/cerpen-auth/login', { username: 'koinuji', password: 'password123', device_id: DEV_A });
+assert(r.status === 403, 'koin ban: login akun dibanned ditolak (sesi lama tidak bisa dipakai)');
+r = await coinAdmin('/api/admin/cerpen-koin/bans/' + banId + '/unban', 'POST', { note: 'uji unban' });
+assert(r.status === 200, 'koin ban: unban ok');
+r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
+assert(r.status === 200, 'koin ban: setelah unban, /me lolos lagi');
+r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/lock', 'POST', {});
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.locked === 1, 'koin lock: akun dikunci');
+r = await coinCall('POST', '/api/cerpen-auth/login', { username: 'koinuji', password: 'password123', device_id: DEV_A });
+assert(r.status === 403, 'koin lock: login akun terkunci ditolak');
+r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/unlock', 'POST', {});
+assert(r.status === 200, 'koin lock: akun dibuka lagi');
+// Overview + detail akun + daftar pantauan.
+r = await coinAdmin('/api/admin/cerpen-koin/overview', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.users >= 1 && rj.vip_active >= 1 && rj.coins_in_circulation >= 140, 'koin overview: hitungan akun/VIP/koin beredar');
+r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id, 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.user.username === 'koinuji' && rj.vip.active === true && rj.unlocks.length >= 3 && rj.reading.length >= 1, 'koin user detail: VIP + unlock + riwayat baca tampil');
+r = await coinAdmin('/api/admin/cerpen-koin/devices?q=&limit=20', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.devices.some(d => d.device_id === DEV_A), 'koin devices: perangkat A muncul di daftar pantauan');
+r = await coinAdmin('/api/admin/cerpen-koin/devices/' + DEV_A + '/watch', 'POST', { watched: 1, note: 'uji pantau' });
+assert(r.status === 200, 'koin devices: tandai pantau ok');
+r = await coinAdmin('/api/admin/cerpen-koin/devices/' + DEV_A, 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.device.watched === 1 && rj.links.some(l => l.user_id === koinUser.id), 'koin device detail: pantau + akun terikat tampil');
+// Auto-flag: >=5 gagal redeem dalam 24 jam -> "perlu perhatian" (tidak memblokir).
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 5; i++) { await coinCall('POST', '/api/cerpen-coins/redeem', { code: 'CERPEN-XXXX-XXXX-XXXX', device_id: DEV_F }); }
+r = await coinAdmin('/api/admin/cerpen-koin/devices?q=&limit=20', 'GET', null);
+rj = JSON.parse(await r.text());
+const devF = rj.devices.find(d => d.device_id === DEV_F);
+assert(devF && devF.status === 'perlu perhatian', 'koin pantauan: >=5 gagal redeem -> perlu perhatian (tidak memblokir)');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

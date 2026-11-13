@@ -30,6 +30,7 @@ import { renderMarkdown } from './markdown.js';
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie, isValidCommenterPassword, COMMENTER_PASSWORD_MIN, COMMENTER_PASSWORD_MAX } from './auth.js';
 import { checkRateLimit } from './security.js';
 import { validEmail, issueOtp, verifyOtp, OTP_SEND_LIMIT, OTP_SEND_WINDOW_MS } from './otp.js';
+import { handleCoinApi, handleCoinAdmin, renderCoinPanel } from './coins.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
 import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, STOPWATCH_EVENTS, nextEventMs, readingTrackerScript, HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
 import { ensureSchema, getSetting, getAllSettings, getEnabledPlugins, doBackup, renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
@@ -324,7 +325,7 @@ input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -884,6 +885,16 @@ async function handleFetch(request, env) {
     // kembalikan default supaya aplikasi tetap jalan dengan tampilan bawaan.
     if (request.method === 'GET' && path === '/api/cerpen-config') {
       const cfg = await getCerpenConfig(env);
+      // 13 Nov 2026 (v87): salurkan link donasi ke aplikasi — setting
+      // donate_url yang sama (diset admin sekali di /kendali/settings ->
+      // "Link donasi", juga dipakai /bio). Satu sumber kebenaran: ubah di
+      // D1 -> config aplikasi ikut berubah tanpa update APK. Hanya https
+      // polos yang disertakan; kosong / tidak valid = kunci tidak ada
+      // (aplikasi menyembunyikan baris "Dukung kreator" total).
+      try {
+        const donateUrl = await getSetting(env, 'donate_url', '');
+        if (/^https:\/\/\S+$/.test(donateUrl)) cfg.donate_url = donateUrl;
+      } catch (e) {}
       return new Response(JSON.stringify(cfg), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=60' } });
     }
 
@@ -1328,6 +1339,19 @@ async function handleFetch(request, env) {
       const epLabel = payload.episode_no ? ` · Episode ${payload.episode_no}` : (payload.season ? ` · Season ${payload.season}` : '');
       const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:4px 14px;border-radius:999px;background:rgba(59,130,246,.16);color:#3b82f6;font-weight:800;font-size:13px">${esc(typeLabel)}${esc(epLabel)}${meta.genre ? ' · ' + esc(meta.genre) : ''}</span></p><h2 style="margin:8px 0 10px">${esc(meta.title)}</h2>${meta.description ? `<p style="max-width:560px;margin:0 auto 20px;line-height:1.6">${esc(meta.description)}</p>` : ''}<p><a href="${esc(intentUrl)}" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:700;padding:12px 24px;border-radius:10px;text-decoration:none;min-height:44px;line-height:44px">Buka di Aplikasi</a></p><p><a href="https://github.com/hozin-king/cerpen-hozin/releases/latest" style="display:inline-block;font-weight:700;padding:12px 24px;border-radius:10px;border:1px solid rgba(128,128,128,.4);text-decoration:none;color:inherit">Download Aplikasi</a></p><p style="font-size:13px;opacity:.65;margin:18px 0 0">Belum memasang Cerpen Hozin? Unduh aplikasinya dulu, lalu buka lagi link ini — konten akan terbuka langsung di aplikasi.</p></div><p><a href="/">← Beranda</a></p>`;
       return html(await renderPage(env, meta.title, content), 200);
+    }
+
+    // ---- Sistem Koin Cerpen (v87, modul coins.js) ----
+    // Auth aplikasi + endpoint koin + admin koin. Ditempatkan di sini
+    // (sebelum blok POST admin yang memanggil formData()) karena membaca
+    // body JSON — sama alasannya dengan blok /api/admin/cerpen-* di bawah.
+    if (path.startsWith('/api/cerpen-auth/') || path.startsWith('/api/cerpen-coins/')) {
+      const r = await handleCoinApi(request, env, url, ADMIN_EMAIL);
+      if (r) return r;
+    }
+    if (path.startsWith('/api/admin/cerpen-koin')) {
+      const r = await handleCoinAdmin(request, env, url, admin);
+      if (r) return r;
     }
 
     // ---- Admin: kontrol API Cerpen (panel /kendali/cerpen-api, v66) ----
@@ -2832,10 +2856,15 @@ requestAnimationFrame(draw);
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/md-backup' || path === '/kendali/tamper')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/md-backup' || path === '/kendali/tamper')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
+      // ---- Admin: panel Koin Cerpen (v87, modul coins.js) ----
+      if (path === '/kendali/koin') {
+        const content = await renderCoinPanel(env, csrf, nav, noticeHtml(url));
+        return html(await renderPage(env, 'Koin Cerpen', content));
+      }
       // ---- Admin: panel kontrol API Cerpen (v66) ----
       // Statistik + keys + submissions + audit, semua dari D1 stopwatch-db
       // (binding BACKUP_DB). Aksi lewat fetch ke /api/admin/cerpen-*.

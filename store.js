@@ -53,6 +53,32 @@ export async function ensureSchema(env) {
         // Index untuk query dashboard (filter 30 hari) + prune retensi.
         `CREATE INDEX IF NOT EXISTS idx_cms_view_events_viewed_at ON cms_view_events (viewed_at)`,
         `CREATE INDEX IF NOT EXISTS idx_security_events_ts ON security_events (ts)`,
+        // 13 Nov 2026 (v87): sistem koin Cerpen — dompet, unlock, ledger,
+        // voucher, harga, audit admin, ban akun, pantauan perangkat.
+        `CREATE TABLE IF NOT EXISTS cerpen_wallets (owner_key TEXT PRIMARY KEY, owner_type TEXT NOT NULL, user_id TEXT, device_id TEXT, balance INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_wallets_user ON cerpen_wallets(user_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_wallets_device ON cerpen_wallets(device_id)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_devices (device_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, android_id TEXT NOT NULL DEFAULT '', label TEXT NOT NULL DEFAULT '', first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_devices_user ON cerpen_devices(user_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_devices_android ON cerpen_devices(android_id)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_unlocks (owner_key TEXT NOT NULL, kind TEXT NOT NULL, target_id TEXT NOT NULL, season INTEGER NOT NULL DEFAULT 1, no INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (owner_key, kind, target_id, season, no))`,
+        `CREATE TABLE IF NOT EXISTS cerpen_coin_ledger (id TEXT PRIMARY KEY, owner_key TEXT NOT NULL, user_id TEXT, device_id TEXT, delta INTEGER NOT NULL, balance_after INTEGER NOT NULL, reason TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_coin_ledger_owner ON cerpen_coin_ledger(owner_key, created_at)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_voucher_batches (batch_id TEXT PRIMARY KEY, reward_type TEXT NOT NULL DEFAULT 'coins', reward_coins INTEGER NOT NULL DEFAULT 0, reward_value INTEGER NOT NULL DEFAULT 0, reward_target_kind TEXT, reward_target_id TEXT, reward_season INTEGER, reward_no INTEGER, total_max INTEGER NOT NULL, per_device_max INTEGER NOT NULL DEFAULT 1, valid_from INTEGER, expires_at INTEGER, redeemed_count INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_vip (user_id TEXT PRIMARY KEY, expires_at INTEGER, granted_by TEXT NOT NULL DEFAULT 'admin', reason TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_vouchers (code_hash TEXT PRIMARY KEY, batch_id TEXT NOT NULL, code_prefix TEXT NOT NULL DEFAULT '', redeemed_count INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_vouchers_batch ON cerpen_vouchers(batch_id)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_voucher_redemptions (id TEXT PRIMARY KEY, code_hash TEXT NOT NULL, owner_key TEXT NOT NULL, device_id TEXT NOT NULL, user_id TEXT, created_at INTEGER NOT NULL)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_voucher_red_code_dev ON cerpen_voucher_redemptions(code_hash, device_id)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_coin_pricing (kind TEXT NOT NULL, target_id TEXT NOT NULL, price INTEGER NOT NULL, free_episodes INTEGER NOT NULL, PRIMARY KEY (kind, target_id))`,
+        `CREATE TABLE IF NOT EXISTS coin_admin_audit (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL, note TEXT NOT NULL DEFAULT '')`,
+        `CREATE TABLE IF NOT EXISTS cerpen_bans (id TEXT PRIMARY KEY, target_type TEXT NOT NULL, target_id TEXT NOT NULL, reason TEXT NOT NULL, banned_by TEXT NOT NULL DEFAULT 'admin', created_at INTEGER NOT NULL, expires_at INTEGER, active INTEGER NOT NULL DEFAULT 1, unbanned_at INTEGER, unbanned_by TEXT, unban_note TEXT NOT NULL DEFAULT '')`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_cerpen_bans_active ON cerpen_bans(target_type, target_id) WHERE active = 1`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_bans_target ON cerpen_bans(target_id, active)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_device_watch (device_id TEXT PRIMARY KEY, android_id TEXT NOT NULL DEFAULT '', watched INTEGER NOT NULL DEFAULT 0, auto_flag INTEGER NOT NULL DEFAULT 0, flag_reason TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_coin_events (id TEXT PRIMARY KEY, kind TEXT NOT NULL, device_id TEXT NOT NULL DEFAULT '', android_id TEXT NOT NULL DEFAULT '', user_id TEXT, detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_coin_events_device ON cerpen_coin_events(device_id, created_at)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_coin_events_kind ON cerpen_coin_events(kind, created_at)`,
       ];
       // 11 Nov 2026 (performa): DDL dieksekusi via SATU batch, bukan
       // ~30 round-trip D1 berurutan — di isolate dingin tiap round-trip
@@ -85,6 +111,8 @@ export async function ensureSchema(env) {
       const uHave = new Set((uInfo.results || []).map(r => r.name));
       if (!uHave.has('email')) alters.push(env.DB.prepare(`ALTER TABLE cms_users ADD COLUMN email TEXT`));
       if (!uHave.has('email_verified')) alters.push(env.DB.prepare(`ALTER TABLE cms_users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`));
+      // 13 Nov 2026 (v87): kolom kunci akun (dipakai penegakan ban koin).
+      if (!uHave.has('locked')) alters.push(env.DB.prepare(`ALTER TABLE cms_users ADD COLUMN locked INTEGER NOT NULL DEFAULT 0`));
       if (alters.length) await env.DB.batch(alters);
       // Akun lama (tanpa email) dianggap terverifikasi — jangan kunci mereka
       // keluar. Idempotent: hanya baris tanpa email yang disentuh.
@@ -94,6 +122,9 @@ export async function ensureSchema(env) {
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`),
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('navbar', 'modern')`),
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('donate_url', '')`),
+        // 13 Nov 2026 (v87): default harga koin Cerpen.
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('cerpen_coin_price_default', '10')`),
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('cerpen_coin_free_episodes_default', '1')`),
         ...pluginDefs.map(p => env.DB.prepare(`INSERT OR IGNORE INTO cms_plugins (id, enabled) VALUES (?, 1)`).bind(p.id)),
       ]);
       const existing = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_posts`).first();
