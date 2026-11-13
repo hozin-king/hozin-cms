@@ -170,13 +170,13 @@ async function getLeaderboard(env, period, limit) {
   } else {
     rows = await env.DB.prepare(`SELECT user_id, SUM(seconds) AS total FROM cms_reading_sessions WHERE post_id LIKE 'cerpen:%' OR post_id LIKE 'komik:%' GROUP BY user_id ORDER BY total DESC LIMIT ?`).bind(lim).all();
   }
-  const users = await env.DB.prepare(`SELECT id, username, reading_private FROM cms_users`).all();
+  const users = await env.DB.prepare(`SELECT id, username, reading_private, verified FROM cms_users`).all();
   const uMap = new Map((users.results || []).map(u => [u.id, u]));
   const out = [];
   for (const r of (rows.results || [])) {
     const u = uMap.get(r.user_id);
     if (!u || Number(u.reading_private) === 1) continue;
-    out.push({ rank: out.length + 1, username: u.username, seconds: Number(r.total) || 0, minutes: Math.floor((Number(r.total) || 0) / 60) });
+    out.push({ rank: out.length + 1, username: u.username, verified: Number(u.verified) || 0, seconds: Number(r.total) || 0, minutes: Math.floor((Number(r.total) || 0) / 60) });
   }
   return out;
 }
@@ -484,6 +484,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
       username: ident.user ? ident.user.username : null,
       balance: w ? Number(w.balance) || 0 : 0,
       vip, reading_private: readingPrivate,
+      verified: ident.kind === 'user' ? (Number(ident.user.verified) === 1 ? 1 : 0) : 0,
       devices, unlocks: unlocks.results || [], pricing,
     });
   }
@@ -764,9 +765,9 @@ export async function handleCoinAdmin(request, env, url, admin) {
     let rows;
     if (term) {
       const like = '%' + term + '%';
-      rows = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked FROM cms_users WHERE username LIKE ? OR email LIKE ? ORDER BY created_at DESC LIMIT ?`).bind(like, like, limit).all();
+      rows = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked, verified FROM cms_users WHERE username LIKE ? OR email LIKE ? ORDER BY created_at DESC LIMIT ?`).bind(like, like, limit).all();
     } else {
-      rows = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked FROM cms_users ORDER BY created_at DESC LIMIT ?`).bind(limit).all();
+      rows = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked, verified FROM cms_users ORDER BY created_at DESC LIMIT ?`).bind(limit).all();
     }
     const users = rows.results || [];
     const bals = await env.DB.prepare(`SELECT user_id, balance FROM cerpen_wallets WHERE user_id IS NOT NULL`).all();
@@ -775,7 +776,7 @@ export async function handleCoinAdmin(request, env, url, admin) {
     const devMap = new Map((devs.results || []).map(r => [r.user_id, Number(r.n) || 0]));
     const banRows = await env.DB.prepare(`SELECT target_id FROM cerpen_bans WHERE target_type = 'user' AND active = 1`).all();
     const banSet = new Set((banRows.results || []).map(r => r.target_id));
-    return aj({ ok: true, users: users.map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0, balance: balMap.get(u.id) || 0, devices: devMap.get(u.id) || 0, banned: banSet.has(u.id) })) });
+    return aj({ ok: true, users: users.map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0, verified: Number(u.verified) || 0, balance: balMap.get(u.id) || 0, devices: devMap.get(u.id) || 0, banned: banSet.has(u.id) })) });
   }
 
   // GET /api/admin/cerpen-koin/users/:id — detail akun
@@ -783,7 +784,7 @@ export async function handleCoinAdmin(request, env, url, admin) {
   if (userDetail && method === 'GET') {
     const userId = userDetail[1];
     if (!isUserId(userId)) return aj({ ok: false, error: 'user_id tidak valid' }, 400);
-    const user = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked, reading_private FROM cms_users WHERE id = ?`).bind(userId).first();
+    const user = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked, reading_private, verified FROM cms_users WHERE id = ?`).bind(userId).first();
     if (!user) return aj({ ok: false, error: 'akun tidak ditemukan' }, 404);
     const wallet = await getWallet(env, 'user:' + userId);
     const devices = await env.DB.prepare(`SELECT device_id, android_id, label, first_seen, last_seen FROM cerpen_devices WHERE user_id = ? ORDER BY last_seen DESC`).bind(userId).all();
@@ -793,7 +794,7 @@ export async function handleCoinAdmin(request, env, url, admin) {
     const vip = await vipStatus(env, userId);
     const readRows = await env.DB.prepare(`SELECT post_id, SUM(seconds) AS s, MAX(day_wib) AS last_day FROM cms_reading_sessions WHERE user_id = ? AND (post_id LIKE 'cerpen:%' OR post_id LIKE 'komik:%') GROUP BY post_id ORDER BY last_day DESC LIMIT 20`).bind(userId).all();
     const reading = (readRows.results || []).map(r => ({ ...(parsePostId(r.post_id) || { kind: '', target_id: r.post_id, season: 1, no: 0 }), seconds: Number(r.s) || 0, last_day: r.last_day }));
-    return aj({ ok: true, user: { id: user.id, username: user.username, email: user.email || '', created_at: user.created_at, email_verified: Number(user.email_verified) || 0, locked: Number(user.locked) || 0, reading_private: Number(user.reading_private) || 0 }, balance: wallet ? Number(wallet.balance) || 0 : 0, vip, reading, devices: devices.results || [], unlocks: unlocks.results || [], ledger: ledger.results || [], bans: bans.results || [] });
+    return aj({ ok: true, user: { id: user.id, username: user.username, email: user.email || '', created_at: user.created_at, email_verified: Number(user.email_verified) || 0, locked: Number(user.locked) || 0, verified: Number(user.verified) || 0, reading_private: Number(user.reading_private) || 0 }, balance: wallet ? Number(wallet.balance) || 0 : 0, vip, reading, devices: devices.results || [], unlocks: unlocks.results || [], ledger: ledger.results || [], bans: bans.results || [] });
   }
 
   // POST /api/admin/cerpen-koin/users/:id/adjust — beri/kurangi koin
@@ -834,6 +835,19 @@ export async function handleCoinAdmin(request, env, url, admin) {
     await env.DB.prepare(`UPDATE cms_users SET locked = ? WHERE id = ?`).bind(locked, userId).run();
     await coinAudit(env, locked ? 'user_lock' : 'user_unlock', 'user', userId, '');
     return aj({ ok: true, user_id: userId, locked });
+  }
+
+  // POST /api/admin/cerpen-koin/users/:id/verify|unverify — badge verifikasi (v87.2)
+  const userVerify = path.match(/^\/api\/admin\/cerpen-koin\/users\/([^/]+)\/(verify|unverify)$/);
+  if (userVerify && method === 'POST') {
+    const userId = userVerify[1];
+    if (!isUserId(userId)) return aj({ ok: false, error: 'user_id tidak valid' }, 400);
+    const verified = userVerify[2] === 'verify' ? 1 : 0;
+    const user = await env.DB.prepare(`SELECT id FROM cms_users WHERE id = ?`).bind(userId).first();
+    if (!user) return aj({ ok: false, error: 'akun tidak ditemukan' }, 404);
+    await env.DB.prepare(`UPDATE cms_users SET verified = ? WHERE id = ?`).bind(verified, userId).run();
+    await coinAudit(env, verified ? 'user_verify' : 'user_unverify', 'user', userId, '');
+    return aj({ ok: true, user_id: userId, verified });
   }
 
   // POST /api/admin/cerpen-koin/devices/:device_id/unlink — lepas ikatan perangkat
@@ -1291,7 +1305,7 @@ export async function renderCoinPanel(env, csrf, nav, notice) {
   const bans = await env.DB.prepare(`SELECT COUNT(*) AS c FROM cerpen_bans WHERE target_type = 'user' AND active = 1`).first();
   const watched = await env.DB.prepare(`SELECT COUNT(*) AS c FROM cerpen_device_watch WHERE watched = 1 OR auto_flag = 1`).first();
   const pricing = await getPricing(env);
-  const userRows = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked FROM cms_users ORDER BY created_at DESC LIMIT 20`).all();
+  const userRows = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked, verified FROM cms_users ORDER BY created_at DESC LIMIT 20`).all();
   const bals = await env.DB.prepare(`SELECT user_id, balance FROM cerpen_wallets WHERE user_id IS NOT NULL`).all();
   const balMap = new Map((bals.results || []).map(r => [r.user_id, Number(r.balance) || 0]));
   const banRows = await env.DB.prepare(`SELECT id, target_id, reason, banned_by, created_at, expires_at FROM cerpen_bans WHERE target_type = 'user' AND active = 1 ORDER BY created_at DESC LIMIT 50`).all();
@@ -1301,7 +1315,9 @@ export async function renderCoinPanel(env, csrf, nav, notice) {
   const vipHtml = (vipRows.results || []).map(v => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(nameMap.get(v.user_id) || v.user_id)}</span><div class="adm-row-meta">sampai ${wib(v.expires_at)}${v.reason ? ' · ' + esc(v.reason) : ''}</div></div><button type="button" data-koin-vip-revoke="${esc(v.user_id)}">Cabut VIP</button></div>`).join('') || '<p>Tidak ada VIP aktif.</p>';
   const boardWeekly = await getLeaderboard(env, 'weekly', 10);
   const boardAll = await getLeaderboard(env, 'all', 10);
-  const boardHtml = (title, list) => `<h4>${title}</h4>` + (list.map(r => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${r.rank}. ${esc(r.username)}</span><div class="adm-row-meta">${r.minutes} menit (${r.seconds} detik)</div></div></div>`).join('') || '<p>Belum ada data.</p>');
+  // Badge verifikasi centang (v87.2): lingkaran biru + ✓ putih, ala medsos.
+  const vBadge = v => Number(v) === 1 ? ' <span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:#1d9bf0;color:#fff;font-size:11px;font-weight:800;line-height:1;vertical-align:-3px" title="Akun terverifikasi">✓</span>' : '';
+  const boardHtml = (title, list) => `<h4>${title}</h4>` + (list.map(r => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${r.rank}. ${esc(r.username)}${vBadge(r.verified)}</span><div class="adm-row-meta">${r.minutes} menit (${r.seconds} detik)</div></div></div>`).join('') || '<p>Belum ada data.</p>');
   let targetOptions = '';
   try {
     if (env.BACKUP_DB) {
@@ -1319,7 +1335,7 @@ export async function renderCoinPanel(env, csrf, nav, notice) {
     const [kind, target] = k.split(':');
     return `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(kind)}:${esc(target)}</span><div class="adm-row-meta">${v.price} koin · ${v.free_episodes} episode gratis</div></div><button type="button" data-koin-pricing-del="${esc(kind)}:${esc(target)}" style="background:#dc2626">Hapus</button></div>`;
   }).join('') || '<p>Belum ada override per series.</p>';
-  const userHtml = (userRows.results || []).map(u => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(u.username)}</span><div class="adm-row-meta">${esc(u.email || '')} · saldo <b>${balMap.get(u.id) || 0} koin</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}${Number(u.locked) ? ' · 🔒 terkunci' : ''}${Number(u.email_verified) === 0 ? ' · belum verifikasi' : ''}</div></div><button type="button" data-koin-user="${esc(u.id)}">Detail</button></div>`).join('') || '<p>Belum ada akun.</p>';
+  const userHtml = (userRows.results || []).map(u => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(u.username)}${vBadge(u.verified)}</span><div class="adm-row-meta">${esc(u.email || '')} · saldo <b>${balMap.get(u.id) || 0} koin</b> · sejak ${esc(String(u.created_at || '').slice(0, 10))}${Number(u.locked) ? ' · 🔒 terkunci' : ''}${Number(u.email_verified) === 0 ? ' · belum verifikasi' : ''}</div></div><button type="button" data-koin-user="${esc(u.id)}">Detail</button></div>`).join('') || '<p>Belum ada akun.</p>';
   const banHtml = (banRows.results || []).map(b => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(nameMap.get(b.target_id) || b.target_id)}</span><div class="adm-row-meta">${esc(b.reason)} · sejak ${wib(b.created_at)} · ${b.expires_at ? 'sampai ' + wib(Number(b.expires_at) * 1000) : 'PERMANEN'}</div></div><button type="button" data-koin-unban="${esc(b.id)}">Unban</button></div>`).join('') || '<p>Tidak ada ban aktif.</p>';
   const watchHtml = watchList.map(d => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${d.status === 'perlu perhatian' ? '⚠' : d.status === 'dipantau' ? '👁' : ''} <code>${esc(String(d.device_id).slice(0, 8))}…</code></span><div class="adm-row-meta">${d.accounts_detail.map(a => esc(a.username)).join(', ') || 'guest'} · ${d.accounts} akun · ${d.redeem_n} redeem · ${d.unlock_n} unlock · terakhir ${wib(d.updated_at)}${d.flag_reason ? ' · ' + esc(d.flag_reason) : ''}</div></div><button type="button" data-koin-device="${esc(d.device_id)}">Detail</button> <button type="button" data-koin-watch="${esc(d.device_id)}" data-watched="${d.watched ? 0 : 1}">${d.watched ? 'Berhenti pantau' : 'Pantau'}</button></div>`).join('') || '<p>Belum ada perangkat tercatat.</p>';
   const ledgerHtml = (ledgerRows.results || []).map(l => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${Number(l.delta) > 0 ? '+' : ''}${l.delta} koin → saldo ${l.balance_after}</span><div class="adm-row-meta">${esc(l.owner_key)} · ${esc(l.reason)}${l.ref ? ' · ' + esc(l.ref) : ''} · ${wib(l.created_at)}</div></div></div>`).join('') || '<p>Belum ada mutasi.</p>';
@@ -1336,7 +1352,8 @@ export async function renderCoinPanel(env, csrf, nav, notice) {
 <div class="adm-stat"><span class="adm-stat-num">${Number(watched?.c) || 0}</span><span class="adm-stat-label">Perangkat dipantau</span></div>
 </div></div>
 <div class="card"><h3>Harga</h3><form id="koin-pricing-form"><label>Harga default per episode (koin)<input name="default_price" type="number" min="0" max="10000" value="${pricing.default_price}" required></label><label>Episode gratis per series (default)<input name="free_episodes_default" type="number" min="0" max="100" value="${pricing.free_episodes_default}" required></label><p><button type="submit">Simpan Harga Default</button></p></form><h4>Override per series/komik</h4>${ovRows}<form id="koin-pricing-ov-form"><label>Jenis<select name="kind"><option value="cerpen">cerpen</option><option value="komik">komik</option></select></label><label>ID series/komik<input name="target_id" required maxlength="64" placeholder="mis. cerpen-01"></label><label>Harga (koin)<input name="price" type="number" min="0" max="10000" value="10" required></label><label>Episode gratis<input name="free_episodes" type="number" min="0" max="100" value="1" required></label><p><button type="submit">Simpan Override</button></p></form></div>
-<div class="card"><h3>Akun</h3><form id="koin-user-search" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">Cari<input name="q" maxlength="64" placeholder="username / email"></label><button type="submit">Cari</button></form><div id="koin-users">${userHtml}</div><div class="card" id="koin-user-detail" hidden><h3>Detail akun</h3><div id="koin-user-detail-body"><p>Pilih tombol Detail pada salah satu akun.</p></div></div></div>
+<div class="card"><h3>Akun</h3><form id="koin-user-search" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">Cari<input name="q" maxlength="64" placeholder="username / email"></label><button type="submit">Cari</button></form><div id="koin-users">${userHtml}</div></div>
+<div class="card" id="koin-user-detail" hidden><h3>Detail akun</h3><div id="koin-user-detail-body"><p>Pilih tombol Detail pada salah satu akun.</p></div></div>
 <div class="card"><h3>Voucher</h3><form id="koin-voucher-form"><label>Jenis hadiah<select name="reward_type" id="koin-reward-type"><option value="coins">Koin</option><option value="episode">Unlock 1 episode</option><option value="season">Unlock 1 season penuh</option><option value="series">Unlock 1 series penuh</option><option value="vip">VIP (hari)</option></select></label><label id="koin-reward-value-label">Reward per kode (koin)<input name="reward_value" type="number" min="1" max="10000" value="50" required></label><div id="koin-target-fields" hidden><label>Jenis konten<select name="reward_target_kind"><option value="cerpen">cerpen</option><option value="komik">komik</option></select></label><label>Target (ID series/komik)<input name="reward_target_id" list="koin-target-list" maxlength="64" placeholder="mis. cerpen-01"></label><datalist id="koin-target-list">${targetOptions}</datalist><label>Season (cerpen)<input name="reward_season" type="number" min="1" max="99" value="1"></label><label>No. episode<input name="reward_no" type="number" min="1" max="9999" value="1"></label></div><label>Jumlah kode<input name="count" type="number" min="1" max="500" value="10" required></label><label>Maks total penukaran<input name="total_max" type="number" min="1" max="100000" value="10" required></label><label>Maks per akun/perangkat<input name="per_device_max" type="number" min="1" max="100" value="1" required></label><label>Berlaku mulai (opsional)<input name="valid_from" type="datetime-local"></label><label>Kedaluwarsa (opsional)<input name="expires_at" type="datetime-local"></label><label>Catatan<input name="note" maxlength="200" placeholder="mis. event akhir pekan"></label><label style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="draft" value="1"> Buat sebagai draf (belum aktif — target/hadiah masih bisa diubah, lalu Aktifkan)</label><p><button type="submit">Buat Batch Voucher</button></p><p style="font-size:13px;opacity:.7">Kode plaintext tampil SEKALI di bawah setelah dibuat — salin segera. Di database hanya hash-nya yang disimpan. Batch draf bisa diubah (target/hadiah/waktu/limit) sampai diaktifkan; batch aktif tidak bisa diubah hadiahnya.</p></form><div id="koin-codes" hidden><h4>Kode batch baru (salin sekarang)</h4><pre id="koin-codes-pre" style="white-space:pre-wrap;word-break:break-all"></pre><p><button type="button" id="koin-codes-copy">Salin Semua Kode</button></p></div><div id="koin-batches"></div></div>
 <div class="card"><h3>VIP</h3><p style="font-size:13px;opacity:.7">Selama VIP aktif, semua episode terkunci bisa dibaca gratis (tanpa potong koin). VIP diberikan lewat panel ini atau voucher khusus — bukan dibeli pakai koin di v1.</p><form id="koin-vip-form"><label>ID akun (u-...)<input name="user_id" required maxlength="64" placeholder="u-..."></label><label>Lama (hari)<input name="days" type="number" min="1" max="730" value="30" required></label><label>Alasan<input name="reason" maxlength="200" placeholder="mis. pemenang event"></label><p><button type="submit">Beri VIP</button></p></form><h4>VIP aktif</h4><div id="koin-vips">${vipHtml}</div></div>
 <div class="card"><h3>Papan Peringkat (waktu baca)</h3><p style="font-size:13px;opacity:.7">Dari pelacak waktu baca v81 (hanya bacaan Cerpen di aplikasi). Akun dengan reading_private=1 tidak tampil.</p>${boardHtml('Mingguan (7 hari terakhir)', boardWeekly)}${boardHtml('Sepanjang waktu', boardAll)}</div>
@@ -1344,8 +1361,10 @@ export async function renderCoinPanel(env, csrf, nav, notice) {
 <div class="card"><h3>Daftar Pantauan Perangkat</h3><p style="font-size:13px;opacity:.7">Pantauan BUKAN hukuman — perangkat yang dipantau tetap bisa memakai aplikasi normal. Tanda ⚠ "perlu perhatian" dibuat otomatis oleh pola mencurigakan (≥3 akun, ≥5 gagal redeem/24 jam, ≥5 kode berbeda/24 jam) dan tidak memblokir apa pun.</p><div id="koin-devices">${watchHtml}</div><div class="card" id="koin-device-detail" hidden><h3>Detail perangkat</h3><div id="koin-device-detail-body"><p>Pilih tombol Detail pada salah satu perangkat.</p></div></div></div>
 <div class="card"><h3>Ledger (20 mutasi terakhir)</h3>${ledgerHtml}</div>
 <div class="card"><h3>Riwayat admin (audit)</h3>${auditHtml}</div>
+<div style="height:110px" aria-hidden="true"></div>
 <script>
 const COIN_CSRF = "${csrf}";
+const V_BADGE = ' <span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:#1d9bf0;color:#fff;font-size:11px;font-weight:800;line-height:1;vertical-align:-3px" title="Akun terverifikasi">✓</span>';
 const koinMsg = document.getElementById('koin-msg');
 function koinSay(t, ok) { koinMsg.innerHTML = '<div class="card"><p>' + t + '</p></div>'; koinMsg.scrollIntoView(); }
 async function koinFetch(url, method, body) {
@@ -1372,7 +1391,7 @@ document.getElementById('koin-user-search').addEventListener('submit', async (e)
   const q = new FormData(e.target).get('q') || '';
   try {
     const j = await koinFetch('/api/admin/cerpen-koin/users?q=' + encodeURIComponent(q) + '&limit=20', 'GET');
-    document.getElementById('koin-users').innerHTML = j.users.map(u => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + u.username + '</span><div class="adm-row-meta">' + (u.email || '') + ' · saldo <b>' + u.balance + ' koin</b>' + (u.locked ? ' · 🔒 terkunci' : '') + (u.banned ? ' · 🚫 dibanned' : '') + '</div></div><button type="button" data-koin-user="' + u.id + '">Detail</button></div>').join('') || '<p>Tidak ada akun.</p>';
+    document.getElementById('koin-users').innerHTML = j.users.map(u => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + u.username + (u.verified ? V_BADGE : '') + '</span><div class="adm-row-meta">' + (u.email || '') + ' · saldo <b>' + u.balance + ' koin</b>' + (u.locked ? ' · 🔒 terkunci' : '') + (u.banned ? ' · 🚫 dibanned' : '') + '</div></div><button type="button" data-koin-user="' + u.id + '">Detail</button></div>').join('') || '<p>Tidak ada akun.</p>';
   } catch (err) { koinSay(err.message); }
 });
 document.getElementById('koin-reward-type').addEventListener('change', (e) => {
@@ -1426,12 +1445,13 @@ document.addEventListener('click', async (e) => {
     if (t.hasAttribute('data-koin-user')) {
       const j = await koinFetch('/api/admin/cerpen-koin/users/' + encodeURIComponent(t.getAttribute('data-koin-user')), 'GET');
       const u = j.user;
-      document.getElementById('koin-user-detail-body').innerHTML = '<p><b>' + u.username + '</b> · ' + (u.email || '') + ' · saldo <b>' + j.balance + ' koin</b>' + (j.vip && j.vip.active ? ' · <b>VIP sampai ' + new Date(j.vip.expires_at).toLocaleDateString('id-ID') + '</b>' : '') + ' · perangkat: ' + j.devices.length + ' · unlock: ' + j.unlocks.length + (u.reading_private ? ' · papan peringkat: disembunyikan' : '') + '</p>'
-        + '<form id="koin-adjust-form"><label>Ubah saldo (delta, bisa negatif)<input name="delta" type="number" required placeholder="mis. 100 atau -50"></label><label>Alasan (wajib)<input name="reason" required maxlength="200"></label><p><button type="submit">Simpan</button> <button type="button" id="koin-lock-btn">' + (u.locked ? 'Buka Kunci Akun' : 'Kunci Akun') + '</button> <button type="button" id="koin-ban2-btn">Ban Akun Ini</button></p></form>'
+      document.getElementById('koin-user-detail-body').innerHTML = '<p><b>' + u.username + '</b>' + (u.verified ? V_BADGE : '') + ' · ' + (u.email || '') + ' · saldo <b>' + j.balance + ' koin</b>' + (j.vip && j.vip.active ? ' · <b>VIP sampai ' + new Date(j.vip.expires_at).toLocaleDateString('id-ID') + '</b>' : '') + ' · perangkat: ' + j.devices.length + ' · unlock: ' + j.unlocks.length + (u.reading_private ? ' · papan peringkat: disembunyikan' : '') + '</p>'
+        + '<form id="koin-adjust-form"><label>Ubah saldo (delta, bisa negatif)<input name="delta" type="number" required placeholder="mis. 100 atau -50"></label><label>Alasan (wajib)<input name="reason" required maxlength="200"></label><p style="display:flex;flex-wrap:wrap;gap:8px"><button type="submit">Simpan</button> <button type="button" id="koin-lock-btn">' + (u.locked ? 'Buka Kunci Akun' : 'Kunci Akun') + '</button> <button type="button" id="koin-verify-btn">' + (u.verified ? 'Cabut verifikasi' : 'Verifikasi ✓') + '</button> <button type="button" id="koin-ban2-btn">Ban Akun Ini</button></p></form>'
         + '<h4>Yang sudah dibeli</h4>' + (j.unlocks.map(x => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + x.kind + ':' + x.target_id + ' S' + x.season + 'E' + x.no + '</span></div></div>').join('') || '<p>Belum ada unlock.</p>')
         + '<h4>Terakhir dibaca</h4>' + (j.reading.map(x => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + x.kind + ':' + x.target_id + ' S' + x.season + 'E' + x.no + '</span><div class="adm-row-meta">' + Math.floor(x.seconds / 60) + ' menit · terakhir ' + x.last_day + '</div></div></div>').join('') || '<p>Belum ada riwayat baca.</p>')
         + '<h4>Ledger</h4>' + (j.ledger.map(l => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + (l.delta > 0 ? '+' : '') + l.delta + ' → ' + l.balance_after + '</span><div class="adm-row-meta">' + l.reason + '</div></div></div>').join('') || '<p>Belum ada mutasi.</p>');
       document.getElementById('koin-user-detail').hidden = false;
+      document.getElementById('koin-user-detail').scrollIntoView({ block: 'start' });
       document.getElementById('koin-adjust-form').addEventListener('submit', async (ev) => {
         ev.preventDefault();
         const f = new FormData(ev.target);
@@ -1439,6 +1459,9 @@ document.addEventListener('click', async (e) => {
       });
       document.getElementById('koin-lock-btn').addEventListener('click', async () => {
         try { const r = await koinFetch('/api/admin/cerpen-koin/users/' + encodeURIComponent(u.id) + '/' + (u.locked ? 'unlock' : 'lock'), 'POST', {}); koinSay('Akun ' + u.username + (r.locked ? ' dikunci.' : ' dibuka.'), true); } catch (err) { koinSay(err.message); }
+      });
+      document.getElementById('koin-verify-btn').addEventListener('click', async () => {
+        try { const r = await koinFetch('/api/admin/cerpen-koin/users/' + encodeURIComponent(u.id) + '/' + (u.verified ? 'unverify' : 'verify'), 'POST', {}); koinSay('Akun ' + u.username + (r.verified ? ' terverifikasi ✓.' : ' verifikasinya dicabut.'), true); } catch (err) { koinSay(err.message); }
       });
       document.getElementById('koin-ban2-btn').addEventListener('click', async () => {
         const reason = prompt('Alasan ban untuk ' + u.username + ' (wajib):');

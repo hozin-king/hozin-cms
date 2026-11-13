@@ -31,7 +31,7 @@ export async function ensureSchema(env) {
         `CREATE TABLE IF NOT EXISTS cms_login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, created_at TEXT NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS cms_backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, status TEXT NOT NULL, posts INTEGER NOT NULL DEFAULT 0, comments INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '')`,
         `CREATE TABLE IF NOT EXISTS cms_refresh_tokens (id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, device TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_used_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, replaced_by TEXT NOT NULL DEFAULT '', remember INTEGER NOT NULL DEFAULT 0)`,
-        `CREATE TABLE IF NOT EXISTS cms_users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL, email TEXT, email_verified INTEGER NOT NULL DEFAULT 0)`,
+        `CREATE TABLE IF NOT EXISTS cms_users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL, email TEXT, email_verified INTEGER NOT NULL DEFAULT 0, verified INTEGER NOT NULL DEFAULT 0)`,
         // 13 Nov 2026 (v83): kode OTP verifikasi email — hanya hash yang
         // disimpan, satu kode aktif per email (INSERT OR REPLACE).
         `CREATE TABLE IF NOT EXISTS cms_otp_codes (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
@@ -113,6 +113,8 @@ export async function ensureSchema(env) {
       if (!uHave.has('email_verified')) alters.push(env.DB.prepare(`ALTER TABLE cms_users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`));
       // 13 Nov 2026 (v87): kolom kunci akun (dipakai penegakan ban koin).
       if (!uHave.has('locked')) alters.push(env.DB.prepare(`ALTER TABLE cms_users ADD COLUMN locked INTEGER NOT NULL DEFAULT 0`));
+      // 13 Nov 2026 (v87.2): badge verifikasi akun (tampil di panel + app).
+      if (!uHave.has('verified')) alters.push(env.DB.prepare(`ALTER TABLE cms_users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0`));
       if (alters.length) await env.DB.batch(alters);
       // Akun lama (tanpa email) dianggap terverifikasi — jangan kunci mereka
       // keluar. Idempotent: hanya baris tanpa email yang disentuh.

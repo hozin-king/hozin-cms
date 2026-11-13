@@ -129,7 +129,7 @@ class MockDB {
       return [];
     }
     if (s.startsWith('INSERT INTO cms_comments')) { this.comments.push({ id: ++this.commentSeq, post_id: a[0], name: a[1], text: a[2], status: a[3], created_at: a[4], parent_id: a[5] || null }); return []; }
-    if (s.startsWith('INSERT INTO cms_users')) { this.users.set(a[0], { id: a[0], username: a[1], password_hash: a[2], salt: a[3], created_at: a[4], email: a[5] ?? null, email_verified: a[6] ?? 0 }); return []; }
+    if (s.startsWith('INSERT INTO cms_users')) { this.users.set(a[0], { id: a[0], username: a[1], password_hash: a[2], salt: a[3], created_at: a[4], email: a[5] ?? null, email_verified: a[6] ?? 0, verified: 0 }); return []; }
     if (s.startsWith('SELECT * FROM cms_users WHERE email')) return [...this.users.values()].filter(u => u.email === a[0]);
     if (s.startsWith('SELECT id FROM cms_users WHERE email')) return [...this.users.values()].filter(u => u.email === a[0]).map(u => ({ id: u.id }));
     if (s === 'UPDATE cms_users SET email_verified = 1 WHERE email IS NULL') { for (const u of this.users.values()) if (!u.email) u.email_verified = 1; return []; }
@@ -830,15 +830,16 @@ class MockDB {
       return [...m.values()].sort((x, y) => y.last_day.localeCompare(x.last_day)).slice(0, 20);
     }
     // --- User koin (admin) ---
-    if (s.startsWith('SELECT id, username, reading_private FROM cms_users')) return [...this.users.values()].map(u => ({ id: u.id, username: u.username, reading_private: Number(u.reading_private) || 0 }));
+    if (s.startsWith('SELECT id, username, reading_private')) return [...this.users.values()].map(u => ({ id: u.id, username: u.username, reading_private: Number(u.reading_private) || 0, verified: Number(u.verified) || 0 }));
     if (s.startsWith('SELECT id FROM cms_users WHERE id')) return [...this.users.values()].filter(u => u.id === a[0]).map(u => ({ id: u.id }));
-    if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked FROM cms_users WHERE username LIKE ? OR email LIKE ?')) {
+    if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked') && s.includes('WHERE username LIKE ?')) {
       const t = String(a[0]).replace(/%/g, '');
-      return [...this.users.values()].filter(u => u.username.includes(t) || (u.email || '').includes(t)).sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, a[2]).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0 }));
+      return [...this.users.values()].filter(u => u.username.includes(t) || (u.email || '').includes(t)).sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, a[2]).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0, verified: Number(u.verified) || 0 }));
     }
-    if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked FROM cms_users ORDER BY created_at DESC LIMIT')) return [...this.users.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, a[0] || 20).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0 }));
-    if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked, reading_private FROM cms_users WHERE id = ?')) return [...this.users.values()].filter(u => u.id === a[0]).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0, reading_private: Number(u.reading_private) || 0 }));
+    if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked') && s.includes('ORDER BY created_at DESC LIMIT') && !s.includes('WHERE')) return [...this.users.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, a[0] || 20).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0, verified: Number(u.verified) || 0 }));
+    if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked') && s.includes('WHERE id = ?')) return [...this.users.values()].filter(u => u.id === a[0]).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0, reading_private: Number(u.reading_private) || 0, verified: Number(u.verified) || 0 }));
     if (s.startsWith('UPDATE cms_users SET locked = ? WHERE id = ?')) { const u = this.users.get(a[1]); if (u) u.locked = a[0]; return []; }
+    if (s.startsWith('UPDATE cms_users SET verified = ? WHERE id = ?')) { const u = this.users.get(a[1]); if (u) u.verified = a[0]; return []; }
     if (s.startsWith('UPDATE cms_users SET reading_private = ? WHERE id = ?')) { const u = this.users.get(a[1]); if (u) u.reading_private = a[0]; return []; }
     if (s.startsWith('SELECT COUNT(*) AS c FROM cms_users')) return [{ c: this.users.size }];
     // --- Episode BACKUP_DB (resolveVoucherEpisodes + targets) ---
@@ -2419,6 +2420,7 @@ async function coinAdmin(path, method, obj) {
 r = await call('GET', '/kendali/koin', null, cookie);
 t = await r.text();
 assert(r.status === 200 && t.includes('Koin Cerpen') && t.includes('Papan Peringkat') && t.includes('Daftar Pantauan'), 'koin panel: /kendali/koin tampil + kartu VIP/leaderboard/pantauan');
+assert(t.includes('</div></div>\n<div class="card" id="koin-user-detail"') && t.includes('height:110px'), 'koin panel: detail akun kartu sendiri (bukan bersarang) + spacer bawah anti-nav');
 const coinCsrf = (t.match(/COIN_CSRF = "([^"]+)"/) || [])[1] || '';
 assert(coinCsrf.length > 10, 'koin panel: token CSRF terbaca dari panel');
 r = await coinCall('GET', '/api/cerpen-coins/pricing', null);
@@ -2427,7 +2429,7 @@ try { pj = JSON.parse(await r.text()); } catch (e) {}
 assert(r.status === 200 && pj.ok === true && pj.default_price === 10 && pj.free_episodes_default === 1, 'koin pricing: default 10 koin, 1 episode gratis');
 r = await coinCall('GET', '/api/cerpen-coins/me?device_id=' + DEV_A, null);
 let me = JSON.parse(await r.text());
-assert(r.status === 200 && me.balance === 0 && Array.isArray(me.unlocks) && me.unlocks.length === 0, 'koin me guest: saldo 0, tanpa unlock');
+assert(r.status === 200 && me.balance === 0 && me.verified === 0 && Array.isArray(me.unlocks) && me.unlocks.length === 0, 'koin me guest: saldo 0, tanpa unlock');
 // Auth aplikasi: daftar -> verifikasi OTP -> login.
 env.DB.rateLimits = new Map();
 r = await coinCall('POST', '/api/cerpen-auth/register', { username: 'koinuji', password: 'password123', email: 'koinuji@example.com', device_id: DEV_A, android_id: 'android-uji-001' });
@@ -2613,6 +2615,7 @@ assert(!rj.leaderboard.some(x => x.seconds === 60 && x.username !== 'koinuji'), 
 r = await coinCall('GET', '/api/cerpen-coins/leaderboard?period=weekly', null);
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.leaderboard.some(x => x.username === 'koinuji' && x.seconds === 60), 'koin leaderboard: koinuji tampil mingguan (60 detik)');
+assert(rj.leaderboard.every(x => typeof x.verified === 'number'), 'koin leaderboard: tiap entri memuat verified');
 r = await coinCall('POST', '/api/cerpen-auth/reading-privacy', { private: true }, { cookie: koinUserCookie });
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.reading_private === 1, 'koin reading-privacy: sembunyikan diri ok');
@@ -2654,6 +2657,26 @@ r = await coinCall('POST', '/api/cerpen-auth/login', { username: 'koinuji', pass
 assert(r.status === 403, 'koin lock: login akun terkunci ditolak');
 r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/unlock', 'POST', {});
 assert(r.status === 200, 'koin lock: akun dibuka lagi');
+
+// Verifikasi centang (v87.2): toggle admin-only, /me + leaderboard memuat verified.
+r = await coinCall('POST', '/api/admin/cerpen-koin/users/' + koinUser.id + '/verify', null, {});
+assert(r.status === 401, 'koin verify: tanpa sesi admin ditolak 401');
+r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/verify', 'POST', {});
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.verified === 1, 'koin verify: admin memberi centang');
+r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.verified === 1, 'koin verify: /me memuat verified 1');
+r = await coinCall('GET', '/api/cerpen-coins/leaderboard?period=all', null);
+rj = JSON.parse(await r.text());
+assert(rj.leaderboard.some(x => x.username === 'koinuji' && x.verified === 1), 'koin verify: leaderboard memuat verified 1');
+r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/unverify', 'POST', {});
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.verified === 0, 'koin verify: admin mencabut centang');
+r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.verified === 0, 'koin verify: /me memuat verified 0 setelah dicabut');
+
 // Overview + detail akun + daftar pantauan.
 r = await coinAdmin('/api/admin/cerpen-koin/overview', 'GET', null);
 rj = JSON.parse(await r.text());
