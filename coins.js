@@ -82,11 +82,13 @@ async function getPricing(env) {
     overrides,
   };
 }
-function priceFor(pricing, kind, targetId, no) {
+// Gratis HANYA episode pertama series: season 1 + no <= free_episodes.
+// Episode 1 season 2+ TIDAK gratis (per-series, keputusan user 13 Nov 2026).
+function priceFor(pricing, kind, targetId, season, no) {
   const ov = pricing.overrides[kind + ':' + targetId];
   const price = ov ? ov.price : pricing.default_price;
   const freeN = ov ? ov.free_episodes : pricing.free_episodes_default;
-  return { price, free: no <= freeN };
+  return { price, free: season === 1 && no <= freeN };
 }
 async function coinAudit(env, action, targetType, targetId, note) {
   await env.DB.prepare(`INSERT INTO coin_admin_audit (id, created_at, action, target_type, target_id, note) VALUES (?, ?, ?, ?, ?, ?)`).bind('ca-' + randomHex(6), Date.now(), action, targetType, targetId, String(note || '').slice(0, 500)).run();
@@ -509,7 +511,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
     const banned = await bannedIfSession(env, ident);
     if (banned) return banned;
     const pricing = await getPricing(env);
-    const { price, free } = priceFor(pricing, kind, targetId, no);
+    const { price, free } = priceFor(pricing, kind, targetId, season, no);
     const now = Date.now();
     const existing = await env.DB.prepare(`SELECT owner_key FROM cerpen_unlocks WHERE owner_key = ? AND kind = ? AND target_id = ? AND season = ? AND no = ?`).bind(ident.ownerKey, kind, targetId, season, no).first();
     if (existing) {

@@ -2406,6 +2406,7 @@ const DEV_F = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 const DEV_G = '11111111-2222-4333-8444-555555555555';
 const DEV_H = '66666666-7777-4888-8999-aaaaaaaaaaaa';
 const DEV_I = '99999999-8888-4777-8666-555555555555';
+const DEV_J = '22222222-3333-4444-8555-666666666666';
 async function coinCall(method, path, obj, headers = {}) {
   const h = { 'content-type': 'application/json', ...headers };
   const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
@@ -2490,6 +2491,33 @@ assert(r.status === 200 && rj.already === true, 'koin purchase: beli ulang episo
 r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 1, device_id: DEV_A }, { cookie: koinUserCookie });
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.free === true && rj.balance === 40, 'koin purchase: episode 1 gratis, saldo tetap 40');
+// Gratis per-series (13 Nov 2026): hanya S1E1 gratis; S2E1/S3E1 terkunci.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 2, no: 1, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.price === 10 && rj.balance === 30, 'koin purchase per-series: S2E1 terkunci 10 koin -> saldo 30');
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 3, no: 1, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.price === 10 && rj.balance === 20, 'koin purchase per-series: S3E1 terkunci 10 koin -> saldo 20');
+// Komik selalu season 1 -> episode 1 komik tetap gratis.
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'komik', target_id: 'komik-01', season: 1, no: 1, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.free === true && rj.balance === 20, 'koin purchase per-series: komik E1 (season 1) gratis, saldo tetap 20');
+// Kembalikan saldo supaya tes berikutnya (VIP dst.) tetap melihat 40.
+r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/adjust', 'POST', { delta: 20, reason: 'uji per-series: kembalikan saldo' });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.balance === 40, 'koin purchase per-series: saldo dikembalikan ke 40');
+// Override free_episodes=2: S1E2 gratis, S2E1 tetap terkunci.
+env.DB.rateLimits = new Map();
+r = await coinAdmin('/api/admin/cerpen-koin/pricing/cerpen/cerpen-01', 'POST', { price: 10, free_episodes: 2 });
+assert(r.status === 200, 'koin pricing per-series: override free_episodes=2 disimpan');
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 2, device_id: DEV_J }, null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.free === true, 'koin purchase per-series: override 2 -> S1E2 gratis (guest baru)');
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 2, no: 1, device_id: DEV_J }, null);
+assert(r.status === 402, 'koin purchase per-series: override 2 -> S2E1 tetap terkunci (saldo guest 0)');
+r = await coinAdmin('/api/admin/cerpen-koin/pricing/cerpen/cerpen-01', 'POST', { delete: true });
+assert(r.status === 200, 'koin pricing per-series: override dihapus, kembali ke default');
 r = await coinAdmin('/api/admin/cerpen-koin/pricing', 'POST', { default_price: 100 });
 assert(r.status === 200, 'koin pricing: ubah default jadi 100');
 r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 3, device_id: DEV_A }, { cookie: koinUserCookie });
