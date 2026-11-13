@@ -31,7 +31,10 @@ export async function ensureSchema(env) {
         `CREATE TABLE IF NOT EXISTS cms_login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, created_at TEXT NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS cms_backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, status TEXT NOT NULL, posts INTEGER NOT NULL DEFAULT 0, comments INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '')`,
         `CREATE TABLE IF NOT EXISTS cms_refresh_tokens (id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, device TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_used_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, replaced_by TEXT NOT NULL DEFAULT '', remember INTEGER NOT NULL DEFAULT 0)`,
-        `CREATE TABLE IF NOT EXISTS cms_users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS cms_users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL, email TEXT, email_verified INTEGER NOT NULL DEFAULT 0)`,
+        // 13 Nov 2026 (v83): kode OTP verifikasi email — hanya hash yang
+        // disimpan, satu kode aktif per email (INSERT OR REPLACE).
+        `CREATE TABLE IF NOT EXISTS cms_otp_codes (email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS cms_comment_votes (comment_id INTEGER NOT NULL, user_key TEXT NOT NULL, vote INTEGER NOT NULL, PRIMARY KEY (comment_id, user_key))`,
         `CREATE TABLE IF NOT EXISTS cms_view_events (id INTEGER PRIMARY KEY AUTOINCREMENT, post_id TEXT NOT NULL, viewed_at TEXT NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS cms_loadtest_runs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, vu INTEGER NOT NULL DEFAULT 0, duration_s INTEGER NOT NULL DEFAULT 0, p95_ms REAL NOT NULL DEFAULT 0, failed_rate REAL NOT NULL DEFAULT 0, passed INTEGER NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '')`,
@@ -77,7 +80,15 @@ export async function ensureSchema(env) {
       const cHave = new Set((cInfo.results || []).map(r => r.name));
       if (!cHave.has('parent_id')) alters.push(env.DB.prepare(`ALTER TABLE cms_comments ADD COLUMN parent_id INTEGER`));
       if (!cHave.has('pinned')) alters.push(env.DB.prepare(`ALTER TABLE cms_comments ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`));
+      // 13 Nov 2026 (v83): kolom email + flag verifikasi di cms_users.
+      const uInfo = await env.DB.prepare(`PRAGMA table_info(cms_users)`).all();
+      const uHave = new Set((uInfo.results || []).map(r => r.name));
+      if (!uHave.has('email')) alters.push(env.DB.prepare(`ALTER TABLE cms_users ADD COLUMN email TEXT`));
+      if (!uHave.has('email_verified')) alters.push(env.DB.prepare(`ALTER TABLE cms_users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0`));
       if (alters.length) await env.DB.batch(alters);
+      // Akun lama (tanpa email) dianggap terverifikasi — jangan kunci mereka
+      // keluar. Idempotent: hanya baris tanpa email yang disentuh.
+      await env.DB.prepare(`UPDATE cms_users SET email_verified = 1 WHERE email IS NULL`).run();
       await env.DB.batch([
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('site_title', 'WorkerCMS')`),
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('theme', 'terang')`),

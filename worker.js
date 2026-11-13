@@ -29,6 +29,7 @@ import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientI
 import { renderMarkdown } from './markdown.js';
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie, isValidCommenterPassword, COMMENTER_PASSWORD_MIN, COMMENTER_PASSWORD_MAX } from './auth.js';
 import { checkRateLimit } from './security.js';
+import { validEmail, issueOtp, verifyOtp, OTP_SEND_LIMIT, OTP_SEND_WINDOW_MS } from './otp.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
 import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, STOPWATCH_EVENTS, nextEventMs, readingTrackerScript, HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
 import { ensureSchema, getSetting, getAllSettings, getEnabledPlugins, doBackup, renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
@@ -2467,7 +2468,7 @@ requestAnimationFrame(draw);
       // di tengah, tab Login / Daftar (bukan dua kartu besar bertumpuk),
       // teks penjelasan dipersingkat jadi satu baris, checkbox Ingat saya
       // sebaris dengan labelnya (bukan melayang sendiri seperti sebelumnya).
-      const content = `${pesan}<div class="card" style="max-width:440px;margin:0 auto"><div style="display:flex;gap:8px;margin-bottom:16px"><button type="button" id="tabLoginBtn" style="flex:1">Login</button><button type="button" id="tabDaftarBtn" style="flex:1;background:transparent;border:1px solid;color:inherit">Daftar</button></div><div id="loginForm"><h2 style="margin-top:0">Login</h2><form method="post" action="/akun/login"><label>Nama pengguna / email</label><input name="username" maxlength="64" required><label>Password</label><input type="password" name="password" required><label class="remember"><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini</label><button type="submit" style="width:100%">Masuk</button></form><p style="text-align:center"><button type="button" id="toDaftarLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Belum punya akun? Daftar</button></p></div><div id="daftarForm" style="display:none"><h2 style="margin-top:0">Buat Akun</h2><p class="meta" style="text-transform:none;letter-spacing:0">Akun hanya untuk berkomentar dan like/dislike, bukan akun admin.</p><form method="post" action="/akun/daftar"><label>Nama pengguna</label><input name="username" maxlength="20" placeholder="huruf kecil, angka, _ , 3–20 karakter" required><label>Password (8–128 karakter)</label><input type="password" name="password" maxlength="128" required><button type="submit" style="width:100%">Daftar</button></form><p style="text-align:center"><button type="button" id="toLoginLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Sudah punya akun? Login</button></p></div><script>(function(){var lb=document.getElementById('tabLoginBtn'),db=document.getElementById('tabDaftarBtn'),lf=document.getElementById('loginForm'),df=document.getElementById('daftarForm');function showLogin(){lf.style.display='block';df.style.display='none';lb.style.background='';lb.style.border='';lb.style.color='';db.style.background='transparent';db.style.border='1px solid';db.style.color='inherit'}function showDaftar(){lf.style.display='none';df.style.display='block';db.style.background='';db.style.border='';db.style.color='';lb.style.background='transparent';lb.style.border='1px solid';lb.style.color='inherit'}lb.onclick=showLogin;db.onclick=showDaftar;document.getElementById('toDaftarLink').onclick=showDaftar;document.getElementById('toLoginLink').onclick=showLogin;})();<\/script><noscript><style>#daftarForm{display:block!important}</style></noscript></div>`;
+      const content = `${pesan}<div class="card" style="max-width:440px;margin:0 auto"><div style="display:flex;gap:8px;margin-bottom:16px"><button type="button" id="tabLoginBtn" style="flex:1">Login</button><button type="button" id="tabDaftarBtn" style="flex:1;background:transparent;border:1px solid;color:inherit">Daftar</button></div><div id="loginForm"><h2 style="margin-top:0">Login</h2><form method="post" action="/akun/login"><label>Nama pengguna / email</label><input name="username" maxlength="64" required><label>Password</label><input type="password" name="password" required><label class="remember"><input type="checkbox" name="remember" value="1"> Ingat saya di perangkat ini</label><button type="submit" style="width:100%">Masuk</button></form><p style="text-align:center"><button type="button" id="toDaftarLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Belum punya akun? Daftar</button></p></div><div id="daftarForm" style="display:none"><h2 style="margin-top:0">Buat Akun</h2><p class="meta" style="text-transform:none;letter-spacing:0">Akun hanya untuk berkomentar dan like/dislike, bukan akun admin.</p><form method="post" action="/akun/daftar"><label>Nama pengguna</label><input name="username" maxlength="20" placeholder="huruf kecil, angka, _ , 3–20 karakter" required><label>Email (untuk kode verifikasi)</label><input type="email" name="email" maxlength="128" placeholder="nama@email.com" required><label>Password (8–128 karakter)</label><input type="password" name="password" maxlength="128" required><button type="submit" style="width:100%">Daftar</button></form><p style="text-align:center"><button type="button" id="toLoginLink" style="background:none;border:0;color:inherit;text-decoration:underline;padding:0;font-weight:400">Sudah punya akun? Login</button></p></div><script>(function(){var lb=document.getElementById('tabLoginBtn'),db=document.getElementById('tabDaftarBtn'),lf=document.getElementById('loginForm'),df=document.getElementById('daftarForm');function showLogin(){lf.style.display='block';df.style.display='none';lb.style.background='';lb.style.border='';lb.style.color='';db.style.background='transparent';db.style.border='1px solid';db.style.color='inherit'}function showDaftar(){lf.style.display='none';df.style.display='block';db.style.background='';db.style.border='';db.style.color='';lb.style.background='transparent';lb.style.border='1px solid';lb.style.color='inherit'}lb.onclick=showLogin;db.onclick=showDaftar;document.getElementById('toDaftarLink').onclick=showDaftar;document.getElementById('toLoginLink').onclick=showLogin;})();<\/script><noscript><style>#daftarForm{display:block!important}</style></noscript></div>`;
       return html(await renderPage(env, 'Akun', content));
     }
     if (path === '/akun/daftar' && request.method === 'POST') {
@@ -2488,20 +2489,87 @@ requestAnimationFrame(draw);
       // akun komentator yang menyamar jadi admin. Pesan disamakan dengan
       // nama sudah dipakai, supaya tidak bocor mana nama yang dicadangkan.
       if (username === 'admin') {
-        return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna sudah dipakai.</p><p><a href="/akun">Kembali</a></p></div>'), 409);
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau email sudah dipakai.</p><p><a href="/akun">Kembali</a></p></div>'), 409);
       }
-      const clash = await env.DB.prepare(`SELECT id FROM cms_users WHERE username = ?`).bind(username).first();
+      // (v83) Email wajib untuk verifikasi OTP. Pesan bentrok disamakan
+      // untuk nama dan email, supaya tidak bocor mana yang sudah terdaftar.
+      const email = String(form.get('email') || '').trim().toLowerCase();
+      if (!validEmail(email) || email === ADMIN_EMAIL) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Email tidak valid.</p><p><a href="/akun">Kembali</a></p></div>'), 400);
+      }
+      const clash = await env.DB.prepare(`SELECT id FROM cms_users WHERE username = ?`).bind(username).first()
+        || await env.DB.prepare(`SELECT id FROM cms_users WHERE email = ?`).bind(email).first();
       if (clash) {
-        return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna sudah dipakai.</p><p><a href="/akun">Kembali</a></p></div>'), 409);
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau email sudah dipakai.</p><p><a href="/akun">Kembali</a></p></div>'), 409);
       }
       const salt = randomHex(16);
       const hash = await hashPassword(password, salt);
       const id = 'u-' + Date.now().toString(36);
-      await env.DB.prepare(`INSERT INTO cms_users (id, username, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)`).bind(id, username, hash, salt, new Date().toISOString()).run();
-      const cookie = await userSessionCookie(env, id);
+      await env.DB.prepare(`INSERT INTO cms_users (id, username, password_hash, salt, created_at, email, email_verified) VALUES (?, ?, ?, ?, ?, ?, 0)`).bind(id, username, hash, salt, new Date().toISOString(), email).run();
+      // (v83) Akun dibuat belum aktif — kode OTP dikirim dulu, sesi baru
+      // diberikan setelah kode diverifikasi. Gagal kirim = jujur gagal,
+      // bukan pura-pura terkirim.
+      if (!(await checkRateLimit(env, 'otp:' + email, OTP_SEND_LIMIT, OTP_SEND_WINDOW_MS))) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Terlalu banyak kode dikirim ke email ini. Coba lagi satu jam lagi.</p><p><a href="/akun/verifikasi?email=' + encodeURIComponent(email) + '">Ke halaman verifikasi</a></p></div>'), 429);
+      }
+      const issued = await issueOtp(env, email);
+      if (!issued.ok) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Akun kamu sudah dibuat, tapi kode verifikasi gagal dikirim (layanan email belum siap). Coba kirim ulang dari halaman verifikasi.</p><p><a href="/akun/verifikasi?email=' + encodeURIComponent(email) + '">Ke halaman verifikasi</a></p></div>'), 502);
+      }
+      return redirect('/akun/verifikasi?email=' + encodeURIComponent(email));
+    }
+    // ---- Verifikasi OTP email (v83) ----
+    if (path === '/akun/verifikasi' && request.method === 'GET') {
+      const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
+      const pesan = url.searchParams.get('pesan') || '';
+      const note = pesan === 'terkirim' ? '<div class="card"><p>Kode baru dikirim ke email kamu (bila email terdaftar).</p></div>'
+        : pesan === 'salah' ? '<div class="card"><p>Kode salah atau sudah kedaluwarsa. Coba lagi, atau minta kode baru di bawah.</p></div>'
+        : pesan === 'limit' ? '<div class="card"><p>Terlalu banyak kode dikirim. Coba lagi satu jam lagi.</p></div>'
+        : pesan === 'gagal' ? '<div class="card"><p>Kode gagal dikirim (layanan email belum siap). Coba lagi nanti.</p></div>' : '';
+      const user = email ? await env.DB.prepare(`SELECT * FROM cms_users WHERE email = ?`).bind(email).first() : null;
+      const csrf = user ? `<input type="hidden" name="csrf" value="${await userCsrf(env, user.id)}">` : '';
+      const content = `${note}<div class="card" style="max-width:440px;margin:0 auto"><h2 style="margin-top:0">Verifikasi Email</h2><p class="meta" style="text-transform:none;letter-spacing:0">Kami mengirim kode 6 digit ke <b>${esc(email) || 'email kamu'}</b>. Kode berlaku 10 menit.</p><form method="post" action="/akun/verifikasi">${csrf}<input type="hidden" name="email" value="${esc(email)}"><label>Kode verifikasi (6 digit)</label><input name="code" inputmode="numeric" maxlength="6" required><button type="submit" style="width:100%">Verifikasi</button></form><form method="post" action="/akun/verifikasi/kirim-ulang" style="margin-top:12px">${csrf}<input type="hidden" name="email" value="${esc(email)}"><button type="submit" style="width:100%;background:transparent;border:1px solid;color:inherit">Kirim ulang kode</button></form><p style="text-align:center"><a href="/akun">Kembali ke Login / Daftar</a></p></div>`;
+      return html(await renderPage(env, 'Akun', content));
+    }
+    if (path === '/akun/verifikasi' && request.method === 'POST') {
+      const ip = clientIp(request);
+      if (!(await checkRateLimit(env, 'otp-verify:' + ip, 10, 15 * 60 * 1000))) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Terlalu banyak percobaan. Coba lagi 15 menit.</p></div>'), 429);
+      }
+      const form = await request.formData();
+      const email = String(form.get('email') || '').trim().toLowerCase();
+      const code = String(form.get('code') || '').trim();
+      const user = email ? await env.DB.prepare(`SELECT * FROM cms_users WHERE email = ?`).bind(email).first() : null;
+      if (user && String(form.get('csrf') || '') !== await userCsrf(env, user.id)) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Token CSRF tidak valid.</p></div>'), 403);
+      }
+      const ok = user && (await verifyOtp(env, email, code)).ok;
+      if (!ok) return redirect('/akun/verifikasi?email=' + encodeURIComponent(email) + '&pesan=salah');
+      await env.DB.prepare(`UPDATE cms_users SET email_verified = 1 WHERE email = ?`).bind(email).run();
+      const cookie = await userSessionCookie(env, user.id);
       const headers = new Headers({ location: '/' });
       headers.append('set-cookie', cookie);
       return new Response(null, { status: 303, headers });
+    }
+    if (path === '/akun/verifikasi/kirim-ulang' && request.method === 'POST') {
+      const form = await request.formData();
+      const email = String(form.get('email') || '').trim().toLowerCase();
+      const user = email ? await env.DB.prepare(`SELECT * FROM cms_users WHERE email = ?`).bind(email).first() : null;
+      if (user) {
+        if (String(form.get('csrf') || '') !== await userCsrf(env, user.id)) {
+          return html(await renderPage(env, 'Akun', '<div class="card"><p>Token CSRF tidak valid.</p></div>'), 403);
+        }
+        if (Number(user.email_verified) === 1) return redirect('/akun');
+        if (!(await checkRateLimit(env, 'otp:' + email, OTP_SEND_LIMIT, OTP_SEND_WINDOW_MS))) {
+          return redirect('/akun/verifikasi?email=' + encodeURIComponent(email) + '&pesan=limit');
+        }
+        const issued = await issueOtp(env, email);
+        if (!issued.ok) {
+          return redirect('/akun/verifikasi?email=' + encodeURIComponent(email) + '&pesan=gagal');
+        }
+      }
+      // Pesan sama walau email tidak terdaftar — jangan bocorkan.
+      return redirect('/akun/verifikasi?email=' + encodeURIComponent(email) + '&pesan=terkirim');
     }
     if (path === '/akun/login' && request.method === 'POST') {
       const ip = clientIp(request);
@@ -2548,6 +2616,11 @@ requestAnimationFrame(draw);
       const ok = user && await verifyPassword(password, user.salt, user.password_hash);
       if (!ok) {
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
+      }
+      // (v83) Akun belum verifikasi email tidak boleh login. Akun lama
+      // tanpa email sudah di-grandfather (email_verified=1 di migrasi).
+      if (Number(user.email_verified) === 0) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Akun ini belum diverifikasi. Cek email kamu untuk kode verifikasi, atau <a href="/akun/verifikasi?email=' + encodeURIComponent(user.email || '') + '">minta kode baru</a>.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
       }
       const cookie = await userSessionCookie(env, user.id);
       const headers = new Headers({ location: '/' });

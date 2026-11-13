@@ -28,6 +28,7 @@ class MockDB {
   constructor() {
     this.posts = []; this.comments = []; this.settings = new Map(); this.plugins = new Map(); this.commentSeq = 0; this.attempts = []; this.backupRuns = []; this.refreshTokens = []; this.viewEvents = [];
     this.users = new Map(); this.votes = []; this.rateLimits = new Map(); this.loadtestRuns = [];
+    this.otpCodes = new Map(); // v83: kode OTP per email
     this.readingSessions = []; this.readingHours = []; this.eternalStopwatch = null;
     this.dracinKeys = []; this.dracinCatalog = []; this.dracinEpisodes = []; this.dracinSeeds = []; this.dracinUsage = [];
     this.viewEventSeq = 0; this.attemptSeq = 0;
@@ -79,6 +80,8 @@ class MockDB {
     if (s.startsWith('CREATE INDEX')) return [];
     if (s.startsWith('PRAGMA table_info(cms_posts)')) return [{ name: 'id' }, { name: 'slug' }, { name: 'title' }, { name: 'body' }, { name: 'category' }, { name: 'status' }, { name: 'created_at' }, { name: 'updated_at' }, { name: 'body_mode' }, { name: 'visibility' }, { name: 'publish_at' }, { name: 'post_password_hash' }, { name: 'post_password_salt' }, { name: 'views' }, { name: 'tags' }];
     if (s.startsWith('PRAGMA table_info(cms_comments)')) return [{ name: 'id' }, { name: 'post_id' }, { name: 'name' }, { name: 'text' }, { name: 'status' }, { name: 'created_at' }, { name: 'parent_id' }];
+    // v83: kolom email/email_verified BELUM ada di mock — jalur migrasi ALTER teruji.
+    if (s.startsWith('PRAGMA table_info(cms_users)')) return [{ name: 'id' }, { name: 'username' }, { name: 'password_hash' }, { name: 'salt' }, { name: 'created_at' }];
     if (s.startsWith('ALTER TABLE')) return [];
     if (s.startsWith('INSERT OR IGNORE INTO cms_settings')) {
       // SQL worker memakai kunci literal di VALUES, bukan bind: ('theme', 'terang')
@@ -99,7 +102,16 @@ class MockDB {
       return [];
     }
     if (s.startsWith('INSERT INTO cms_comments')) { this.comments.push({ id: ++this.commentSeq, post_id: a[0], name: a[1], text: a[2], status: a[3], created_at: a[4], parent_id: a[5] || null }); return []; }
-    if (s.startsWith('INSERT INTO cms_users')) { this.users.set(a[0], { id: a[0], username: a[1], password_hash: a[2], salt: a[3], created_at: a[4] }); return []; }
+    if (s.startsWith('INSERT INTO cms_users')) { this.users.set(a[0], { id: a[0], username: a[1], password_hash: a[2], salt: a[3], created_at: a[4], email: a[5] ?? null, email_verified: a[6] ?? 0 }); return []; }
+    if (s.startsWith('SELECT * FROM cms_users WHERE email')) return [...this.users.values()].filter(u => u.email === a[0]);
+    if (s.startsWith('SELECT id FROM cms_users WHERE email')) return [...this.users.values()].filter(u => u.email === a[0]).map(u => ({ id: u.id }));
+    if (s === 'UPDATE cms_users SET email_verified = 1 WHERE email IS NULL') { for (const u of this.users.values()) if (!u.email) u.email_verified = 1; return []; }
+    if (s.startsWith('UPDATE cms_users SET email_verified = 1 WHERE email = ?')) { for (const u of this.users.values()) if (u.email === a[0]) u.email_verified = 1; return []; }
+    // v83: tabel kode OTP (satu kode aktif per email).
+    if (s.startsWith('INSERT OR REPLACE INTO cms_otp_codes')) { this.otpCodes.set(a[0], { email: a[0], code_hash: a[1], expires_at: a[2], attempts: 0, created_at: a[3] }); return []; }
+    if (s.startsWith('SELECT * FROM cms_otp_codes WHERE email')) return this.otpCodes.has(a[0]) ? [this.otpCodes.get(a[0])] : [];
+    if (s.startsWith('UPDATE cms_otp_codes SET attempts = attempts + 1 WHERE email')) { const row = this.otpCodes.get(a[0]); if (row) row.attempts = Number(row.attempts) + 1; return []; }
+    if (s.startsWith('DELETE FROM cms_otp_codes WHERE email')) { this.otpCodes.delete(a[0]); return []; }
     if (s.startsWith('SELECT * FROM cms_users WHERE username')) return [...this.users.values()].filter(u => u.username === a[0]);
     if (s.startsWith('SELECT id FROM cms_users WHERE username')) return [...this.users.values()].filter(u => u.username === a[0]).map(u => ({ id: u.id }));
     if (s.startsWith('SELECT id, slug, visibility, publish_at FROM cms_posts WHERE slug')) return this.posts.filter(p => p.slug === a[0]).map(p => ({ id: p.id, slug: p.slug, visibility: p.visibility, publish_at: p.publish_at }));
@@ -513,7 +525,18 @@ class MockDB {
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
-const env = { DB: new MockDB(), BACKUP_DB: new MockDB(), ADMIN_TOKEN: 'test-admin-token', CERPEN_PATH_KEY: '11'.repeat(32) };
+const env = { DB: new MockDB(), BACKUP_DB: new MockDB(), ADMIN_TOKEN: 'test-admin-token', CERPEN_PATH_KEY: '11'.repeat(32), RESEND_API_KEY: 're_test' };
+// v83: stub fetch untuk pengiriman OTP — hanya panggilan Resend yang dicegat,
+// sisanya diteruskan ke fetch asli supaya tes lain tidak berubah.
+const resendCalls = [];
+const realFetch0 = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  if (String(url).includes('api.resend.com')) {
+    resendCalls.push({ url: String(url), body: init && init.body ? JSON.parse(init.body) : null });
+    return { ok: true, status: 200, json: async () => ({ id: 're_test123' }), text: async () => '{}' };
+  }
+  return realFetch0(url, init);
+};
 const base = 'https://cms.test';
 async function call(method, path, body = null, cookie = '') {
   const headers = {};
@@ -534,6 +557,19 @@ assert(t.includes('id="copyr"') && t.includes('<a href="/uptime">Uptime</a>') &&
 // (salah -> 403 generik, benar -> token akses + refresh + dashboard super-admin)
 function cookiesOf(res) { const list = res.headers.getSetCookie ? res.headers.getSetCookie() : [(res.headers.get('set-cookie') || '')]; return list.map(c => c.split(';')[0]).filter(Boolean); }
 function cookieHeader(list) { return list.join('; '); }
+// v83: helper verifikasi OTP — kode dibaca dari email yang ditangkap stub.
+function kodeTerakhir() {
+  const last = resendCalls[resendCalls.length - 1];
+  const m = last && last.body && last.body.html ? last.body.html.match(/(\d{6})/) : null;
+  return m ? m[1] : '';
+}
+async function verifikasiKode(email) {
+  const t = await call('GET', '/akun/verifikasi?email=' + encodeURIComponent(email));
+  const vcsrf = ((await t.text()).match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+  const r = await call('POST', '/akun/verifikasi', { email, code: kodeTerakhir(), csrf: vcsrf });
+  assert(r.status === 303, 'otp: kode benar mengaktifkan akun ' + email);
+  return cookieHeader(cookiesOf(r));
+}
 r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'salah' }); assert(r.status === 403, 'login admin salah ditolak (pesan generik)');
 // v74: login gagal tercatat di security_events (sumber globe /uptime)
 const secBefore = env.DB.securityEvents.length;
@@ -574,8 +610,8 @@ r = await call('GET', '/'); t = await r.text(); assert(t.includes('Post Uji'), '
 // (tidak tampil), admin setujui -> tampil
 r = await call('POST', '/post/post-uji/comment', { text: 'Komentar anonim' }); assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'komentar tanpa akun dialihkan ke /akun');
 assert(!env.DB.comments.some(c => c.text === 'Komentar anonim'), 'komentar anonim tidak tersimpan');
-r = await call('POST', '/akun/daftar', { username: 'budi', password: 'password123' }); assert(r.status === 303, 'daftar akun komentator redirect');
-let userCookie = cookieHeader(cookiesOf(r));
+r = await call('POST', '/akun/daftar', { username: 'budi', password: 'password123', email: 'budi@example.com' }); assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun/verifikasi'), 'daftar akun komentator redirect ke verifikasi');
+let userCookie = await verifikasiKode('budi@example.com');
 assert(userCookie.includes('cms_user='), 'daftar memberi sesi komentator');
 r = await call('GET', '/post/post-uji', null, userCookie); t = await r.text();
 const userCsrf = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
@@ -1110,15 +1146,18 @@ env.DB.rateLimits = new Map();
 // 31. Batas panjang password komentator 8–128 (B2)
 env.DB.rateLimits = new Map();
 r = await call('POST', '/akun/daftar', { username: 'pw7', password: '1234567' }); assert(r.status === 400, 'password: 7 karakter ditolak 400');
-r = await call('POST', '/akun/daftar', { username: 'pw8', password: '12345678' }); assert(r.status === 303, 'password: 8 karakter lolos');
-r = await call('POST', '/akun/daftar', { username: 'pw128', password: 'x'.repeat(128) }); assert(r.status === 303, 'password: 128 karakter lolos');
+r = await call('POST', '/akun/daftar', { username: 'pw8', password: '12345678', email: 'pw8@example.com' }); assert(r.status === 303, 'password: 8 karakter lolos');
+await verifikasiKode('pw8@example.com');
+r = await call('POST', '/akun/daftar', { username: 'pw128', password: 'x'.repeat(128), email: 'pw128@example.com' }); assert(r.status === 303, 'password: 128 karakter lolos');
+await verifikasiKode('pw128@example.com');
 r = await call('POST', '/akun/daftar', { username: 'pw129', password: 'x'.repeat(129) }); assert(r.status === 400, 'password: 129 karakter ditolak 400');
 assert(![...env.DB.users.values()].some(u => u.username === 'pw129'), 'password: 129 karakter tidak membuat akun');
 env.DB.rateLimits = new Map();
 r = await call('POST', '/akun/login', { username: 'pw8', password: 'x'.repeat(200) }); assert(r.status === 403, 'password: login 200 karakter ditolak 403 generik');
 r = await call('POST', '/akun/login', { username: 'pw8', password: '12345678' }); assert(r.status === 303, 'password: login benar tetap lolos setelah percobaan panjang');
 env.DB.rateLimits = new Map();
-r = await call('POST', '/akun/daftar', { username: 'pwspasi', password: '  rahasia123  ' }); assert(r.status === 303, 'password: spasi di awal/akhir diterima sebagai bagian password');
+r = await call('POST', '/akun/daftar', { username: 'pwspasi', password: '  rahasia123  ', email: 'pwspasi@example.com' }); assert(r.status === 303, 'password: spasi di awal/akhir diterima sebagai bagian password');
+await verifikasiKode('pwspasi@example.com');
 r = await call('POST', '/akun/login', { username: 'pwspasi', password: 'rahasia123' }); assert(r.status === 403, 'password: login dengan spasi di-trim ditolak (tidak di-trim)');
 r = await call('POST', '/akun/login', { username: 'pwspasi', password: '  rahasia123  ' }); assert(r.status === 303, 'password: login dengan spasi persis lolos');
 const savedToken = env.ADMIN_TOKEN;
@@ -1220,7 +1259,7 @@ env.DB.rateLimits = new Map();
 r = await callStream('POST', '/akun/daftar', 'username=stream1&password=' + 'y'.repeat(300000));
 assert(r.status === 413, 'body cap: POST 300 KB tanpa Content-Length ditolak 413');
 env.DB.rateLimits = new Map();
-r = await callStream('POST', '/akun/daftar', 'username=streamok&password=password123');
+r = await callStream('POST', '/akun/daftar', 'username=streamok&password=password123&email=streamok@example.com');
 assert(r.status === 303, 'body cap: POST kecil tanpa Content-Length tetap jalan (daftar lolos)');
 assert([...env.DB.users.values()].some(u => u.username === 'streamok'), 'body cap: akun dari body chunked tersimpan');
 // 36. Grace rantai multi-lompatan (B5): tiga request bersamaan dengan
@@ -1802,8 +1841,8 @@ assert(r.status === 200 && st1.totalSeconds === 180 && st1.totalMinutes === 3 &&
 assert(st1.topDay && st1.topDay.minutes === 3 && typeof st1.topDay.date === 'string', 'reading: hari tersering = hari ini, 3 menit');
 assert(st1.hourRange && typeof st1.hourRange.label === 'string' && st1.hourRange.label.includes(':'), 'reading: rentang jam terisi');
 env.DB.rateLimits = new Map();
-r = await call('POST', '/akun/daftar', { username: 'siti', password: 'password123' });
-const sitiCookie = cookieHeader(cookiesOf(r));
+r = await call('POST', '/akun/daftar', { username: 'siti', password: 'password123', email: 'siti@example.com' }); assert(r.status === 303, 'daftar siti redirect ke verifikasi');
+const sitiCookie = await verifikasiKode('siti@example.com');
 const budi = [...env.DB.users.values()].find(u => u.username === 'budi');
 r = await call('GET', '/api/reading/stats?user=' + budi.id, null, sitiCookie);
 assert(r.status === 403, 'reading: akun lain tidak boleh lihat statistik budi');
@@ -1830,4 +1869,86 @@ r = await call('GET', '/'); t = await r.text();
 assert(t.includes('Selamat datang!') && (r.headers.get('set-cookie') || '').includes('cms_fv=1'), 'first-visit: pengunjung baru dapat campuran + cookie cms_fv');
 r = await call('GET', '/', null, 'cms_fv=1'); t = await r.text();
 assert(!t.includes('Selamat datang!'), 'first-visit: pengunjung kembali dapat beranda normal');
+// 49. Verifikasi OTP email saat daftar (v83).
+env.DB.rateLimits = new Map();
+r = await call('GET', '/akun'); t = await r.text();
+assert(t.includes('name="email"') && t.includes('/akun/daftar'), 'otp: form daftar ada kolom email');
+r = await call('POST', '/akun/daftar', { username: 'tanpaemail', password: 'password123' }); assert(r.status === 400, 'otp: daftar tanpa email ditolak 400');
+r = await call('POST', '/akun/daftar', { username: 'emailjelek', password: 'password123', email: 'bukan-email' }); assert(r.status === 400, 'otp: email tidak valid ditolak 400');
+r = await call('POST', '/akun/daftar', { username: 'penyamar', password: 'password123', email: 'muchammadhozin@gmail.com' }); assert(r.status === 400, 'otp: email admin tidak bisa dipakai komentator');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/akun/daftar', { username: 'otpuser', password: 'password123', email: 'otpuser@example.com' });
+assert(r.status === 303 && (r.headers.get('location') || '') === '/akun/verifikasi?email=otpuser%40example.com', 'otp: daftar redirect ke halaman verifikasi');
+const otpRow = env.DB.otpCodes.get('otpuser@example.com');
+const kodeOtpUser = kodeTerakhir();
+assert(otpRow && otpRow.code_hash && otpRow.code_hash.length === 64 && otpRow.code_hash !== kodeOtpUser, 'otp: kode tersimpan sebagai hash SHA-256, bukan plaintext');
+assert(resendCalls[resendCalls.length - 1].body.to[0] === 'otpuser@example.com' && resendCalls[resendCalls.length - 1].body.subject.includes('verifikasi'), 'otp: email terkirim ke alamat pendaftar dengan subjek verifikasi');
+r = await call('POST', '/akun/login', { username: 'otpuser', password: 'password123' });
+assert(r.status === 403 && (await r.text()).includes('belum diverifikasi'), 'otp: login sebelum verifikasi ditolak');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/akun/daftar', { username: 'lainnama', password: 'password123', email: 'otpuser@example.com' });
+assert(r.status === 409 && (await r.text()).includes('Nama pengguna atau email sudah dipakai'), 'otp: email duplikat ditolak 409 dengan pesan gabungan');
+let vcsrf = '';
+{
+  const t2 = await call('GET', '/akun/verifikasi?email=otpuser%40example.com');
+  vcsrf = ((await t2.text()).match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+}
+assert(vcsrf.length > 10, 'otp: halaman verifikasi memberi token CSRF');
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 5; i++) {
+  r = await call('POST', '/akun/verifikasi', { email: 'otpuser@example.com', code: '000000', csrf: vcsrf });
+  assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=salah'), 'otp: kode salah ditolak (' + (i + 1) + '/5)');
+}
+r = await call('POST', '/akun/verifikasi', { email: 'otpuser@example.com', code: kodeOtpUser, csrf: vcsrf });
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=salah'), 'otp: kode benar setelah 5x salah tetap ditolak (kode hangus)');
+for (let i = 0; i < 3; i++) {
+  r = await call('POST', '/akun/verifikasi/kirim-ulang', { email: 'otpuser@example.com', csrf: vcsrf });
+  assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=terkirim'), 'otp: kirim ulang ke-' + (i + 1) + ' lolos');
+}
+r = await call('POST', '/akun/verifikasi/kirim-ulang', { email: 'otpuser@example.com', csrf: vcsrf });
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=limit'), 'otp: kirim ulang ke-4 kena limit 3/jam');
+r = await call('POST', '/akun/verifikasi', { email: 'otpuser@example.com', code: kodeTerakhir(), csrf: vcsrf });
+assert(r.status === 303 && !(r.headers.get('location') || '').includes('pesan=salah'), 'otp: kode baru dari kirim ulang berhasil');
+const otpCookie = cookieHeader(cookiesOf(r));
+assert(otpCookie.includes('cms_user='), 'otp: verifikasi memberi sesi komentator');
+const otpUser = [...env.DB.users.values()].find(u => u.username === 'otpuser');
+assert(otpUser && Number(otpUser.email_verified) === 1, 'otp: akun aktif setelah verifikasi');
+r = await call('POST', '/akun/login', { username: 'otpuser', password: 'password123' });
+assert(r.status === 303, 'otp: login setelah verifikasi lolos');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/akun/daftar', { username: 'kadaluarsa', password: 'password123', email: 'kadaluarsa@example.com' });
+assert(r.status === 303, 'otp: daftar akun kadaluarsa redirect');
+env.DB.otpCodes.get('kadaluarsa@example.com').expires_at = Date.now() - 1000;
+{
+  const t2 = await call('GET', '/akun/verifikasi?email=kadaluarsa%40example.com');
+  vcsrf = ((await t2.text()).match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+}
+r = await call('POST', '/akun/verifikasi', { email: 'kadaluarsa@example.com', code: kodeTerakhir(), csrf: vcsrf });
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=salah'), 'otp: kode kedaluwarsa ditolak');
+const savedKey = env.RESEND_API_KEY; env.RESEND_API_KEY = '';
+env.DB.rateLimits = new Map();
+r = await call('POST', '/akun/daftar', { username: 'gagalkirim', password: 'password123', email: 'gagalkirim@example.com' });
+assert(r.status === 502 && (await r.text()).includes('gagal dikirim'), 'otp: tanpa kunci email, daftar gagal jujur (502), bukan pura-pura terkirim');
+assert(!env.DB.otpCodes.has('gagalkirim@example.com'), 'otp: kode gagal kirim tidak tersimpan');
+env.RESEND_API_KEY = savedKey;
+env.DB.rateLimits = new Map();
+{
+  const t2 = await call('GET', '/akun/verifikasi?email=gagalkirim%40example.com');
+  vcsrf = ((await t2.text()).match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+}
+r = await call('POST', '/akun/verifikasi/kirim-ulang', { email: 'gagalkirim@example.com', csrf: vcsrf });
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=terkirim'), 'otp: kirim ulang setelah kunci dipulihkan lolos');
+await verifikasiKode('gagalkirim@example.com');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/akun/daftar', { username: 'kakek', password: 'password123', email: 'kakek@example.com' });
+await verifikasiKode('kakek@example.com');
+const kakek = [...env.DB.users.values()].find(u => u.username === 'kakek');
+kakek.email = null; kakek.email_verified = 0; // simulasikan akun pra-v83
+await env.DB.prepare(`UPDATE cms_users SET email_verified = 1 WHERE email IS NULL`).run();
+assert(kakek.email_verified === 1, 'otp: migrasi grandfather akun lama tanpa email');
+r = await call('POST', '/akun/login', { username: 'kakek', password: 'password123' });
+assert(r.status === 303, 'otp: akun lama (grandfathered) tetap bisa login');
+env.DB.rateLimits = new Map();
+r = await call('POST', '/akun/verifikasi', { email: 'tidakada@example.com', code: '123456', csrf: 'x' });
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=salah'), 'otp: verifikasi email tak terdaftar tetap pesan generik');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
