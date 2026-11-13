@@ -2791,7 +2791,7 @@ document.querySelectorAll('[data-cerpen-aa]').forEach(function (btn) {
   btn.addEventListener('click', async function () {
     const id = btn.dataset.cerpenAa;
     const cur = btn.dataset.mode || 'off';
-    const mode = prompt('Mode auto-approve untuk key ' + id + ' (saat ini: ' + cur + '):\n- off = mati\n- always = selalu setujui\n- 1d = 1 hari\n- 1w = 1 minggu\n- 1mo = 1 bulan\n- until = manual (pakai tanggal)', cur);
+    const mode = prompt('Mode auto-approve untuk key ' + id + ' (saat ini: ' + cur + '):\\n- off = mati\\n- always = selalu setujui\\n- 1d = 1 hari\\n- 1w = 1 minggu\\n- 1mo = 1 bulan\\n- until = manual (pakai tanggal)', cur);
     if (mode === null) return;
     const m = mode.trim().toLowerCase();
     if (['off', 'always', '1d', '1w', '1mo', 'until'].indexOf(m) === -1) { cerpenShowMsg('Mode tidak valid (off/always/1d/1w/1mo/until).', false); return; }

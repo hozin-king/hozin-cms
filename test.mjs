@@ -1,6 +1,7 @@
 // Uji WorkerCMS tanpa Cloudflare: mock D1 sederhana untuk pola SQL yang dipakai worker.js.
 // Jalankan: node test.mjs  (harus keluar semua OK (kini 18+ cek, termasuk CSRF & rate-limit))
 import worker from './worker.js';
+import vm from 'node:vm';
 import { themes } from './themes.js';
 import { renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
 import { parseTags, tagSlug, sanitizeHtml, sha256Hex } from './util.js';
@@ -1494,6 +1495,16 @@ r = await call('GET', '/kendali/cerpen-api'); assert(r.status === 303 && (r.head
 r = await call('GET', '/kendali/cerpen-api', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('Cerpen API') && t.includes('Cerpen Uji Pending') && t.includes('key-be663fc2') && t.includes('Riwayat admin'), 'cerpen-admin: halaman panel tampil (statistik + keys + submissions + audit)');
 assert(t.includes('href="/kendali/cerpen-api"'), 'cerpen-admin: panel masuk nav admin');
+// Regresi v83.2 (13 Nov 2026): skrip inline panel harus valid. '\n' di dalam
+// string kutip-tunggal pada prompt auto-approve (v68) dievaluasi template
+// literal menjadi newline literal -> SyntaxError -> SELURUH blok skrip mati
+// (tombol Detail tidak bereaksi sama sekali). Cek parse semua blok <script>.
+for (const p83 of ['/kendali/cerpen-api', '/kendali/md-backup']) {
+  const rr83 = await call('GET', p83, null, cookie); const hh83 = await rr83.text();
+  const blocks83 = [...hh83.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+  assert(blocks83.length > 0, 'skrip-inline: halaman ' + p83 + ' punya blok <script>');
+  for (const b83 of blocks83) { let ok83 = true; try { new vm.Script(b83); } catch (e) { ok83 = false; } assert(ok83, 'skrip-inline: blok <script> di ' + p83 + ' lolos parse'); }
+}
 // 40. Share link Cerpen (v67, 12 Nov 2026): assetlinks + token AES-GCM +
 // landing + resolve + admin revoke/unrevoke + rate limit.
 r = await call('GET', '/.well-known/assetlinks.json'); t = await r.text();
