@@ -1883,6 +1883,12 @@ const otpRow = env.DB.otpCodes.get('otpuser@example.com');
 const kodeOtpUser = kodeTerakhir();
 assert(otpRow && otpRow.code_hash && otpRow.code_hash.length === 64 && otpRow.code_hash !== kodeOtpUser, 'otp: kode tersimpan sebagai hash SHA-256, bukan plaintext');
 assert(resendCalls[resendCalls.length - 1].body.to[0] === 'otpuser@example.com' && resendCalls[resendCalls.length - 1].body.subject.includes('verifikasi'), 'otp: email terkirim ke alamat pendaftar dengan subjek verifikasi');
+// v83.1: email OTP HTML bermerek + fallback teks.
+const otpMail = resendCalls[resendCalls.length - 1].body;
+assert(otpMail.html && otpMail.html.includes('Hozin King') && otpMail.html.includes(kodeOtpUser) && otpMail.html.includes('10 menit') && otpMail.html.includes('Jangan bagikan'), 'otp v83.1: email HTML bermerek memuat kode + masa berlaku + peringatan');
+assert(otpMail.html.includes('font-size:42px') && otpMail.html.includes('text-align:center'), 'otp v83.1: kode tampil besar di tengah');
+assert(otpMail.text && otpMail.text.includes(kodeOtpUser) && otpMail.text.includes('10 menit'), 'otp v83.1: fallback teks polos tetap ada dan memuat kode');
+assert(!/<img|https?:\/\//.test(otpMail.html), 'otp v83.1: HTML tanpa gambar eksternal / tautan luar');
 r = await call('POST', '/akun/login', { username: 'otpuser', password: 'password123' });
 assert(r.status === 403 && (await r.text()).includes('belum diverifikasi'), 'otp: login sebelum verifikasi ditolak');
 env.DB.rateLimits = new Map();

@@ -44,7 +44,7 @@ export async function sendOtpEmail(env, email, code) {
         from,
         to: [email],
         subject: 'Kode verifikasi akun hozinking.my.id',
-        html: `<p>Kode verifikasi akun <b>hozinking.my.id</b> kamu:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p><p>Kode berlaku 10 menit. Jangan bagikan kode ini ke siapa pun.</p>`,
+        html: otpEmailHtml(code),
         text: `Kode verifikasi akun hozinking.my.id kamu: ${code}. Kode berlaku 10 menit. Jangan bagikan kode ini ke siapa pun.`,
       }),
       signal: AbortSignal.timeout(10000),
@@ -54,6 +54,14 @@ export async function sendOtpEmail(env, email, code) {
   } catch {
     return { ok: false, error: 'email_send_failed' };
   }
+}
+
+// v83.1: HTML email OTP bermerek — teks saja, tanpa gambar eksternal
+// (tanpa tracking pixel, tanpa tautan luar), CSS inline. Kode tetap 6 digit
+// berurutan dan tidak ada angka 6 digit lain di body supaya mudah dibaca
+// dan disalin; email/username tidak ditampilkan di email.
+export function otpEmailHtml(code) {
+  return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kode verifikasi akun hozinking.my.id</title></head><body style="margin:0;padding:0;background-color:#f4f4f5;font-family:Arial,Helvetica,sans-serif;color:#1f2937"><div style="max-width:480px;margin:0 auto;padding:24px 16px"><div style="text-align:center;padding:8px 0 16px"><div style="font-size:22px;font-weight:700;color:#0f766e">Hozin King</div><div style="font-size:13px;color:#6b7280">hozinking.my.id</div></div><div style="background-color:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:28px 20px;text-align:center"><p style="margin:0 0 8px;font-size:15px">Kode verifikasi akun kamu:</p><div style="font-size:42px;font-weight:700;letter-spacing:8px;color:#0f766e;padding:12px 0">${code}</div><p style="margin:8px 0 0;font-size:13px;color:#6b7280">Kode berlaku 10 menit.</p><p style="margin:4px 0 0;font-size:13px;color:#6b7280">Jangan bagikan kode ini ke siapa pun.</p></div><p style="text-align:center;font-size:12px;color:#9ca3af;margin:16px 0 0">Email ini dikirim otomatis oleh hozinking.my.id. Bila kamu tidak mendaftar, abaikan saja.</p></div></body></html>`;
 }
 
 // Buat (atau ganti) kode untuk email lalu kirim. Satu kode aktif per email.
