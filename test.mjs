@@ -1968,4 +1968,56 @@ assert(r.status === 303, 'otp: akun lama (grandfathered) tetap bisa login');
 env.DB.rateLimits = new Map();
 r = await call('POST', '/akun/verifikasi', { email: 'tidakada@example.com', code: '123456', csrf: 'x' });
 assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=salah'), 'otp: verifikasi email tak terdaftar tetap pesan generik');
+// v84: endpoint versi + APK Hozin FB Manager (repo privat, via Worker).
+// Stub fetch GitHub: rilis terbaru v1.0.99 (code 99) + daftar tag + build.gradle.
+const ghCalls = [];
+const fetchBeforeFbm = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  const u = String(url);
+  if (u.includes('api.github.com')) {
+    ghCalls.push(u);
+    const auth = (init && init.headers && (init.headers.authorization || init.headers.Authorization)) || '';
+    if (!String(auth).startsWith('Bearer ghp_test')) {
+      return { ok: false, status: 401, json: async () => ({}), text: async () => '{}' };
+    }
+    if (u.includes('/releases/latest')) {
+      return { ok: true, status: 200, json: async () => ({ tag_name: 'v1.0.99', body: 'Catatan rilis uji', assets: [{ name: 'HozinFBManager-1.0.99.apk', size: 6294999, browser_download_url: 'https://api.github.com/repos/hozin-king/fb-account-manager/releases/assets/1' }, { name: 'Source code (zip)', size: 100, browser_download_url: 'https://example.com/src.zip' }] }), text: async () => '{}' };
+    }
+    if (u.includes('/releases?per_page=10')) {
+      return { ok: true, status: 200, json: async () => ([{ tag_name: 'v1.0.99' }, { tag_name: 'v1.0.98' }, { tag_name: 'v1.0.97' }, { tag_name: 'v1.0.96' }]), text: async () => '[]' };
+    }
+    if (u.includes('/contents/app/build.gradle')) {
+      return { ok: true, status: 200, json: async () => ({}), text: async () => 'android {\n    defaultConfig {\n        versionCode 99\n        versionName "1.0.99"\n    }\n}' };
+    }
+    if (u.includes('/releases/assets/1')) {
+      return { ok: true, status: 200, body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('FAKEAPKBYTES')); c.close(); } }), json: async () => ({}), text: async () => 'FAKEAPKBYTES' };
+    }
+    return { ok: false, status: 404, json: async () => ({}), text: async () => '{}' };
+  }
+  return fetchBeforeFbm(u, init);
+};
+r = await call('GET', '/api/fbm-version');
+assert(r.status === 502 && (await r.text()).includes('versi belum tersedia'), 'fbm-version: tanpa secret GITHUB_PAT_READ -> 502 jujur');
+r = await call('GET', '/api/fbm-apk');
+assert(r.status === 502 && (await r.text()).includes('unduhan belum tersedia'), 'fbm-apk: tanpa secret -> 502 jujur');
+env.GITHUB_PAT_READ = 'ghp_test123';
+r = await call('GET', '/api/fbm-version'); t = await r.text();
+assert(r.status === 200, 'fbm-version: dengan token -> 200');
+let fbmV = {};
+try { fbmV = JSON.parse(t); } catch (e) {}
+assert(fbmV.ok === true && fbmV.versionName === '1.0.99' && fbmV.versionCode === 99 && fbmV.tag === 'v1.0.99' && fbmV.apkName === 'HozinFBManager-1.0.99.apk' && Array.isArray(fbmV.tags) && fbmV.tags.length === 4 && fbmV.tags[0] === 'v1.0.99', 'fbm-version: field lengkap (versionCode 99 dari build.gradle, tag, apkName, tags)');
+assert(!t.includes('ghp_test') && !t.includes('browser_download_url') && !t.includes('apkDownloadUrl'), 'fbm-version: token + URL unduh tidak bocor ke respons');
+const ghCallsAfterFirst = ghCalls.length;
+r = await call('GET', '/api/fbm-version');
+assert(r.status === 200 && ghCalls.length === ghCallsAfterFirst, 'fbm-version: panggilan kedua memakai cache 5 menit (tanpa fetch GitHub lagi)');
+r = await call('GET', '/api/fbm-apk');
+assert(r.status === 200 && r.headers.get('content-type') === 'application/vnd.android.package-archive' && (r.headers.get('content-disposition') || '').includes('HozinFBManager-1.0.99.apk'), 'fbm-apk: 200 + content-type APK + attachment nama asli');
+assert((await r.text()) === 'FAKEAPKBYTES', 'fbm-apk: bytes APK diteruskan apa adanya');
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 10; i++) { r = await call('GET', '/api/fbm-apk'); }
+assert(r.status === 200, 'fbm-apk: 10 unduhan/jam masih lolos');
+r = await call('GET', '/api/fbm-apk');
+assert(r.status === 429, 'fbm-apk: unduhan ke-11 dalam 1 jam ditolak 429');
+delete env.GITHUB_PAT_READ;
+globalThis.fetch = fetchBeforeFbm;
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

@@ -691,6 +691,90 @@ export default {
   },
 };
 
+// ---- Versi terbaru Hozin FB Manager (aplikasi Android, v1.0.32) ----
+// Repo FBM privat: aplikasi TIDAK BISA memanggil GitHub Releases API
+// langsung (404 tanpa token). Worker menjadi perantara: mengambil data
+// rilis terbaru dari GitHub memakai secret GITHUB_PAT_READ (PAT read-only
+// repo itu saja), lalu menyajikannya sebagai JSON publik + mem-proxy
+// unduhan APK. Token TIDAK PERNAH muncul di respons mana pun.
+// Cache 5 menit di memori Worker supaya tiap buka aplikasi tidak
+// membakar kuota API GitHub. Bila secret belum terpasang atau GitHub
+// gagal, jawab 502 JSON yang jujur (bukan crash, bukan 500).
+const FBM_GH_REPO = 'hozin-king/fb-account-manager';
+const FBM_VERSION_CACHE_MS = 5 * 60 * 1000;
+let fbmReleaseCache = { at: 0, data: null };
+
+function fbmPickApkAsset(assets) {
+  if (!Array.isArray(assets)) return null;
+  let fallback = null;
+  let fallbackSize = -1;
+  for (const a of assets) {
+    if (!a || typeof a.name !== 'string' || !a.name.toLowerCase().endsWith('.apk')) continue;
+    if (typeof a.browser_download_url !== 'string' || !a.browser_download_url) continue;
+    if (a.name.includes('HozinFBManager')) return a;
+    if (typeof a.size === 'number' && a.size > fallbackSize) { fallbackSize = a.size; fallback = a; }
+  }
+  return fallback;
+}
+
+// Ambil info rilis terbaru FBM dari GitHub (dengan cache 5 menit).
+// Kembalikan { data } bila sukses, atau { error: 'no-token' | 'github' }.
+// versionCode diambil dari app/build.gradle di main — HANYA dipakai bila
+// versionName-nya sama dengan tag rilis terbaru (bila tidak sama, artinya
+// main sudah maju tapi rilis belum terbit: versionCode = null, aplikasi
+// memakai perbandingan versionName + daftar tag seperti pola Cerpen).
+async function fetchFbmLatestRelease(env) {
+  const token = env.GITHUB_PAT_READ;
+  if (!token) return { error: 'no-token' };
+  const now = Date.now();
+  if (fbmReleaseCache.data && now - fbmReleaseCache.at < FBM_VERSION_CACHE_MS) {
+    return { data: fbmReleaseCache.data };
+  }
+  const ghHeaders = { 'authorization': 'Bearer ' + token, 'accept': 'application/vnd.github+json', 'user-agent': 'hozin-cms-fbm-version/1.0' };
+  let latest;
+  try {
+    const res = await fetch('https://api.github.com/repos/' + FBM_GH_REPO + '/releases/latest', { headers: ghHeaders, cf: { cacheTtl: 0 } });
+    if (!res.ok) return { error: 'github' };
+    latest = await res.json();
+  } catch (e) {
+    return { error: 'github' };
+  }
+  const tag = typeof latest.tag_name === 'string' ? latest.tag_name : '';
+  const versionName = tag.replace(/^v/i, '');
+  if (!versionName) return { error: 'github' };
+  const apk = fbmPickApkAsset(latest.assets);
+  let tags = [];
+  try {
+    const res = await fetch('https://api.github.com/repos/' + FBM_GH_REPO + '/releases?per_page=10', { headers: ghHeaders, cf: { cacheTtl: 0 } });
+    if (res.ok) {
+      const list = await res.json();
+      if (Array.isArray(list)) tags = list.map(r => r.tag_name).filter(t => typeof t === 'string' && t);
+    }
+  } catch (e) { /* daftar tag gagal = keputusan tetap jalan, tertinggal dihitung 1 */ }
+  let versionCode = null;
+  try {
+    const res = await fetch('https://api.github.com/repos/' + FBM_GH_REPO + '/contents/app/build.gradle', { headers: { ...ghHeaders, 'accept': 'application/vnd.github.raw' }, cf: { cacheTtl: 0 } });
+    if (res.ok) {
+      const gradle = await res.text();
+      const codeM = gradle.match(/versionCode\s+(\d+)/);
+      const nameM = gradle.match(/versionName\s+"([^"]+)"/);
+      if (codeM && nameM && nameM[1] === versionName) versionCode = Number(codeM[1]);
+    }
+  } catch (e) { /* versionCode tetap null */ }
+  const data = {
+    versionCode,
+    versionName,
+    tag,
+    apkName: apk ? apk.name : null,
+    apkSize: apk && typeof apk.size === 'number' ? apk.size : null,
+    apkDownloadUrl: apk ? apk.browser_download_url : null,
+    notes: typeof latest.body === 'string' ? latest.body.slice(0, 500) : '',
+    tags,
+  };
+  fbmReleaseCache = { at: now, data };
+  return { data };
+}
+
 async function handleFetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -801,6 +885,45 @@ async function handleFetch(request, env) {
     if (request.method === 'GET' && path === '/api/cerpen-config') {
       const cfg = await getCerpenConfig(env);
       return new Response(JSON.stringify(cfg), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=60' } });
+    }
+
+    // ---- Publik: versi terbaru Hozin FB Manager (aplikasi Android, v1.0.32) ----
+    // Aplikasi mengecek ini saat dibuka (throttle 6 jam di aplikasi).
+    // Tanpa auth; URL unduh APK TIDAK disertakan di respons ini (hanya
+    // nama + ukuran) — unduhnya lewat /api/fbm-apk di bawah.
+    if (request.method === 'GET' && path === '/api/fbm-version') {
+      const fbmJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      const r = await fetchFbmLatestRelease(env);
+      if (r.error === 'no-token') return fbmJson({ ok: false, error: 'versi belum tersedia' }, 502);
+      if (r.error || !r.data) return fbmJson({ ok: false, error: 'gagal memeriksa versi' }, 502);
+      const d = r.data;
+      return fbmJson({ ok: true, versionCode: d.versionCode, versionName: d.versionName, tag: d.tag, apkName: d.apkName, apkSize: d.apkSize, notes: d.notes, tags: d.tags }, 200);
+    }
+
+    // ---- Publik: unduh APK rilis terbaru Hozin FB Manager (proxy, v1.0.32) ----
+    // Mem-proxy bytes APK dari GitHub (pakai token yang sama) supaya
+    // aplikasi bisa unduh update in-app meski repo privat. Rate limit
+    // ringan 10/jam/IP (pola checkRateLimit yang sudah ada) karena
+    // tiap unduhan ~6 MB. Token tidak pernah bocor ke pemanggil.
+    if (request.method === 'GET' && path === '/api/fbm-apk') {
+      const fbmJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!(await checkRateLimit(env, 'fbm-apk:' + clientIp(request), 10, 3600 * 1000))) return fbmJson({ ok: false, error: 'terlalu banyak permintaan' }, 429);
+      const r = await fetchFbmLatestRelease(env);
+      if (r.error === 'no-token') return fbmJson({ ok: false, error: 'unduhan belum tersedia' }, 502);
+      if (r.error || !r.data || !r.data.apkDownloadUrl) return fbmJson({ ok: false, error: 'gagal mengambil APK' }, 502);
+      let up;
+      try {
+        up = await fetch(r.data.apkDownloadUrl, { headers: { 'authorization': 'Bearer ' + env.GITHUB_PAT_READ, 'accept': 'application/octet-stream', 'user-agent': 'hozin-cms-fbm-apk/1.0' } });
+      } catch (e) {
+        return fbmJson({ ok: false, error: 'gagal mengambil APK' }, 502);
+      }
+      if (!up.ok || !up.body) return fbmJson({ ok: false, error: 'gagal mengambil APK' }, 502);
+      const h = new Headers();
+      h.set('content-type', 'application/vnd.android.package-archive');
+      h.set('content-disposition', 'attachment; filename="' + (r.data.apkName || 'HozinFBManager.apk') + '"');
+      if (r.data.apkSize) h.set('content-length', String(r.data.apkSize));
+      h.set('cache-control', 'no-store');
+      return new Response(up.body, { status: 200, headers: h });
     }
 
     // ---- Submit konten Cerpen dari API key (akun Muse kedua, v64, 12 Nov 2026) ----
