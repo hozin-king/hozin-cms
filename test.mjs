@@ -215,6 +215,12 @@ class MockDB {
     }
     if (s.startsWith('SELECT id FROM cms_posts WHERE slug')) return this.posts.filter(p => p.slug === a[0]).map(p => ({ id: p.id }));
     if (s.startsWith('SELECT * FROM cms_comments WHERE post_id')) return this.comments.filter(c => c.post_id === a[0] && c.status === 'approved').sort((x, y) => x.created_at.localeCompare(y.created_at));
+    // v82: panel admin butuh slug postingan untuk tautan teleport ke komentar
+    if (s.startsWith('SELECT c.*, p.slug AS post_slug FROM cms_comments')) {
+      const all = [...this.comments].sort((x, y) => y.created_at.localeCompare(x.created_at)).map(c => ({ ...c, post_slug: (this.posts.find(p => p.id === c.post_id) || {}).slug || null }));
+      if (s.includes('LIMIT ? OFFSET ?')) return all.slice(a[1], a[1] + a[0]);
+      return all;
+    }
     if (s.startsWith('SELECT * FROM cms_comments ORDER')) {
       const all = [...this.comments].sort((x, y) => y.created_at.localeCompare(x.created_at));
       if (s.includes('LIMIT ? OFFSET ?')) return all.slice(a[1], a[1] + a[0]);
@@ -254,7 +260,7 @@ class MockDB {
     if (s.startsWith('UPDATE cms_comments SET pinned = 1')) { const c = this.comments.find(x => x.id === a[0]); if (c) c.pinned = 1; return []; }
     if (s.startsWith('UPDATE cms_comments SET pinned = 0')) { const c = this.comments.find(x => x.id === a[0]); if (c) c.pinned = 0; return []; }
     if (s.startsWith('UPDATE cms_comments SET pinned')) { const c = this.comments.find(x => x.id === a[1]); if (c) c.pinned = a[0]; return []; }
-    if (s.startsWith('UPDATE cms_comments SET status')) { const c = this.comments.find(x => x.id === a[0]); if (c) c.status = 'approved'; return []; }
+    if (s.startsWith('UPDATE cms_comments SET status')) { const c = this.comments.find(x => x.id === a[0]); if (c) c.status = s.includes("status = 'pending'") ? 'pending' : 'approved'; return []; }
     if (s.startsWith('UPDATE cms_plugins SET enabled')) { this.plugins.set(a[1], a[0]); return []; }
     if (s.startsWith('DELETE FROM cms_posts')) { this.posts = this.posts.filter(p => p.id !== a[0]); return []; }
     if (s.startsWith('DELETE FROM cms_comments')) { this.comments = this.comments.filter(c => c.id !== a[0]); return []; }
@@ -839,6 +845,18 @@ r = await call('GET', '/kendali/settings', null, cookie); t = await r.text();
 assert(t.includes('Simpan Pengaturan') && t.includes('Foto profil situs'), 'halaman Pengaturan: form sendiri');
 r = await call('GET', '/kendali/comments', null, cookie); t = await r.text();
 assert(t.includes('<h2>Komentar</h2>'), 'halaman Komentar: sendiri');
+// 18b. Teleport komentar (v82): panel admin -> anchor di halaman post
+r = await call('GET', '/kendali/comments', null, cookie); t = await r.text();
+assert(t.includes(`href="/post/post-uji#comment-${commentId}"`) && t.includes('target="_blank"'), 'panel komentar: tautan Lihat di postingan ke anchor #comment-<id> di tab baru');
+r = await call('GET', '/post/post-uji'); t = await r.text();
+assert(t.includes(`id="comment-${commentId}"`), 'halaman post: komentar punya anchor id="comment-<id>"');
+assert(t.includes('.card:target'), 'halaman post: gaya :target untuk highlight komentar tujuan');
+// 18c. Tarik persetujuan (v82): approved -> tombol Tarik, kembali pending
+r = await call('GET', '/kendali/comments', null, cookie); t = await r.text();
+assert(t.includes('action="/kendali/comments/withdraw"') && t.includes('>Tarik</button>'), 'tarik: komentar approved menampilkan tombol Tarik, bukan Setujui');
+r = await call('POST', '/kendali/comments/withdraw', { csrf, id: String(commentId) }, cookie); assert(r.status === 303, 'tarik: redirect');
+r = await call('GET', '/post/post-uji'); t = await r.text(); assert(!t.includes('Komentar uji'), 'tarik: komentar tidak tampil publik lagi');
+r = await call('POST', '/kendali/comments/approve', { csrf, id: String(commentId) }, cookie); assert(r.status === 303, 'tarik: setujui ulang redirect (pulihkan)');
 // 19. Ikon mata animasi sinkron WIB (perintah pemilik 30 Okt 2026 12:31)
 // Bukan emoji; SVG + keyframes kedip 4 detik + footer script sinkron fase
 r = await call('GET', '/'); t = await r.text();

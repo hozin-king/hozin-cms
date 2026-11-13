@@ -337,6 +337,7 @@ const ADMIN_NOTICES = {
   'komentar-disematkan': 'Komentar disematkan.',
   'komentar-dilepas': 'Sematan komentar dilepas.',
   'komentar-diubah': 'Komentar diubah.',
+  'komentar-ditarik': 'Persetujuan komentar ditarik.',
   'plugin-disimpan': 'Plugin disimpan.',
   'post-dibuat': 'Post dibuat.',
   'post-diubah': 'Post diubah.',
@@ -2970,10 +2971,11 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
         const page = parseAdminPage(url);
         const [countRow, comments] = await Promise.all([
           env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_comments`).first(),
-          env.DB.prepare(`SELECT * FROM cms_comments ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(ADMIN_PAGE_SIZE, (page - 1) * ADMIN_PAGE_SIZE).all(),
+          // (v82) bawa slug postingan untuk tautan teleport ke komentar
+          env.DB.prepare(`SELECT c.*, p.slug AS post_slug FROM cms_comments c LEFT JOIN cms_posts p ON p.id = c.post_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?`).bind(ADMIN_PAGE_SIZE, (page - 1) * ADMIN_PAGE_SIZE).all(),
         ]);
         const totalPages = Math.max(1, Math.ceil((Number(countRow && countRow.n) || 0) / ADMIN_PAGE_SIZE));
-        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]${Number(c.pinned) === 1 ? ' 📌 Disematkan' : ''}<p>${esc(c.text)}</p><form method="post" action="/kendali/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form> <form method="post" action="/kendali/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form>${c.status === 'approved' && !c.parent_id ? (Number(c.pinned) === 1 ? ` <form method="post" action="/kendali/comments/unpin" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Lepas Sematan</button></form>` : ` <form method="post" action="/kendali/comments/pin" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Sematkan</button></form>`) : ''}<details><summary>Edit komentar (admin)</summary><form method="post" action="/kendali/comments/update">${csrfField}<input type="hidden" name="id" value="${c.id}"><textarea name="text" maxlength="2000" required>${esc(c.text)}</textarea><button type="submit">Simpan Edit</button></form></details></div>`).join('') || '<p>Belum ada komentar.</p>';
+        const commentRows = (comments.results || []).map(c => `<div class="card"><b>${esc(c.name)}</b> [${esc(c.status)}]${Number(c.pinned) === 1 ? ' 📌 Disematkan' : ''}${c.post_slug ? ` · <a href="/post/${esc(c.post_slug)}#comment-${c.id}" target="_blank" rel="noopener">Lihat di postingan ↗</a>` : ''}<p>${esc(c.text)}</p>${c.status === 'approved' ? `<form method="post" action="/kendali/comments/withdraw" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Tarik</button></form>` : `<form method="post" action="/kendali/comments/approve" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Setujui</button></form>`} <form method="post" action="/kendali/comments/delete" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Hapus</button></form>${c.status === 'approved' && !c.parent_id ? (Number(c.pinned) === 1 ? ` <form method="post" action="/kendali/comments/unpin" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Lepas Sematan</button></form>` : ` <form method="post" action="/kendali/comments/pin" style="display:inline">${csrfField}<input type="hidden" name="id" value="${c.id}"><button type="submit">Sematkan</button></form>`) : ''}<details><summary>Edit komentar (admin)</summary><form method="post" action="/kendali/comments/update">${csrfField}<input type="hidden" name="id" value="${c.id}"><textarea name="text" maxlength="2000" required>${esc(c.text)}</textarea><button type="submit">Simpan Edit</button></form></details></div>`).join('') || '<p>Belum ada komentar.</p>';
         const content = `<h2>Komentar</h2>${nav}${noticeHtml(url)}${commentRows}${pageNav('/kendali/comments', page, totalPages)}`;
         return html(await renderPage(env, 'Komentar', content));
       }
@@ -3571,6 +3573,12 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
           }
         } catch (e) {}
         return redirect(withNotice('/kendali/comments', 'komentar-disetujui'));
+      }
+      // (v82) Tarik persetujuan: komentar kembali pending, tidak tampil publik.
+      if (path === '/kendali/comments/withdraw') {
+        const cid = Number(form.get('id'));
+        await env.DB.prepare(`UPDATE cms_comments SET status = 'pending' WHERE id = ?`).bind(cid).run();
+        return redirect(withNotice('/kendali/comments', 'komentar-ditarik'));
       }
       if (path === '/kendali/comments/delete') {
         const cid = Number(form.get('id'));

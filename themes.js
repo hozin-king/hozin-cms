@@ -8,6 +8,7 @@ function baseCss(def) {
     `header .brand{font-size:clamp(16px,3.2vw,19px);font-weight:700;display:inline-flex;align-items:center}header .mark{width:26px;height:26px;flex:0 0 26px;margin-right:9px}header .mark svg{width:26px;height:26px;display:block}header nav{margin-top:8px;font-size:14px;display:flex;flex-wrap:wrap;gap:6px 14px}` +
     `header nav a{color:${accent};font-weight:500}main{width:100%;max-width:${maxWidth}px;margin:0 auto;padding:18px 14px}` +
     `.card{background:${card};border:1px solid ${border};border-radius:${radius}px;padding:18px;margin:0 0 18px;overflow-wrap:anywhere;box-shadow:0 1px 2px rgba(0,0,0,.03)}` +
+    `.card:target{outline:2px solid ${accent};outline-offset:2px}` +
     `.card h2{margin:0 0 6px;font-weight:700;font-size:clamp(19px,4.2vw,25px);line-height:1.3}.card h2 a{color:${fg};text-decoration:none}.meta{color:${muted};font-size:13px;margin-bottom:6px}` +
     `a{color:${accent}}img,video{max-width:100%;height:auto;border-radius:8px}audio{width:100%}input,textarea,select{width:100%;box-sizing:border-box;padding:9px 12px;margin:3px 0 12px;border:1px solid ${border};border-radius:8px;background:${bg};color:${fg};font-size:16px;font-family:inherit}` +
     `:focus-visible{outline:2px solid ${accent};outline-offset:2px}` +

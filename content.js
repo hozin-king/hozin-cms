@@ -118,7 +118,8 @@ export function renderCommentsTree(comments, votes, myVotes, csrfField, canReply
     const deleteForm = canManage
       ? `<details><summary>Hapus komentar</summary><form method="post" action="/post/${esc(postSlug)}/comment/delete"><input type="hidden" name="csrf" value="${csrfField}"><input type="hidden" name="comment_id" value="${c.id}"><p>Komentar ini akan dihapus permanen.</p><button type="submit">Hapus Permanen</button></form></details>`
       : '';
-    return `<div class="card" style="margin-left:${indent}px">${pinLabel}<p><b>${esc(c.name)}</b></p><p>${esc(displayText)}</p><p>${voteForms}</p>${editForm}${deleteForm}${replyForm}${kids}</div>`;
+    // (v82) anchor stabil per komentar: id="comment-<id>" untuk teleport dari panel admin.
+    return `<div class="card" id="comment-${c.id}" style="margin-left:${indent}px">${pinLabel}<p><b>${esc(c.name)}</b></p><p>${esc(displayText)}</p><p>${voteForms}</p>${editForm}${deleteForm}${replyForm}${kids}</div>`;
   };
   // Komentar yang induknya sudah dihapus diperlakukan sebagai komentar utama,
   // supaya tidak hilang diam-diam.
