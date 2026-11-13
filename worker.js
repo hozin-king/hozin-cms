@@ -324,7 +324,7 @@ input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/md-backup', 'Backup .md']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -924,6 +924,29 @@ async function handleFetch(request, env) {
       if (r.data.apkSize) h.set('content-length', String(r.data.apkSize));
       h.set('cache-control', 'no-store');
       return new Response(up.body, { status: 200, headers: h });
+    }
+
+    // ---- Publik: laporan tamper Hozin FB Manager (aplikasi Android, v1.0.33) ----
+    // Aplikasi yang mendeteksi repack (paket/label/signer tidak cocok dengan
+    // nilai resmi) mengirim laporan ke sini. Tanpa auth — laporan datang dari
+    // aplikasi yang mungkin sudah di-repack, jadi secret aplikasi tidak bisa
+    // dipakai sebagai auth. Validasi ringan: body JSON objek non-kosong;
+    // field yang dikenal disimpan (dipotong ke batas wajar), sisanya diabaikan.
+    // Simpan ke D1 stopwatch-db (binding BACKUP_DB, tabel app_tamper_reports).
+    if (request.method === 'POST' && path === '/api/app-tamper') {
+      const tpJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+      if (!env.BACKUP_DB) return tpJson({ ok: false, error: 'database tidak tersedia' }, 503);
+      let body;
+      try { body = await request.json(); } catch (e) { return tpJson({ ok: false, error: 'body tidak valid' }, 400); }
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length === 0) return tpJson({ ok: false, error: 'body tidak valid' }, 400);
+      const str = (v, max) => { const s = String(v == null ? '' : v); return s.length > max ? s.slice(0, max) : s; };
+      const vc = Number(body.version_code);
+      try {
+        await env.BACKUP_DB.prepare(`INSERT INTO app_tamper_reports (package_found, label_found, signer_found, version_code, version_name, device_model, android_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(str(body.package_found, 200), str(body.label_found, 200), str(body.signer_found, 200), Number.isFinite(vc) ? Math.trunc(vc) : null, str(body.version_name, 50), str(body.device_model, 100), str(body.android_version, 50), Date.now()).run();
+      } catch (e) {
+        return tpJson({ ok: false, error: 'gagal menyimpan laporan' }, 500);
+      }
+      return tpJson({ ok: true }, 200);
     }
 
     // ---- Submit konten Cerpen dari API key (akun Muse kedua, v64, 12 Nov 2026) ----
@@ -2774,7 +2797,7 @@ requestAnimationFrame(draw);
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/md-backup')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/md-backup' || path === '/kendali/tamper')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
@@ -3097,6 +3120,24 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
 });
 </script>`;
         return html(await renderPage(env, 'Backup .md', content));
+      }
+      // ---- Admin: laporan tamper FB Manager (v1.0.33) ----
+      // Daftar laporan repack dari aplikasi (guard tamper native), terbaru
+      // dulu. Hanya baca — tidak ada aksi hapus; laporan adalah bukti.
+      if (path === '/kendali/tamper') {
+        if (!env.BACKUP_DB) {
+          const content = `<h2>Laporan Tamper</h2>${nav}<div class="card"><p>Database Cerpen (stopwatch-db) tidak tersedia — panel tidak bisa dimuat.</p></div>`;
+          return html(await renderPage(env, 'Laporan Tamper', content));
+        }
+        const wib = v => { const n = Number(v || 0); const ms = (n > 0 && n < 1e12) ? n * 1000 : n; return new Date(ms + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16); };
+        let fLimit = parseInt(url.searchParams.get('limit') || '50', 10);
+        if (Number.isNaN(fLimit)) fLimit = 50;
+        fLimit = Math.min(100, Math.max(1, fLimit));
+        const rows = await env.BACKUP_DB.prepare(`SELECT id, package_found, label_found, signer_found, version_code, version_name, device_model, android_version, created_at FROM app_tamper_reports ORDER BY created_at DESC LIMIT ?`).bind(fLimit).all();
+        const list = rows.results || [];
+        const rowsHtml = list.map(r => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(r.package_found || '(paket tidak diketahui)')}</span><div class="adm-row-meta">${wib(r.created_at)} · label ${esc(r.label_found || '-')} · signer ${esc(r.signer_found || '-')}</div><div class="adm-row-meta">perangkat ${esc(r.device_model || '-')} · Android ${esc(r.android_version || '-')} · aplikasi v${esc(r.version_name || '-')} (code ${r.version_code == null ? '-' : Number(r.version_code)})</div></div></div>`).join('') || '<p>Belum ada laporan tamper.</p>';
+        const content = `<h2>Laporan Tamper</h2>${nav}<p class="meta">Laporan repack dari aplikasi Hozin FB Manager (guard tamper native). Terbaru dulu; ${list.length} laporan ditampilkan.</p><div class="card">${rowsHtml}</div>`;
+        return html(await renderPage(env, 'Laporan Tamper', content));
       }
       if (path === '/kendali') {
         // Prune retensi analitik (bertahap, maks 500/pemanggilan): gagal

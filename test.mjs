@@ -72,6 +72,8 @@ class MockDB {
       { id: 3, ts: nowT - 900 * 1000, kind: 'login_gagal', country: 'RU', city: 'Moscow' },
     ];
     this.securityEventSeq = 3;
+    // v1.0.33: laporan tamper FB Manager (tabel app_tamper_reports)
+    this.tamperReports = [];
   }
   prepare(sql) { return new Stmt(this, sql); }
   async batch(stmts) { this.batchCalls = (this.batchCalls || 0) + 1; for (const s of stmts) await s.run(); }
@@ -185,6 +187,9 @@ class MockDB {
     if (s.startsWith('CREATE TABLE IF NOT EXISTS cms_backup')) return [];
     if (s.startsWith('DELETE FROM cms_backup')) return [];
     if (s.startsWith('INSERT INTO cms_backup_posts')) { this.backupPosts = (this.backupPosts || 0) + 1; return []; }
+    // v1.0.33: laporan tamper FB Manager (app_tamper_reports).
+    if (s.startsWith('INSERT INTO app_tamper_reports')) { this.tamperReports.push({ id: this.tamperReports.length + 1, package_found: a[0], label_found: a[1], signer_found: a[2], version_code: a[3], version_name: a[4], device_model: a[5], android_version: a[6], created_at: a[7] }); return []; }
+    if (s.startsWith('SELECT id, package_found, label_found, signer_found, version_code, version_name, device_model, android_version, created_at FROM app_tamper_reports')) { const all = [...this.tamperReports].sort((x, y) => (y.created_at || 0) - (x.created_at || 0)); return all.slice(0, a[0]); }
     if (s.startsWith('INSERT INTO cms_backup_comments')) { this.backupComments = (this.backupComments || 0) + 1; return []; }
     if (s.startsWith('INSERT INTO cms_backup_settings')) { (this.backupSettings = this.backupSettings || []).push({ key: a[0], value: a[1], backup_at: a[2] }); return []; }
     if (s.startsWith('INSERT INTO cms_backup_plugins') || s.startsWith('INSERT INTO cms_backup_users') || s.startsWith('INSERT INTO cms_backup_votes')) return [];
@@ -1751,6 +1756,24 @@ assert(!renderMarkdown('<script>alert(1)</script>').includes('<script>'), 'md-re
 assert(renderMarkdown('[klik](javascript:alert(1))').includes('klik') && !renderMarkdown('[klik](javascript:alert(1))').includes('javascript:'), 'md-render: link javascript tidak dirender sebagai <a>');
 assert(renderMarkdown('```js\nconst a = 1;\n```').includes('<pre><code>const a = 1;'), 'md-render: code block berpagar');
 assert(renderMarkdown('snake_case tetap').includes('snake_case') && !renderMarkdown('snake_case tetap').includes('<em>'), 'md-render: snake_case tidak jadi miring');
+// 42c. Laporan tamper FB Manager (v1.0.33, 13 Nov 2026): POST /api/app-tamper
+// + halaman /kendali/tamper.
+r = await callJson('POST', '/api/app-tamper', { package_found: 'com.palsu.fbmanager', label_found: 'FB Manager Palsu', signer_found: 'AA:BB:CC:DD', version_code: 34, version_name: '1.0.33', device_model: 'POCO X6 Pro', android_version: '14', timestamp: 1794444000000 });
+jj = await r.json();
+assert(r.status === 200 && jj.ok === true, 'app-tamper: laporan valid -> 200 {ok:true}');
+assert(env.BACKUP_DB.tamperReports.length === 1 && env.BACKUP_DB.tamperReports[0].package_found === 'com.palsu.fbmanager' && env.BACKUP_DB.tamperReports[0].version_code === 34 && env.BACKUP_DB.tamperReports[0].device_model === 'POCO X6 Pro', 'app-tamper: baris tersimpan di BACKUP_DB (paket + version_code + perangkat)');
+r = await callJson('POST', '/api/app-tamper', {});
+assert(r.status === 400, 'app-tamper: body kosong ditolak 400');
+r = await callJson('POST', '/api/app-tamper', []);
+assert(r.status === 400, 'app-tamper: body array ditolak 400');
+{
+  const req = new Request(base + '/api/app-tamper', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{bukan json' });
+  r = await worker.fetch(req, env);
+  assert(r.status === 400, 'app-tamper: body bukan JSON ditolak 400');
+}
+r = await call('GET', '/kendali/tamper'); assert(r.status === 303 && (r.headers.get('location') || '') === '/akun?pesan=login', 'app-tamper: halaman tanpa auth dialihkan ke login');
+r = await call('GET', '/kendali/tamper', null, cookie); t = await r.text();
+assert(r.status === 200 && t.includes('Laporan Tamper') && t.includes('com.palsu.fbmanager') && t.includes('POCO X6 Pro') && t.includes('Tamper'), 'app-tamper: halaman admin memuat laporan terbaru + nav Tamper');
 // 43. Layout mobile panel admin (v70, 12 Nov 2026): baris .adm-row
 // membungkus (flex-wrap) supaya di layar ~360px teks tidak pecah per
 // karakter dan tombol tidak menutupi teks.
