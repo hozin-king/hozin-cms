@@ -31,6 +31,7 @@ import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRe
 import { checkRateLimit } from './security.js';
 import { validEmail, issueOtp, verifyOtp, OTP_SEND_LIMIT, OTP_SEND_WINDOW_MS } from './otp.js';
 import { handleCoinApi, handleCoinAdmin, renderCoinPanel } from './coins.js';
+import { handleSocialApi, handleSocialAdminApi, renderSocialReportsPanel, renderSocialStatsPanel, getSocialDashboardSummary } from './social.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
 import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, STOPWATCH_EVENTS, nextEventMs, readingTrackerScript, HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
 import { ensureSchema, getSetting, getAllSettings, getEnabledPlugins, doBackup, renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
@@ -325,7 +326,7 @@ input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/statistik', 'Statistik'], ['/kendali/laporan', 'Laporan'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -1351,6 +1352,19 @@ async function handleFetch(request, env) {
     }
     if (path.startsWith('/api/admin/cerpen-koin')) {
       const r = await handleCoinAdmin(request, env, url, admin);
+      if (r) return r;
+    }
+
+    // ---- Fitur Sosial Cerpen (v87.3, modul social.js) ----
+    // View + like + dislike + report per konten + statistik admin.
+    // Ditempatkan di sini (sebelum blok POST admin yang memanggil
+    // formData()) karena membaca body JSON.
+    if (path.startsWith('/api/cerpen-social/')) {
+      const r = await handleSocialApi(request, env, url);
+      if (r) return r;
+    }
+    if (path.startsWith('/api/admin/cerpen-social/')) {
+      const r = await handleSocialAdminApi(request, env, url, admin);
       if (r) return r;
     }
 
@@ -2856,7 +2870,7 @@ requestAnimationFrame(draw);
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/md-backup' || path === '/kendali/tamper')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/statistik' || path === '/kendali/laporan' || path === '/kendali/md-backup' || path === '/kendali/tamper')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
@@ -2864,6 +2878,16 @@ requestAnimationFrame(draw);
       if (path === '/kendali/koin') {
         const content = await renderCoinPanel(env, csrf, nav, noticeHtml(url));
         return html(await renderPage(env, 'Koin Cerpen', content));
+      }
+      // ---- Admin: statistik Cerpen ala YouTube Studio (v87.3, social.js) ----
+      if (path === '/kendali/statistik') {
+        const content = await renderSocialStatsPanel(env, csrf, nav, noticeHtml(url), url);
+        return html(await renderPage(env, 'Statistik Cerpen', content));
+      }
+      // ---- Admin: laporan konten Cerpen (v87.3, social.js) ----
+      if (path === '/kendali/laporan') {
+        const content = await renderSocialReportsPanel(env, csrf, nav, noticeHtml(url), url);
+        return html(await renderPage(env, 'Laporan Konten', content));
       }
       // ---- Admin: panel kontrol API Cerpen (v66) ----
       // Statistik + keys + submissions + audit, semua dari D1 stopwatch-db
@@ -3249,7 +3273,10 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
         for (const c of commentList) if (c.status === 'approved') commenterCount.set(c.name, (commenterCount.get(c.name) || 0) + 1);
         const topCommenters = [...commenterCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, n], i) => `<div class="adm-row"><span class="adm-rank">${i + 1}</span><div class="adm-row-body"><span class="adm-row-title">${esc(name)}</span><div class="adm-row-meta">${n} komentar</div></div></div>`).join('') || '<p>Belum ada komentator aktif.</p>';
         const zeroViews = postList.filter(p => (Number(p.views) || 0) === 0).slice(0, 5).map(p => `<div class="adm-row"><div class="adm-row-body">${postLink(p)}<div class="adm-row-meta">Belum pernah dilihat</div></div><a class="adm-edit" href="/kendali/posts/edit?id=${esc(p.id)}">Edit</a></div>`).join('');
-        const content = `<div class="adm-head"><div class="adm-head-mark">H</div><div><h2>Dashboard Admin</h2><p class="adm-role">Peran: <span class="adm-badge">Super-Super-Admin</span> <span class="adm-muted">(satu-satunya) — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</span></p></div></div>${nav}<div class="card"><h3>Ringkasan</h3><div class="adm-stats"><div class="adm-stat"><span class="adm-stat-num">${totalViews}</span><span class="adm-stat-label">views total</span><span class="adm-stat-sub">rata-rata ${avgViews} views/post</span></div><div class="adm-stat"><span class="adm-stat-num">${views7}</span><span class="adm-stat-label">Views 7 hari terakhir</span></div><div class="adm-stat"><span class="adm-stat-num">${viewsToday}</span><span class="adm-stat-label">Views hari ini (WIB)</span></div><div class="adm-stat"><span class="adm-stat-num">${postList.length}</span><span class="adm-stat-label">Post</span><span class="adm-stat-sub"><a href="/kendali/posts">Lihat Post</a> · <a href="/kendali/posts/new">Post Baru</a></span></div><div class="adm-stat"><span class="adm-stat-num">${commentList.length}</span><span class="adm-stat-label">Komentar</span><span class="adm-stat-sub">${approvedComments} disetujui, ${pending} menunggu · <a href="/kendali/comments">Moderasi Komentar</a></span></div><div class="adm-stat"><span class="adm-stat-num">${(users.results || []).length}</span><span class="adm-stat-label">Akun komentator</span><span class="adm-stat-sub"><a href="/kendali/users">Lihat Akun</a></span></div><div class="adm-stat"><span class="adm-stat-num">${activePlugins}</span><span class="adm-stat-label">Plugin aktif</span><span class="adm-stat-sub"><a href="/kendali/plugins">Lihat Plugin</a></span></div></div></div><div class="card"><h3>🔥 Post Terpopuler / Viral (views terbanyak sepanjang masa)</h3>${topViewsHtml}</div><div class="card"><h3>📈 Post Terpopuler 7 Hari Terakhir</h3>${top7Html}</div><div class="card"><h3>💬 Post Paling Banyak Dikomentari</h3>${topCommented}</div><div class="card"><h3>🆕 Post Terbaru</h3>${latest}</div><div class="card"><h3>👥 Komentator Teraktif</h3>${topCommenters}</div>${zeroViews ? `<div class="card"><h3>👀 Post Belum Pernah Dilihat</h3>${zeroViews}</div>` : ''}<form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>`;
+        // Ringkasan sosial Cerpen (v87.3): fail-silent, dashboard tidak boleh rusak karenanya.
+        const socSum = await getSocialDashboardSummary(env);
+        const socialCard = `<div class="card"><h3>📚 Cerpen — Sosial</h3><div class="adm-stats"><div class="adm-stat"><span class="adm-stat-num">${socSum.views.toLocaleString('id-ID')}</span><span class="adm-stat-label">views konten</span></div><div class="adm-stat"><span class="adm-stat-num">${socSum.likes.toLocaleString('id-ID')}</span><span class="adm-stat-label">like konten</span></div><div class="adm-stat"><span class="adm-stat-num">${socSum.reports_baru}</span><span class="adm-stat-label">laporan baru</span><span class="adm-stat-sub">${socSum.reports} laporan total · <a href="/kendali/laporan">Moderasi</a></span></div></div><p><a href="/kendali/statistik">Lihat Statistik Cerpen →</a></p></div>`;
+        const content = `<div class="adm-head"><div class="adm-head-mark">H</div><div><h2>Dashboard Admin</h2><p class="adm-role">Peran: <span class="adm-badge">Super-Super-Admin</span> <span class="adm-muted">(satu-satunya) — tidak ada akun admin lain. Akun komentator di bawah bukan akun admin.</span></p></div></div>${nav}<div class="card"><h3>Ringkasan</h3><div class="adm-stats"><div class="adm-stat"><span class="adm-stat-num">${totalViews}</span><span class="adm-stat-label">views total</span><span class="adm-stat-sub">rata-rata ${avgViews} views/post</span></div><div class="adm-stat"><span class="adm-stat-num">${views7}</span><span class="adm-stat-label">Views 7 hari terakhir</span></div><div class="adm-stat"><span class="adm-stat-num">${viewsToday}</span><span class="adm-stat-label">Views hari ini (WIB)</span></div><div class="adm-stat"><span class="adm-stat-num">${postList.length}</span><span class="adm-stat-label">Post</span><span class="adm-stat-sub"><a href="/kendali/posts">Lihat Post</a> · <a href="/kendali/posts/new">Post Baru</a></span></div><div class="adm-stat"><span class="adm-stat-num">${commentList.length}</span><span class="adm-stat-label">Komentar</span><span class="adm-stat-sub">${approvedComments} disetujui, ${pending} menunggu · <a href="/kendali/comments">Moderasi Komentar</a></span></div><div class="adm-stat"><span class="adm-stat-num">${(users.results || []).length}</span><span class="adm-stat-label">Akun komentator</span><span class="adm-stat-sub"><a href="/kendali/users">Lihat Akun</a></span></div><div class="adm-stat"><span class="adm-stat-num">${activePlugins}</span><span class="adm-stat-label">Plugin aktif</span><span class="adm-stat-sub"><a href="/kendali/plugins">Lihat Plugin</a></span></div></div></div>${socialCard}<div class="card"><h3>🔥 Post Terpopuler / Viral (views terbanyak sepanjang masa)</h3>${topViewsHtml}</div><div class="card"><h3>📈 Post Terpopuler 7 Hari Terakhir</h3>${top7Html}</div><div class="card"><h3>💬 Post Paling Banyak Dikomentari</h3>${topCommented}</div><div class="card"><h3>🆕 Post Terbaru</h3>${latest}</div><div class="card"><h3>👥 Komentator Teraktif</h3>${topCommenters}</div>${zeroViews ? `<div class="card"><h3>👀 Post Belum Pernah Dilihat</h3>${zeroViews}</div>` : ''}<form method="post" action="/kendali/logout">${csrfField}<button type="submit">Keluar</button></form>`;
         return html(await renderPage(env, 'Admin', content));
       }
       if (path === '/kendali/posts') {

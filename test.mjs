@@ -94,6 +94,11 @@ class MockDB {
     this.coinWatch = new Map(); // device_id -> {device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at}
     this.coinEvents = []; // {id, kind, device_id, android_id, user_id, detail, created_at}
     this.coinVip = new Map(); // user_id -> {user_id, expires_at, granted_by, reason, created_at}
+    // v87.3: state fitur sosial Cerpen (cms-db).
+    this.socialStats = new Map(); // kind|ref -> {kind, ref, views, likes, dislikes, reports, updated_at}
+    this.socialVotes = []; // {kind, ref, voter_key, vote, device_id, user_id, created_at, updated_at}
+    this.socialViews = []; // {kind, ref, viewer_key, day, created_at}
+    this.socialReports = []; // {id, kind, ref, reporter_key, device_id, user_id, category, note, status, day, created_at, updated_at}
     // v81: agregat waktu baca (sudah ada array-nya di constructor; isi di
     // sini hanya penegas — handler upsert ada di bawah).
     this.readingSessions = this.readingSessions || [];
@@ -853,6 +858,51 @@ class MockDB {
     if (s.startsWith('SELECT DISTINCT season FROM cerpen_episodes WHERE series_id = ? ORDER BY season ASC')) return [...new Set(this.cerpenEpisodes.filter(e => e.series_id === a[0]).map(e => e.season))].sort((x, y) => x - y).map(season => ({ season }));
     if (s.startsWith('SELECT season, no, judul FROM cerpen_episodes WHERE series_id = ? ORDER BY season ASC, no ASC LIMIT 500')) return this.cerpenEpisodes.filter(e => e.series_id === a[0]).sort((x, y) => (x.season - y.season) || (x.no - y.no)).slice(0, 500).map(e => ({ season: e.season, no: e.no, judul: e.judul }));
     if (s.startsWith('SELECT no, judul FROM cerpen_komik_episodes WHERE komik_id = ? ORDER BY no ASC LIMIT 500')) return this.cerpenKomikEpisodes.filter(e => e.komik_id === a[0]).sort((x, y) => x.no - y.no).slice(0, 500).map(e => ({ no: e.no, judul: e.judul }));
+    // v87.3: fitur sosial Cerpen (social.js).
+    if (s.startsWith('INSERT OR IGNORE INTO cerpen_content_stats')) { const k = a[0] + '|' + a[1]; if (!this.socialStats.has(k)) this.socialStats.set(k, { kind: a[0], ref: a[1], views: 0, likes: 0, dislikes: 0, reports: 0, updated_at: a[2] }); return []; }
+    if (s.startsWith('SELECT views, likes, dislikes FROM cerpen_content_stats WHERE kind = ? AND ref = ?')) { const r = this.socialStats.get(a[0] + '|' + a[1]); return r ? [{ views: r.views, likes: r.likes, dislikes: r.dislikes }] : []; }
+    if (s.startsWith('SELECT vote FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND voter_key = ?')) return this.socialVotes.filter(v => v.kind === a[0] && v.ref === a[1] && v.voter_key === a[2]).map(v => ({ vote: v.vote }));
+    if (s.startsWith('INSERT OR IGNORE INTO cerpen_content_views')) { const ex = this.socialViews.some(v => v.kind === a[0] && v.ref === a[1] && v.viewer_key === a[2] && v.day === a[3]); if (ex) return { changes: 0 }; this.socialViews.push({ kind: a[0], ref: a[1], viewer_key: a[2], day: a[3], created_at: a[4] }); return { changes: 1 }; }
+    if (s.startsWith('UPDATE cerpen_content_stats SET views = views + 1')) { const r = this.socialStats.get(a[1] + '|' + a[2]); if (r) { r.views += 1; r.updated_at = a[0]; } return []; }
+    if (s.startsWith('UPDATE cerpen_content_stats SET likes = likes + ?')) { const r = this.socialStats.get(a[3] + '|' + a[4]); if (r) { r.likes += a[0]; r.dislikes += a[1]; r.updated_at = a[2]; } return []; }
+    if (s.startsWith('UPDATE cerpen_content_stats SET reports = reports + 1')) { const r = this.socialStats.get(a[1] + '|' + a[2]); if (r) { r.reports += 1; r.updated_at = a[0]; } return []; }
+    if (s.startsWith('INSERT INTO cerpen_content_votes')) { this.socialVotes.push({ kind: a[0], ref: a[1], voter_key: a[2], vote: a[3], device_id: a[4], user_id: a[5], created_at: a[6], updated_at: a[7] }); return []; }
+    if (s.startsWith('UPDATE cerpen_content_votes SET vote = ?')) { const v = this.socialVotes.find(x => x.kind === a[2] && x.ref === a[3] && x.voter_key === a[4]); if (v) { v.vote = a[0]; v.updated_at = a[1]; } return []; }
+    if (s.startsWith('DELETE FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND voter_key = ?')) { this.socialVotes = this.socialVotes.filter(v => !(v.kind === a[0] && v.ref === a[1] && v.voter_key === a[2])); return []; }
+    if (s.startsWith('SELECT id FROM cerpen_content_reports WHERE kind = ? AND ref = ? AND reporter_key = ? AND day = ?')) return this.socialReports.filter(r => r.kind === a[0] && r.ref === a[1] && r.reporter_key === a[2] && r.day === a[3]).map(r => ({ id: r.id }));
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_content_reports WHERE reporter_key = ? AND day = ?')) return [{ n: this.socialReports.filter(r => r.reporter_key === a[0] && r.day === a[1]).length }];
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_content_reports WHERE status = ?')) return [{ n: this.socialReports.filter(r => r.status === a[0]).length }];
+    if (s.startsWith('INSERT INTO cerpen_content_reports')) { this.socialReports.push({ id: a[0], kind: a[1], ref: a[2], reporter_key: a[3], device_id: a[4], user_id: a[5], category: a[6], note: a[7], status: 'baru', day: a[8], created_at: a[9], updated_at: a[10] }); return []; }
+    if (s.startsWith('UPDATE cerpen_content_reports SET status = ?')) { const r = this.socialReports.find(x => x.id === a[2]); if (!r) return { changes: 0 }; r.status = a[0]; r.updated_at = a[1]; return { changes: 1 }; }
+    if (s.startsWith('SELECT id, kind, ref, reporter_key, device_id, user_id, category, note, status, day, created_at FROM cerpen_content_reports')) {
+      let rows = [...this.socialReports].sort((x, y) => y.created_at - x.created_at);
+      let ai = 0;
+      if (s.includes('kind = ?')) rows = rows.filter(r => r.kind === a[ai++]);
+      if (s.includes('status = ?')) rows = rows.filter(r => r.status === a[ai++]);
+      return rows.slice(0, a[ai] || 50);
+    }
+    // Agregasi statistik admin (v87.3).
+    if (s.startsWith('SELECT COALESCE(SUM(views), 0) AS views, COALESCE(SUM(likes), 0) AS likes, COALESCE(SUM(dislikes), 0) AS dislikes, COALESCE(SUM(reports), 0) AS reports FROM cerpen_content_stats')) { let v = 0, l = 0, d = 0, rp = 0; for (const x of this.socialStats.values()) { v += x.views; l += x.likes; d += x.dislikes; rp += x.reports; } return [{ views: v, likes: l, dislikes: d, reports: rp }]; }
+    if (s.startsWith('SELECT day, COUNT(*) AS n FROM cerpen_content_views WHERE day >= ? GROUP BY day ORDER BY day ASC')) { const m = new Map(); for (const x of this.socialViews) if (x.day >= a[0]) m.set(x.day, (m.get(x.day) || 0) + 1); return [...m.entries()].sort((x, y) => x[0].localeCompare(y[0])).map(([day, n]) => ({ day, n })); }
+    if (s.startsWith('SELECT kind, ref, views, likes, dislikes FROM cerpen_content_stats ORDER BY views DESC LIMIT 10')) return [...this.socialStats.values()].sort((x, y) => y.views - x.views).slice(0, 10);
+    if (s.startsWith('SELECT kind, ref, views, likes, dislikes FROM cerpen_content_stats ORDER BY likes DESC LIMIT 10')) return [...this.socialStats.values()].sort((x, y) => y.likes - x.likes).slice(0, 10);
+    if (s.startsWith('SELECT COALESCE(SUM(seconds), 0) AS total FROM cms_reading_sessions')) return [{ total: this.readingSessions.reduce((n, x) => n + (Number(x.seconds) || 0), 0) }];
+    if (s.startsWith('SELECT post_id, SUM(seconds) AS total FROM cms_reading_sessions GROUP BY post_id ORDER BY total DESC LIMIT 10')) { const m = new Map(); for (const x of this.readingSessions) m.set(x.post_id, (m.get(x.post_id) || 0) + (Number(x.seconds) || 0)); return [...m.entries()].map(([post_id, total]) => ({ post_id, total })).sort((x, y) => y.total - x.total).slice(0, 10); }
+    if (s.startsWith('SELECT kind, target_id, season, no, COUNT(*) AS n FROM cerpen_unlocks GROUP BY kind, target_id, season, no ORDER BY n DESC LIMIT 10')) { const m = new Map(); for (const x of this.coinUnlocks) { const k = x.kind + '|' + x.target_id + '|' + x.season + '|' + x.no; const e = m.get(k) || { kind: x.kind, target_id: x.target_id, season: x.season, no: x.no, n: 0 }; e.n++; m.set(k, e); } return [...m.values()].sort((x, y) => y.n - x.n).slice(0, 10); }
+    if (s.startsWith('SELECT ref, SUM(0 - delta) AS spent FROM cerpen_coin_ledger WHERE delta < 0 GROUP BY ref ORDER BY spent DESC LIMIT 20')) { const m = new Map(); for (const x of this.coinLedger) if (Number(x.delta) < 0) m.set(x.ref, (m.get(x.ref) || 0) - Number(x.delta)); return [...m.entries()].map(([ref, spent]) => ({ ref, spent })).sort((x, y) => y.spent - x.spent).slice(0, 20); }
+    if (s.startsWith('SELECT COALESCE(SUM(0 - delta), 0) AS spent FROM cerpen_coin_ledger WHERE delta < 0')) return [{ spent: this.coinLedger.filter(x => Number(x.delta) < 0).reduce((n, x) => n - Number(x.delta), 0) }];
+    if (s.startsWith('SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS n FROM cms_users GROUP BY day ORDER BY day DESC LIMIT ?')) { const m = new Map(); for (const u of this.users.values()) { const d = String(u.created_at || '').slice(0, 10); m.set(d, (m.get(d) || 0) + 1); } return [...m.entries()].sort((x, y) => y[0].localeCompare(x[0])).slice(0, a[0]).map(([day, n]) => ({ day, n })); }
+    if (s.startsWith('SELECT day_wib, COUNT(DISTINCT user_id) AS n FROM cms_reading_sessions GROUP BY day_wib ORDER BY day_wib DESC LIMIT ?')) { const m = new Map(); for (const x of this.readingSessions) { const set = m.get(x.day_wib) || new Set(); set.add(x.user_id); m.set(x.day_wib, set); } return [...m.entries()].sort((x, y) => y[0].localeCompare(x[0])).slice(0, a[0]).map(([day_wib, set]) => ({ day_wib, n: set.size })); }
+    if (s.startsWith('SELECT category, COUNT(*) AS n FROM cerpen_content_reports GROUP BY category')) { const m = new Map(); for (const r of this.socialReports) m.set(r.category, (m.get(r.category) || 0) + 1); return [...m.entries()].map(([category, n]) => ({ category, n })); }
+    if (s.startsWith('SELECT status, COUNT(*) AS n FROM cerpen_content_reports GROUP BY status')) { const m = new Map(); for (const r of this.socialReports) m.set(r.status, (m.get(r.status) || 0) + 1); return [...m.entries()].map(([status, n]) => ({ status, n })); }
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_series')) return [{ n: this.cerpenSeries.length }];
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_episodes')) return [{ n: this.cerpenEpisodes.length }];
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_komik_episodes')) return [{ n: this.cerpenKomikEpisodes.length }];
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_komik')) return [{ n: this.cerpenKomik.length }];
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_news')) return [{ n: this.cerpenNews.length }];
+    if (s.startsWith('SELECT id, judul, created_at FROM cerpen_series ORDER BY created_at DESC LIMIT 5')) return [...this.cerpenSeries].sort((x, y) => (Number(y.created_at) || 0) - (Number(x.created_at) || 0)).slice(0, 5).map(x => ({ id: x.id, judul: x.judul, created_at: Number(x.created_at) || 0 }));
+    if (s.startsWith('SELECT series_id, season, no, judul, created_at FROM cerpen_episodes ORDER BY created_at DESC LIMIT 5')) return [...this.cerpenEpisodes].sort((x, y) => (Number(y.created_at) || 0) - (Number(x.created_at) || 0)).slice(0, 5).map(x => ({ series_id: x.series_id, season: x.season, no: x.no, judul: x.judul, created_at: Number(x.created_at) || 0 }));
+    if (s.startsWith('SELECT id, title, added_at FROM cerpen_news ORDER BY added_at DESC LIMIT 5')) return [...this.cerpenNews].sort((x, y) => String(y.added_at || '').localeCompare(String(x.added_at || ''))).slice(0, 5).map(x => ({ id: x.id, title: x.title, added_at: x.added_at }));
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -2699,4 +2749,81 @@ r = await coinAdmin('/api/admin/cerpen-koin/devices?q=&limit=20', 'GET', null);
 rj = JSON.parse(await r.text());
 const devF = rj.devices.find(d => d.device_id === DEV_F);
 assert(devF && devF.status === 'perlu perhatian', 'koin pantauan: >=5 gagal redeem -> perlu perhatian (tidak memblokir)');
+// v87.3: Fitur sosial Cerpen — view/like/dislike/report + statistik admin.
+async function socialCall(method, path, obj, headers = {}) {
+  const h = { 'content-type': 'application/json', ...headers };
+  const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
+  return worker.fetch(req, env);
+}
+const SOC_DEV = '33333333-4444-4555-8666-777777777777';
+const SOC_DEV2 = '44444444-5555-4666-8777-888888888888';
+const SOC_REF = 'cerpen-01:1:1';
+const koinSession = koinUserCookie.slice('cms_user='.length);
+let sj = {};
+r = await socialCall('GET', '/api/cerpen-social/stats?kind=cerpen&ref=' + SOC_REF, null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.views === 0 && sj.likes === 0 && sj.dislikes === 0 && sj.my_vote === 0, 'social stats: konten ada, angka 0');
+r = await socialCall('GET', '/api/cerpen-social/stats?kind=cerpen&ref=cerpen-99:1:1', null);
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'invalid_ref', 'social stats: episode tak ada -> 400 invalid_ref');
+r = await socialCall('GET', '/api/cerpen-social/stats?kind=ngaco&ref=x', null);
+assert(r.status === 400, 'social stats: kind tak dikenal -> 400');
+env.DB.rateLimits = new Map();
+r = await socialCall('POST', '/api/cerpen-social/view', { kind: 'cerpen', ref: SOC_REF, device_id: SOC_DEV });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.views === 1, 'social view: view pertama views=1');
+r = await socialCall('POST', '/api/cerpen-social/view', { kind: 'cerpen', ref: SOC_REF, device_id: SOC_DEV });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.views === 1, 'social view: view kedua device sama tidak nambah');
+r = await socialCall('POST', '/api/cerpen-social/view', { kind: 'cerpen', ref: SOC_REF, device_id: SOC_DEV2 });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.views === 2, 'social view: device beda views=2');
+env.DB.rateLimits = new Map();
+r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 1, device_id: SOC_DEV });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.likes === 1 && sj.my_vote === 1, 'social vote: like guest likes=1');
+r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 1, device_id: SOC_DEV });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.likes === 0 && sj.my_vote === 0, 'social vote: like kedua = batalkan');
+r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: -1, device_id: SOC_DEV });
+assert(r.status === 401 && JSON.parse(await r.text()).error === 'login_required', 'social vote: dislike guest -> 401 login_required');
+env.DB.rateLimits = new Map();
+r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: -1, device_id: SOC_DEV }, { authorization: 'Bearer ' + koinSession });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.dislikes === 1 && sj.my_vote === -1, 'social vote: dislike login (Bearer) dislikes=1');
+r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 1, device_id: SOC_DEV }, { authorization: 'Bearer ' + koinSession });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.likes === 1 && sj.dislikes === 0 && sj.my_vote === 1, 'social vote: ganti dislike -> like');
+r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 0, device_id: SOC_DEV }, { authorization: 'Bearer ' + koinSession });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.likes === 0 && sj.dislikes === 0 && sj.my_vote === 0, 'social vote: vote=0 batalkan');
+env.DB.rateLimits = new Map();
+r = await socialCall('POST', '/api/cerpen-social/report', { kind: 'cerpen', ref: SOC_REF, category: 'typo', note: 'ada salah ketik', device_id: SOC_DEV });
+sj = JSON.parse(await r.text());
+assert(r.status === 201 && sj.ok === true && typeof sj.report_id === 'string' && sj.report_id.startsWith('rep-'), 'social report: guest bisa lapor, report_id didapat');
+const socRepId = sj.report_id;
+r = await socialCall('POST', '/api/cerpen-social/report', { kind: 'cerpen', ref: SOC_REF, category: 'gambar', device_id: SOC_DEV });
+assert(r.status === 429 && JSON.parse(await r.text()).error === 'already_reported', 'social report: lapor kedua konten sama di hari sama -> 429 already_reported');
+r = await socialCall('POST', '/api/cerpen-social/report', { kind: 'cerpen', ref: SOC_REF, category: 'ngaco', device_id: SOC_DEV });
+assert(r.status === 400, 'social report: kategori tak dikenal -> 400');
+r = await socialCall('POST', '/api/cerpen-social/stats-batch', { device_id: SOC_DEV, items: [{ kind: 'cerpen', ref: SOC_REF }, { kind: 'berita', ref: 'news-1' }, { kind: 'cerpen', ref: 'cerpen-99:1:1' }] });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.stats['cerpen|cerpen-01:1:1'] && sj.stats['cerpen|cerpen-01:1:1'].views === 2 && sj.stats['berita|news-1'] && !sj.stats['cerpen|cerpen-99:1:1'], 'social stats-batch: item valid tampil, item tak valid dilewati');
+r = await call('GET', '/kendali/laporan', null, cookie);
+t = await r.text();
+assert(r.status === 200 && t.includes('Laporan Konten') && t.includes(socRepId), 'social panel laporan: tampil + laporan uji ada');
+r = await socialCall('POST', '/api/admin/cerpen-social/reports/' + socRepId + '/status', { status: 'ditolak' }, { 'x-csrf': coinCsrf, cookie });
+assert(r.status === 200 && JSON.parse(await r.text()).status === 'ditolak', 'social admin: tolak laporan ok');
+r = await socialCall('POST', '/api/admin/cerpen-social/reports/' + socRepId + '/status', { status: 'ngaco' }, { 'x-csrf': coinCsrf, cookie });
+assert(r.status === 400, 'social admin: status tak dikenal -> 400');
+r = await socialCall('POST', '/api/admin/cerpen-social/reports/rep-00000000/status', { status: 'ditolak' }, { 'x-csrf': coinCsrf, cookie });
+assert(r.status === 404, 'social admin: laporan tak ada -> 404');
+r = await socialCall('GET', '/api/admin/cerpen-social/stats-overview?range=7', null, { 'x-csrf': coinCsrf, cookie });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.totals.views === 2 && sj.totals.reports === 1 && sj.trend.length === 7 && sj.content.series === 1 && sj.content.news === 1 && sj.reading.top.length >= 0, 'social stats-overview: totals + tren 7 hari + konten tampil');
+r = await call('GET', '/kendali/statistik', null, cookie);
+t = await r.text();
+assert(r.status === 200 && t.includes('Statistik Cerpen') && t.includes('Tidak ditampilkan (datanya tidak ada)'), 'social panel statistik: tampil + penanda jujur metrik kosong');
+r = await call('GET', '/kendali', null, cookie);
+t = await r.text();
+assert(r.status === 200 && t.includes('Cerpen — Sosial') && t.includes('/kendali/statistik'), 'social dashboard: kartu ringkasan + tautan statistik');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

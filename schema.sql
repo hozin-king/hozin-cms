@@ -97,3 +97,12 @@ CREATE INDEX IF NOT EXISTS idx_cerpen_coin_events_device ON cerpen_coin_events(d
 CREATE INDEX IF NOT EXISTS idx_cerpen_coin_events_kind ON cerpen_coin_events(kind, created_at);
 -- VIP per akun (19:17): expires_at = unix MS.
 CREATE TABLE IF NOT EXISTS cerpen_vip (user_id TEXT PRIMARY KEY, expires_at INTEGER, granted_by TEXT NOT NULL DEFAULT 'admin', reason TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
+
+-- ================= Fitur Sosial Cerpen (v87.3, 14 Nov 2026) =================
+-- Lihat social.js + social_ddl.sql. Tinggal di cms-db (binding DB).
+CREATE TABLE IF NOT EXISTS cerpen_content_stats (kind TEXT NOT NULL, ref TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 0, likes INTEGER NOT NULL DEFAULT 0, dislikes INTEGER NOT NULL DEFAULT 0, reports INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (kind, ref));
+CREATE TABLE IF NOT EXISTS cerpen_content_votes (kind TEXT NOT NULL, ref TEXT NOT NULL, voter_key TEXT NOT NULL, vote INTEGER NOT NULL, device_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (kind, ref, voter_key));
+CREATE TABLE IF NOT EXISTS cerpen_content_views (kind TEXT NOT NULL, ref TEXT NOT NULL, viewer_key TEXT NOT NULL, day TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (kind, ref, viewer_key, day));
+CREATE TABLE IF NOT EXISTS cerpen_content_reports (id TEXT PRIMARY KEY, kind TEXT NOT NULL, ref TEXT NOT NULL, reporter_key TEXT NOT NULL, device_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '', category TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'baru', day TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cerpen_content_reports_daily ON cerpen_content_reports (kind, ref, reporter_key, day);
+CREATE INDEX IF NOT EXISTS idx_cerpen_content_reports_status ON cerpen_content_reports (status, created_at);
