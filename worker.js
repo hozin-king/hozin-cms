@@ -777,6 +777,154 @@ async function fetchFbmLatestRelease(env) {
   return { data };
 }
 
+// ---- Rilis Cerpen Hozin (v87.4, 14 Nov 2026) ----
+// AKAR BASI: /api/cerpen-version dulu HANYA membaca baris key='latest'
+// tabel cerpen_version di stopwatch-db, yang di-seed SEKALI oleh
+// migrate_cerpen_images.py (v1.1.28, 13 Nov 09:11) dan tak pernah
+// diperbarui — rilis v1.1.29..v1.1.31 tak pernah sampai ke endpoint,
+// aplikasi 1.1.30.3 pun menyimpulkan "sudah versi terbaru".
+// PERBAIKAN: sumber utama = GitHub Releases API repo PUBLIK (tanpa
+// token — JANGAN andalkan GITHUB_PAT_READ, diketahui tak valid sejak
+// v84). Cache in-memory 5 menit supaya tidak menghantam rate limit
+// GitHub (60/jam tanpa auth, per IP egress). Bila GitHub gagal,
+// fallback ke baris D1 'latest' — DAN baris itu diperbarui setiap kali
+// fetch live berhasil menemukan rilis lebih baru, supaya fallback
+// tidak pernah basi lagi.
+const CERPEN_GH_REPO = 'hozin-king/cerpen-hozin';
+const CERPEN_RELEASES_CACHE_MS = 5 * 60 * 1000;
+// SHA-256 sidik jari sertifikat penandatangan APK resmi Cerpen
+// (dibuktikan dari APK v1.1.31: 75ba028f…a01c1d; sama di semua rilis
+// sejak v1.1.29 — keystore debug persisten di repo). Hanya berubah
+// bila keystore ganti (saat itu perbarui daftar ini + deploy).
+const CERPEN_KNOWN_SIGNER_SHAS = ['75ba028f4f9b401b3f414a2b9e63617fa35b503c692c5f6c188e3724a7a01c1d'];
+let cerpenReleaseCache = { at: 0, data: null };
+
+function cerpenPickApkAsset(assets) {
+  if (!Array.isArray(assets)) return null;
+  let fallback = null;
+  let fallbackSize = -1;
+  for (const a of assets) {
+    if (!a || typeof a.name !== 'string' || !a.name.toLowerCase().endsWith('.apk')) continue;
+    if (typeof a.browser_download_url !== 'string' || !a.browser_download_url) continue;
+    if (a.name.includes('CerpenHozin')) return a;
+    if (typeof a.size === 'number' && a.size > fallbackSize) { fallbackSize = a.size; fallback = a; }
+  }
+  return fallback;
+}
+
+// Banding semver numerik per segmen ('1.1.30.3' vs '1.1.31'): -1/0/1.
+function cmpSemver(a, b) {
+  const pa = String(a).split('.').map(x => parseInt(x, 10) || 0);
+  const pb = String(b).split('.').map(x => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+// Ambil versi dari string bebas ('v1.1.31', '1.1.31 (code 36)'): null bila tak ada angka.
+function parseAppVersion(v) {
+  const m = String(v || '').match(/(\d+(?:\.\d+)*)/);
+  return m ? m[1] : null;
+}
+
+// Ambil info rilis dari GitHub (cache 5 menit). {data} atau {error}.
+async function fetchCerpenReleases(env) {
+  const now = Date.now();
+  if (cerpenReleaseCache.data && now - cerpenReleaseCache.at < CERPEN_RELEASES_CACHE_MS) {
+    return { data: cerpenReleaseCache.data };
+  }
+  let list;
+  try {
+    const res = await fetch('https://api.github.com/repos/' + CERPEN_GH_REPO + '/releases?per_page=10', { headers: { 'accept': 'application/vnd.github+json', 'user-agent': 'hozin-cms-cerpen-version/1.0' }, cf: { cacheTtl: 0 } });
+    if (!res.ok) return { error: 'github' };
+    list = await res.json();
+  } catch (e) {
+    return { error: 'github' };
+  }
+  if (!Array.isArray(list)) return { error: 'github' };
+  const pub = list.filter(r => r && !r.draft && !r.prerelease && typeof r.tag_name === 'string' && r.tag_name);
+  if (!pub.length) return { error: 'github' };
+  const latest = pub[0];
+  const apk = cerpenPickApkAsset(latest.assets);
+  const version = String(latest.tag_name).replace(/^v/i, '');
+  if (!parseAppVersion(version)) return { error: 'github' };
+  const data = {
+    tag: latest.tag_name,
+    version,
+    apk_url: apk ? apk.browser_download_url : null,
+    apk_name: apk ? apk.name : null,
+    published_at: typeof latest.published_at === 'string' ? latest.published_at : null,
+    tags: pub.map(r => r.tag_name),
+  };
+  cerpenReleaseCache = { at: now, data };
+  // Segarkan baris fallback D1 supaya tidak pernah basi lagi.
+  try {
+    if (env.BACKUP_DB) {
+      const upd = await env.BACKUP_DB.prepare(`UPDATE cerpen_version SET tag = ?, version = ?, apk_url = ?, published_at = ? WHERE key = ?`).bind(data.tag, data.version, data.apk_url || '', data.published_at || '', 'latest').run();
+      if (!upd || !upd.meta || Number(upd.meta.changes) !== 1) {
+        await env.BACKUP_DB.prepare(`INSERT INTO cerpen_version (key, tag, version, apk_url, published_at) VALUES (?, ?, ?, ?, ?)`).bind('latest', data.tag, data.version, data.apk_url || '', data.published_at || '').run();
+      }
+    }
+  } catch (e) { /* gagal tulis D1: live tetap jalan, fallback tetap basi — dicoba lagi di fetch berikut */ }
+  return { data };
+}
+
+// Info rilis efektif: live GitHub, fallback baris D1, null bila keduanya gagal.
+// Bentuk: {tag, version, apk_url, published_at, tags, source: 'github'|'d1'}.
+async function resolveCerpenRelease(env) {
+  const live = await fetchCerpenReleases(env);
+  if (live.data) return { ...live.data, source: 'github' };
+  try {
+    if (env.BACKUP_DB) {
+      const row = await env.BACKUP_DB.prepare(`SELECT tag, version, apk_url, published_at FROM cerpen_version WHERE key = ?`).bind('latest').first();
+      if (row && row.tag) {
+        return { tag: row.tag, version: String(row.version || String(row.tag).replace(/^v/i, '')), apk_url: row.apk_url || null, published_at: row.published_at || null, tags: [row.tag], source: 'd1' };
+      }
+    }
+  } catch (e) { /* abaikan, kembalikan null di bawah */ }
+  return null;
+}
+
+// Penegakan update di jalur sync (v87.4): kembalikan null bila boleh,
+// atau {latest, reason} bila HARUS ditolak 426.
+// - signer dikirim & tidak cocok daftar dikenal -> tolak (signer_mismatch).
+// - versi < latest DAN ada >=3 rilis lebih baru di daftar tags -> tolak
+//   (locked_3_behind). Daftar tags hanya dari GitHub; bila sumbernya D1
+//   (GitHub down, tags=[latest]) jumlah tak bisa dihitung -> izinkan
+//   sementara (fail-open, dicoba lagi saat GitHub pulih).
+// - versi tak bisa diparse padahal header dikirim -> tolak (version_unknown).
+// - versi >= latest -> izinkan. Tanpa header versi+signer -> tak bisa
+//   dinilai -> izinkan (aplikasi lama; penegakan berlaku sejak aplikasi
+//   mengirim header, v1.1.32).
+async function checkCerpenAppLock(env, appVersion, appSigner) {
+  if (!appVersion && !appSigner) return null;
+  const rel = await resolveCerpenRelease(env);
+  if (!rel) return null; // rilis tak diketahui -> fail-open
+  if (appSigner) {
+    const norm = String(appSigner).replace(/[^0-9a-fA-F]/g, '').toLowerCase();
+    if (norm && !CERPEN_KNOWN_SIGNER_SHAS.includes(norm)) {
+      return { latest: rel.tag, reason: 'signer_mismatch' };
+    }
+  }
+  if (!appVersion) return null;
+  const v = parseAppVersion(appVersion);
+  if (!v) return { latest: rel.tag, reason: 'version_unknown' };
+  if (cmpSemver(v, rel.version) >= 0) return null;
+  const newer = (rel.tags || []).filter(t => {
+    const tv = parseAppVersion(t);
+    return tv && cmpSemver(tv, v) > 0;
+  }).length;
+  if (rel.source === 'github' && newer >= 3) {
+    return { latest: rel.tag, reason: 'locked_3_behind' };
+  }
+  return null;
+}
+
+// Hook tes: kosongkan cache rilis (dipakai test.mjs antar skenario).
+export function resetCerpenReleaseCacheForTest() { cerpenReleaseCache = { at: 0, data: null }; }
+
 async function handleFetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -959,18 +1107,18 @@ async function handleFetch(request, env) {
       return new Response(bytes, { status: 200, headers: { 'content-type': 'application/octet-stream', 'cache-control': 'public, max-age=3600' } });
     }
 
-    // ---- Publik: versi terbaru Cerpen Hozin (aplikasi Android, v86) ----
-    // Aplikasi mengecek ini saat dibuka untuk update in-app; datanya dari
-    // D1 stopwatch-db (binding BACKUP_DB, tabel cerpen_version, baris
-    // key 'latest' yang ditulis proses sync). Tanpa auth. Rate limit
-    // 60/jam/IP: cek versi berkala aplikasi jauh di bawah batas ini.
+    // ---- Publik: versi terbaru Cerpen Hozin (aplikasi Android, v86; live GitHub sejak v87.4) ----
+    // Aplikasi mengecek ini saat dibuka untuk update in-app. Sumber utama:
+    // GitHub Releases API repo publik (tanpa token, cache 5 menit);
+    // fallback baris key 'latest' tabel cerpen_version di D1 stopwatch-db
+    // (binding BACKUP_DB) — baris itu disegarkan tiap fetch live berhasil,
+    // jadi fallback tidak basi lagi. Tanpa auth. Rate limit 60/jam/IP.
     if (request.method === 'GET' && path === '/api/cerpen-version') {
       const cvJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
-      if (!env.BACKUP_DB) return cvJson({ ok: false, error: 'database tidak tersedia' }, 503);
       if (!(await checkRateLimit(env, 'cerpen-version:' + clientIp(request), 60, 3600 * 1000))) return cvJson({ ok: false, error: 'terlalu banyak permintaan' }, 429);
-      const row = await env.BACKUP_DB.prepare(`SELECT tag, version, apk_url, published_at FROM cerpen_version WHERE key = ?`).bind('latest').first();
-      if (!row) return cvJson({ ok: false, error: 'versi belum tersedia' }, 404);
-      return cvJson({ tag: row.tag, version: row.version, apk_url: row.apk_url, published_at: row.published_at }, 200);
+      const rel = await resolveCerpenRelease(env);
+      if (!rel) return cvJson({ ok: false, error: 'versi belum tersedia' }, 404);
+      return cvJson({ ok: true, tag: rel.tag, version: rel.version, apk_url: rel.apk_url, published_at: rel.published_at, tags: rel.tags, source: rel.source }, 200);
     }
 
     // ---- Publik: laporan tamper Hozin FB Manager (aplikasi Android, v1.0.33) ----
@@ -1803,6 +1951,19 @@ async function handleFetch(request, env) {
         return new Response('Not found', { status: 404 });
       }
       if (!env.BACKUP_DB) return cpJson({ ok: false, error: 'database tidak tersedia' }, 503);
+      // v87.4: penegakan update — aplikasi yang tertinggal >=3 rilis atau
+      // signer-nya tak dikenal TIDAK BOLEH sync/unduh konten (426
+      // version_locked). Header X-App-Version (fallback ?app_version=) +
+      // X-App-Signer-Sha (opsional; aplikasi lama tanpa header tidak
+      // diblokir — penegakan berlaku sejak aplikasi mengirim header,
+      // v1.1.32). Rate limit lain di jalur ini tidak berubah.
+      {
+        const url0 = new URL(request.url);
+        const lock = await checkCerpenAppLock(env,
+          String(request.headers.get('x-app-version') || url0.searchParams.get('app_version') || '').trim(),
+          String(request.headers.get('x-app-signer-sha') || url0.searchParams.get('app_signer_sha') || '').trim());
+        if (lock) return cpJson({ ok: false, error: 'version_locked', latest: lock.latest, reason: lock.reason }, 426);
+      }
       const res = parts[4];
       const url = new URL(request.url);
       const q = (name) => url.searchParams.get(name);
