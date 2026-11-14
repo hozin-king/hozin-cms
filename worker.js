@@ -990,7 +990,19 @@ async function fetchCerpenReleasesViaJsdelivr(env) {
 // 'jsdelivr'|'d1'}.
 async function resolveCerpenRelease(env) {
   const live = await fetchCerpenReleases(env);
-  if (live.data) return { ...live.data, source: live.source || 'github' };
+  if (live.data) {
+    const data = { ...live.data, source: live.source || 'github' };
+    // Jalur live tanpa published_at (jsDelivr + halaman tag GitHub ikut
+    // gagal): isi dari baris D1 BILA tag-nya sama (tanggal sudah
+    // terverifikasi saat backfill) — jangan pakai tanggal tag lain.
+    if (!data.published_at && env.BACKUP_DB) {
+      try {
+        const row = await env.BACKUP_DB.prepare(`SELECT published_at FROM cerpen_version WHERE key = ? AND tag = ?`).bind('latest', data.tag).first();
+        if (row && row.published_at) data.published_at = row.published_at;
+      } catch (e) { /* published_at tetap null */ }
+    }
+    return data;
+  }
   try {
     if (env.BACKUP_DB) {
       const row = await env.BACKUP_DB.prepare(`SELECT tag, version, apk_url, published_at FROM cerpen_version WHERE key = ?`).bind('latest').first();

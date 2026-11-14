@@ -342,6 +342,7 @@ class MockDB {
     // v86: mock tabel gambar + versi Cerpen (dipakai /api/cerpen-img/* + /api/cerpen-version)
     if (s.startsWith('SELECT data FROM cerpen_images WHERE path = ?')) return this.cerpenImages.filter(x => x.path === a[0]);
     if (s.startsWith('SELECT tag, version, apk_url, published_at FROM cerpen_version WHERE key = ?')) return this.cerpenVersion.filter(x => x.key === a[0]);
+    if (s.startsWith('SELECT published_at FROM cerpen_version WHERE key = ? AND tag = ?')) return this.cerpenVersion.filter(x => x.key === a[0] && x.tag === a[1]);
     // v87.4: penyegaran baris fallback D1 tiap fetch live GitHub berhasil.
     if (s.startsWith('UPDATE cerpen_version SET tag = ?, version = ?, apk_url = ?, published_at = ? WHERE key = ?')) {
       const row = this.cerpenVersion.find(x => x.key === a[4]);
@@ -2598,6 +2599,23 @@ assert(env.BACKUP_DB.cerpenVersion.some(x => x.key === 'latest' && x.tag === 'v1
 r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28' });
 assert(r.status === 426 && (await r.json()).error === 'version_locked', 'cerpen-lock v87.4: dengan data jsDelivr, sync v1.1.28 -> 426');
 globalThis.fetch = fetchBeforeJd;
+// v87.4 (lanjutan): live tanpa published_at -> isi dari baris D1 tag sama.
+resetCerpenReleaseCacheForTest();
+const fetchBeforeNoPub = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  const u = String(url);
+  if (u.includes('api.github.com')) throw new Error('github api rate-limited (uji published_at)');
+  if (u.includes('info/refs?service=git-upload-pack')) return { ok: false, status: 403, json: async () => ({}), text: async () => '' };
+  if (u.includes('data.jsdelivr.com')) return { ok: true, status: 200, json: async () => ({ tags: {}, versions: ['1.1.31.1', '1.1.31', '1.1.30.3'] }), text: async () => '{}' };
+  if (u.includes('/releases/tag/')) return { ok: false, status: 403, json: async () => ({}), text: async () => '' };
+  return fetchBeforeNoPub(u, init);
+};
+env.DB.rateLimits = new Map();
+r = await call('GET', '/api/cerpen-version'); t = await r.text();
+let cv6 = {};
+try { cv6 = JSON.parse(t); } catch (e) {}
+assert(r.status === 200 && cv6.tag === 'v1.1.31.1' && cv6.source === 'jsdelivr' && cv6.published_at === '2026-11-14T16:30:49Z', 'cerpen-version v87.4: live tanpa published_at -> diisi dari baris D1 tag yang sama');
+globalThis.fetch = fetchBeforeNoPub;
 // v87: Sistem Koin Cerpen — auth aplikasi, dompet, voucher, VIP, leaderboard, riwayat, ban, pantauan.
 const DEV_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const DEV_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
