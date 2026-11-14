@@ -829,53 +829,117 @@ function parseAppVersion(v) {
   return m ? m[1] : null;
 }
 
-// Ambil info rilis dari GitHub (cache 5 menit). {data} atau {error}.
+// Ambil info rilis dari GitHub (cache 5 menit). {data, source} atau {error}.
+// Jalur 1: Releases API (data lengkap). Jalur 2 (bila API gagal —
+// terbukti kena rate limit dari IP egress Worker): git refs + halaman
+// tag. Keduanya menyegarkan baris fallback D1.
 async function fetchCerpenReleases(env) {
   const now = Date.now();
   if (cerpenReleaseCache.data && now - cerpenReleaseCache.at < CERPEN_RELEASES_CACHE_MS) {
-    return { data: cerpenReleaseCache.data };
+    return { data: cerpenReleaseCache.data, source: cerpenReleaseCache.source || 'github' };
   }
-  let list;
+  let list = null;
   try {
     const res = await fetch('https://api.github.com/repos/' + CERPEN_GH_REPO + '/releases?per_page=10', { headers: { 'accept': 'application/vnd.github+json', 'user-agent': 'hozin-cms-cerpen-version/1.0' }, cf: { cacheTtl: 0 } });
+    if (res.ok) list = await res.json();
+  } catch (e) { /* jatuh ke jalur refs */ }
+  if (Array.isArray(list)) {
+    const pub = list.filter(r => r && !r.draft && !r.prerelease && typeof r.tag_name === 'string' && r.tag_name);
+    if (pub.length) {
+      const latest = pub[0];
+      const apk = cerpenPickApkAsset(latest.assets);
+      const version = String(latest.tag_name).replace(/^v/i, '');
+      if (parseAppVersion(version)) {
+        const data = {
+          tag: latest.tag_name,
+          version,
+          apk_url: apk ? apk.browser_download_url : null,
+          apk_name: apk ? apk.name : null,
+          published_at: typeof latest.published_at === 'string' ? latest.published_at : null,
+          tags: pub.map(r => r.tag_name),
+        };
+        cerpenReleaseCache = { at: now, data, source: 'github' };
+        await refreshCerpenVersionRow(env, data);
+        return { data, source: 'github' };
+      }
+    }
+  }
+  const refs = await fetchCerpenReleasesViaRefs(env);
+  if (refs.data) {
+    cerpenReleaseCache = { at: now, data: refs.data, source: 'github-refs' };
+    await refreshCerpenVersionRow(env, refs.data);
+    return { data: refs.data, source: 'github-refs' };
+  }
+  return { error: 'github' };
+}
+
+// Segarkan baris fallback D1 (bila berubah): published_at dipertahankan
+// dari baris lama bila sumber live tak memberikannya untuk tag yang sama;
+// bila tag baru tanpa tanggal, simpan '' (jujur "tak diketahui").
+async function refreshCerpenVersionRow(env, data) {
+  try {
+    if (!env.BACKUP_DB) return;
+    const cur = await env.BACKUP_DB.prepare(`SELECT tag, version, apk_url, published_at FROM cerpen_version WHERE key = ?`).bind('latest').first();
+    if (cur && cur.tag === data.tag && cur.version === data.version && cur.apk_url === data.apk_url) return; // sudah segar
+    const pub = data.published_at || (cur && cur.tag === data.tag ? cur.published_at : '') || '';
+    const upd = await env.BACKUP_DB.prepare(`UPDATE cerpen_version SET tag = ?, version = ?, apk_url = ?, published_at = ? WHERE key = ?`).bind(data.tag, data.version, data.apk_url || '', pub, 'latest').run();
+    if (!upd || !upd.meta || Number(upd.meta.changes) !== 1) {
+      await env.BACKUP_DB.prepare(`INSERT INTO cerpen_version (key, tag, version, apk_url, published_at) VALUES (?, ?, ?, ?, ?)`).bind('latest', data.tag, data.version, data.apk_url || '', pub).run();
+    }
+  } catch (e) { /* gagal tulis D1: live tetap jalan, fallback tetap basi — dicoba lagi di fetch berikut */ }
+}
+
+// Jalur live KEDUA (14 Nov 2026, setelah api.github.com terbukti kena
+// rate limit dari IP egress Worker — 5× berturut-turut source d1):
+// git smart-HTTP info/refs (github.com, BUKAN api.github.com — tanpa
+// kuota API) untuk daftar tag + tag terbaru, lalu halaman rilis tag
+// untuk published_at (datetime pertama). apk_url dirangkai dari pola
+// nama aset yang konsisten di semua rilis (CerpenHozin-<tag>.apk,
+// terverifikasi sampai v1.1.31.1). Hanya tag versi numerik murni yang
+// dihitung (bukan tag beta/draf). published_at null bila halaman tag
+// tak terbaca — versi + apk_url + tags tetap benar.
+async function fetchCerpenReleasesViaRefs(env) {
+  let refsText;
+  try {
+    const res = await fetch('https://github.com/' + CERPEN_GH_REPO + '.git/info/refs?service=git-upload-pack', { headers: { 'user-agent': 'hozin-cms-cerpen-version/1.0' }, cf: { cacheTtl: 0 } });
     if (!res.ok) return { error: 'github' };
-    list = await res.json();
+    refsText = await res.text();
   } catch (e) {
     return { error: 'github' };
   }
-  if (!Array.isArray(list)) return { error: 'github' };
-  const pub = list.filter(r => r && !r.draft && !r.prerelease && typeof r.tag_name === 'string' && r.tag_name);
-  if (!pub.length) return { error: 'github' };
-  const latest = pub[0];
-  const apk = cerpenPickApkAsset(latest.assets);
-  const version = String(latest.tag_name).replace(/^v/i, '');
-  if (!parseAppVersion(version)) return { error: 'github' };
-  const data = {
-    tag: latest.tag_name,
-    version,
-    apk_url: apk ? apk.browser_download_url : null,
-    apk_name: apk ? apk.name : null,
-    published_at: typeof latest.published_at === 'string' ? latest.published_at : null,
-    tags: pub.map(r => r.tag_name),
-  };
-  cerpenReleaseCache = { at: now, data };
-  // Segarkan baris fallback D1 supaya tidak pernah basi lagi.
+  const tags = [...new Set([...String(refsText || '').matchAll(/refs\/tags\/(v[0-9][0-9A-Za-z.\-]*)/g)].map(m => m[1]))]
+    .filter(t => /^v\d+(\.\d+)*$/.test(t) && parseAppVersion(t))
+    .sort((a, b) => cmpSemver(parseAppVersion(b), parseAppVersion(a)));
+  if (!tags.length) return { error: 'github' };
+  const tag = tags[0];
+  const version = parseAppVersion(tag);
+  let publishedAt = null;
   try {
-    if (env.BACKUP_DB) {
-      const upd = await env.BACKUP_DB.prepare(`UPDATE cerpen_version SET tag = ?, version = ?, apk_url = ?, published_at = ? WHERE key = ?`).bind(data.tag, data.version, data.apk_url || '', data.published_at || '', 'latest').run();
-      if (!upd || !upd.meta || Number(upd.meta.changes) !== 1) {
-        await env.BACKUP_DB.prepare(`INSERT INTO cerpen_version (key, tag, version, apk_url, published_at) VALUES (?, ?, ?, ?, ?)`).bind('latest', data.tag, data.version, data.apk_url || '', data.published_at || '').run();
-      }
+    const res = await fetch('https://github.com/' + CERPEN_GH_REPO + '/releases/tag/' + tag, { headers: { 'user-agent': 'Mozilla/5.0' }, cf: { cacheTtl: 0 } });
+    if (res.ok) {
+      const html = await res.text();
+      const m = html.match(/datetime="([^"]+)"/);
+      if (m) publishedAt = m[1];
     }
-  } catch (e) { /* gagal tulis D1: live tetap jalan, fallback tetap basi — dicoba lagi di fetch berikut */ }
-  return { data };
+  } catch (e) { /* published_at tetap null */ }
+  return {
+    data: {
+      tag,
+      version,
+      apk_url: 'https://github.com/' + CERPEN_GH_REPO + '/releases/download/' + tag + '/CerpenHozin-' + tag + '.apk',
+      apk_name: 'CerpenHozin-' + tag + '.apk',
+      published_at: publishedAt,
+      tags,
+    },
+  };
 }
 
-// Info rilis efektif: live GitHub, fallback baris D1, null bila keduanya gagal.
-// Bentuk: {tag, version, apk_url, published_at, tags, source: 'github'|'d1'}.
+// Info rilis efektif: live GitHub (API, lalu git refs), fallback baris
+// D1, null bila semuanya gagal. Bentuk: {tag, version, apk_url,
+// published_at, tags, source: 'github'|'github-refs'|'d1'}.
 async function resolveCerpenRelease(env) {
   const live = await fetchCerpenReleases(env);
-  if (live.data) return { ...live.data, source: 'github' };
+  if (live.data) return { ...live.data, source: live.source || 'github' };
   try {
     if (env.BACKUP_DB) {
       const row = await env.BACKUP_DB.prepare(`SELECT tag, version, apk_url, published_at FROM cerpen_version WHERE key = ?`).bind('latest').first();
@@ -891,9 +955,10 @@ async function resolveCerpenRelease(env) {
 // atau {latest, reason} bila HARUS ditolak 426.
 // - signer dikirim & tidak cocok daftar dikenal -> tolak (signer_mismatch).
 // - versi < latest DAN ada >=3 rilis lebih baru di daftar tags -> tolak
-//   (locked_3_behind). Daftar tags hanya dari GitHub; bila sumbernya D1
-//   (GitHub down, tags=[latest]) jumlah tak bisa dihitung -> izinkan
-//   sementara (fail-open, dicoba lagi saat GitHub pulih).
+//   (locked_3_behind). Daftar tags lengkap hanya dari sumber live (API
+//   GitHub / git refs); bila sumbernya D1 (semua live gagal,
+//   tags=[latest]) jumlah tak bisa dihitung -> izinkan sementara
+//   (fail-open, dicoba lagi saat live pulih).
 // - versi tak bisa diparse padahal header dikirim -> tolak (version_unknown).
 // - versi >= latest -> izinkan. Tanpa header versi+signer -> tak bisa
 //   dinilai -> izinkan (aplikasi lama; penegakan berlaku sejak aplikasi
@@ -916,7 +981,10 @@ async function checkCerpenAppLock(env, appVersion, appSigner) {
     const tv = parseAppVersion(t);
     return tv && cmpSemver(tv, v) > 0;
   }).length;
-  if (rel.source === 'github' && newer >= 3) {
+  // Daftar tags lengkap hanya dari sumber live (API / git refs); bila
+  // sumbernya D1 (semua jalur live gagal, tags=[latest]) jumlah tak bisa
+  // dihitung -> izinkan sementara (fail-open, dicoba lagi saat live pulih).
+  if ((rel.source === 'github' || rel.source === 'github-refs') && newer >= 3) {
     return { latest: rel.tag, reason: 'locked_3_behind' };
   }
   return null;

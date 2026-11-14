@@ -2468,7 +2468,7 @@ assert(r.status === 400 && (await r.text()).includes('path gambar tidak valid'),
 // bukan bergantung pada rate limit jaringan sungguhan).
 const fetchBeforeCerpenV = globalThis.fetch;
 globalThis.fetch = async (url, init) => {
-  if (String(url).includes('api.github.com')) throw new Error('github down (uji fallback)');
+  if (String(url).includes('github.com')) throw new Error('github down (uji fallback)');
   return fetchBeforeCerpenV(url, init);
 };
 r = await call('GET', '/api/cerpen-version'); t = await r.text();
@@ -2535,7 +2535,7 @@ assert(r.status === 426, 'cerpen-lock v87.4: versi tak bisa diparse -> 426 versi
 // penegakan hitungan (tags tak lengkap) — sync lama lolos sementara.
 resetCerpenReleaseCacheForTest();
 globalThis.fetch = async (url, init) => {
-  if (String(url).includes('api.github.com')) throw new Error('github down (uji fallback)');
+  if (String(url).includes('github.com')) throw new Error('github down (uji fallback)');
   return fetchBeforeCerpenLive(url, init);
 };
 env.DB.rateLimits = new Map();
@@ -2546,6 +2546,38 @@ assert(r.status === 200 && cv3.tag === 'v1.1.31' && cv3.source === 'd1', 'cerpen
 r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28' });
 assert(r.status === 200, 'cerpen-lock v87.4: GitHub down (fallback D1) -> fail-open sementara, sync 1.1.28 lolos');
 globalThis.fetch = fetchBeforeCerpenLive;
+// v87.4 (lanjutan): API GitHub kena rate limit -> jalur git refs + halaman tag.
+resetCerpenReleaseCacheForTest();
+const refsTextUji = [
+  '001e# service=git-upload-pack', '0000',
+  '00a1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1.1.31.1',
+  '00a1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1.1.31',
+  '00a1cccccccccccccccccccccccccccccccccccccccc\trefs/tags/v1.1.30.3',
+  '00a1dddddddddddddddddddddddddddddddddddddddd\trefs/tags/v1.1.30.2',
+  '00a1eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/tags/v1.1.30.1',
+  '00a1ffffffffffffffffffffffffffffffffffffffff\trefs/tags/v1.1.30',
+  '00a11111111111111111111111111111111111111\trefs/tags/v1.1.29',
+  '00a122222222222222222222222222222222222222\trefs/tags/v1.1.28',
+  '00a133333333333333333333333333333333333333\trefs/tags/v1.2.0-beta',
+  '00a144444444444444444444444444444444444444\trefs/heads/main',
+].join('\n');
+const fetchBeforeRefs = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  const u = String(url);
+  if (u.includes('api.github.com')) throw new Error('github api rate-limited (uji refs)');
+  if (u.includes('info/refs?service=git-upload-pack')) return { ok: true, status: 200, json: async () => ({}), text: async () => refsTextUji };
+  if (u.includes('/releases/tag/v1.1.31.1')) return { ok: true, status: 200, json: async () => ({}), text: async () => '<html><relative-time datetime="2026-11-14T16:30:49Z"></relative-time></html>' };
+  return fetchBeforeRefs(u, init);
+};
+env.DB.rateLimits = new Map();
+r = await call('GET', '/api/cerpen-version'); t = await r.text();
+let cv4 = {};
+try { cv4 = JSON.parse(t); } catch (e) {}
+assert(r.status === 200 && cv4.tag === 'v1.1.31.1' && cv4.version === '1.1.31.1' && cv4.apk_url === 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.31.1/CerpenHozin-v1.1.31.1.apk' && cv4.published_at === '2026-11-14T16:30:49Z' && cv4.source === 'github-refs' && Array.isArray(cv4.tags) && cv4.tags.length === 8 && cv4.tags[0] === 'v1.1.31.1' && !cv4.tags.includes('v1.2.0-beta'), 'cerpen-version v87.4: API rate-limited -> jalur git refs -> v1.1.31.1 + tags lengkap (beta dikecualikan)');
+assert(env.BACKUP_DB.cerpenVersion.some(x => x.key === 'latest' && x.tag === 'v1.1.31.1'), 'cerpen-version v87.4: jalur refs juga menyegarkan baris D1 ke v1.1.31.1');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28' });
+assert(r.status === 426 && (await r.json()).error === 'version_locked', 'cerpen-lock v87.4: dengan data refs, sync v1.1.28 -> 426 (7 rilis di belakang)');
+globalThis.fetch = fetchBeforeRefs;
 // v87: Sistem Koin Cerpen — auth aplikasi, dompet, voucher, VIP, leaderboard, riwayat, ban, pantauan.
 const DEV_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const DEV_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
