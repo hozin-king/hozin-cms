@@ -870,6 +870,12 @@ async function fetchCerpenReleases(env) {
     await refreshCerpenVersionRow(env, refs.data);
     return { data: refs.data, source: 'github-refs' };
   }
+  const jd = await fetchCerpenReleasesViaJsdelivr(env);
+  if (jd.data) {
+    cerpenReleaseCache = { at: now, data: jd.data, source: 'jsdelivr' };
+    await refreshCerpenVersionRow(env, jd.data);
+    return { data: jd.data, source: 'jsdelivr' };
+  }
   return { error: 'github' };
 }
 
@@ -934,9 +940,54 @@ async function fetchCerpenReleasesViaRefs(env) {
   };
 }
 
-// Info rilis efektif: live GitHub (API, lalu git refs), fallback baris
-// D1, null bila semuanya gagal. Bentuk: {tag, version, apk_url,
-// published_at, tags, source: 'github'|'github-refs'|'d1'}.
+// Jalur live KETIGA (14 Nov 2026): api.github.com DAN github.com
+// sama-sama gagal dari egress Worker (source tetap d1 setelah deploy
+// refs) — jsDelivr adalah CDN publik tanpa kuota API. data.jsdelivr
+// mengembalikan daftar versi tag (tanpa awalan 'v', terbaru dulu).
+// published_at dicoba dari halaman tag GitHub (bila ikut gagal, null —
+// refreshCerpenVersionRow mempertahankan tanggal lama untuk tag yang
+// sama, '' untuk tag baru).
+async function fetchCerpenReleasesViaJsdelivr(env) {
+  let list;
+  try {
+    const res = await fetch('https://data.jsdelivr.com/v1/package/gh/' + CERPEN_GH_REPO, { headers: { 'user-agent': 'hozin-cms-cerpen-version/1.0' }, cf: { cacheTtl: 0 } });
+    if (!res.ok) return { error: 'github' };
+    list = await res.json();
+  } catch (e) {
+    return { error: 'github' };
+  }
+  const versions = Array.isArray(list && list.versions) ? list.versions : [];
+  const tags = [...new Set(versions.map(v => 'v' + String(v)))]
+    .filter(t => /^v\d+(\.\d+)*$/.test(t) && parseAppVersion(t))
+    .sort((a, b) => cmpSemver(parseAppVersion(b), parseAppVersion(a)));
+  if (!tags.length) return { error: 'github' };
+  const tag = tags[0];
+  const version = parseAppVersion(tag);
+  let publishedAt = null;
+  try {
+    const res = await fetch('https://github.com/' + CERPEN_GH_REPO + '/releases/tag/' + tag, { headers: { 'user-agent': 'Mozilla/5.0' }, cf: { cacheTtl: 0 } });
+    if (res.ok) {
+      const html = await res.text();
+      const m = html.match(/datetime="([^"]+)"/);
+      if (m) publishedAt = m[1];
+    }
+  } catch (e) { /* published_at tetap null */ }
+  return {
+    data: {
+      tag,
+      version,
+      apk_url: 'https://github.com/' + CERPEN_GH_REPO + '/releases/download/' + tag + '/CerpenHozin-' + tag + '.apk',
+      apk_name: 'CerpenHozin-' + tag + '.apk',
+      published_at: publishedAt,
+      tags,
+    },
+  };
+}
+
+// Info rilis efektif: live (API GitHub, lalu git refs, lalu jsDelivr),
+// fallback baris D1, null bila semuanya gagal. Bentuk: {tag, version,
+// apk_url, published_at, tags, source: 'github'|'github-refs'|
+// 'jsdelivr'|'d1'}.
 async function resolveCerpenRelease(env) {
   const live = await fetchCerpenReleases(env);
   if (live.data) return { ...live.data, source: live.source || 'github' };
@@ -956,7 +1007,7 @@ async function resolveCerpenRelease(env) {
 // - signer dikirim & tidak cocok daftar dikenal -> tolak (signer_mismatch).
 // - versi < latest DAN ada >=3 rilis lebih baru di daftar tags -> tolak
 //   (locked_3_behind). Daftar tags lengkap hanya dari sumber live (API
-//   GitHub / git refs); bila sumbernya D1 (semua live gagal,
+//   GitHub / git refs / jsDelivr); bila sumbernya D1 (semua live gagal,
 //   tags=[latest]) jumlah tak bisa dihitung -> izinkan sementara
 //   (fail-open, dicoba lagi saat live pulih).
 // - versi tak bisa diparse padahal header dikirim -> tolak (version_unknown).
@@ -984,7 +1035,7 @@ async function checkCerpenAppLock(env, appVersion, appSigner) {
   // Daftar tags lengkap hanya dari sumber live (API / git refs); bila
   // sumbernya D1 (semua jalur live gagal, tags=[latest]) jumlah tak bisa
   // dihitung -> izinkan sementara (fail-open, dicoba lagi saat live pulih).
-  if ((rel.source === 'github' || rel.source === 'github-refs') && newer >= 3) {
+  if ((rel.source === 'github' || rel.source === 'github-refs' || rel.source === 'jsdelivr') && newer >= 3) {
     return { latest: rel.tag, reason: 'locked_3_behind' };
   }
   return null;

@@ -2468,7 +2468,7 @@ assert(r.status === 400 && (await r.text()).includes('path gambar tidak valid'),
 // bukan bergantung pada rate limit jaringan sungguhan).
 const fetchBeforeCerpenV = globalThis.fetch;
 globalThis.fetch = async (url, init) => {
-  if (String(url).includes('github.com')) throw new Error('github down (uji fallback)');
+  if (String(url).includes('github.com') || String(url).includes('jsdelivr')) throw new Error('github down (uji fallback)');
   return fetchBeforeCerpenV(url, init);
 };
 r = await call('GET', '/api/cerpen-version'); t = await r.text();
@@ -2535,7 +2535,7 @@ assert(r.status === 426, 'cerpen-lock v87.4: versi tak bisa diparse -> 426 versi
 // penegakan hitungan (tags tak lengkap) — sync lama lolos sementara.
 resetCerpenReleaseCacheForTest();
 globalThis.fetch = async (url, init) => {
-  if (String(url).includes('github.com')) throw new Error('github down (uji fallback)');
+  if (String(url).includes('github.com') || String(url).includes('jsdelivr')) throw new Error('github down (uji fallback)');
   return fetchBeforeCerpenLive(url, init);
 };
 env.DB.rateLimits = new Map();
@@ -2578,6 +2578,26 @@ assert(env.BACKUP_DB.cerpenVersion.some(x => x.key === 'latest' && x.tag === 'v1
 r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28' });
 assert(r.status === 426 && (await r.json()).error === 'version_locked', 'cerpen-lock v87.4: dengan data refs, sync v1.1.28 -> 426 (7 rilis di belakang)');
 globalThis.fetch = fetchBeforeRefs;
+// v87.4 (lanjutan): API + github.com sama-sama gagal -> jalur jsDelivr.
+resetCerpenReleaseCacheForTest();
+const fetchBeforeJd = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  const u = String(url);
+  if (u.includes('api.github.com')) throw new Error('github api rate-limited (uji jsdelivr)');
+  if (u.includes('info/refs?service=git-upload-pack')) return { ok: false, status: 403, json: async () => ({}), text: async () => '' };
+  if (u.includes('data.jsdelivr.com')) return { ok: true, status: 200, json: async () => ({ tags: {}, versions: ['1.1.31.1', '1.1.31', '1.1.30.3', '1.1.30.2', '1.1.30.1', '1.1.30', '1.1.29', '1.1.28', '1.2.0-beta'] }), text: async () => '{}' };
+  if (u.includes('/releases/tag/v1.1.31.1')) return { ok: true, status: 200, json: async () => ({}), text: async () => '<html><relative-time datetime="2026-11-14T16:30:49Z"></relative-time></html>' };
+  return fetchBeforeJd(u, init);
+};
+env.DB.rateLimits = new Map();
+r = await call('GET', '/api/cerpen-version'); t = await r.text();
+let cv5 = {};
+try { cv5 = JSON.parse(t); } catch (e) {}
+assert(r.status === 200 && cv5.tag === 'v1.1.31.1' && cv5.version === '1.1.31.1' && cv5.apk_url === 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.31.1/CerpenHozin-v1.1.31.1.apk' && cv5.published_at === '2026-11-14T16:30:49Z' && cv5.source === 'jsdelivr' && Array.isArray(cv5.tags) && cv5.tags.length === 8 && cv5.tags[0] === 'v1.1.31.1' && !cv5.tags.includes('v1.2.0-beta'), 'cerpen-version v87.4: API + github.com gagal -> jalur jsDelivr -> v1.1.31.1 (beta dikecualikan)');
+assert(env.BACKUP_DB.cerpenVersion.some(x => x.key === 'latest' && x.tag === 'v1.1.31.1'), 'cerpen-version v87.4: jalur jsDelivr juga menyegarkan baris D1 ke v1.1.31.1');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28' });
+assert(r.status === 426 && (await r.json()).error === 'version_locked', 'cerpen-lock v87.4: dengan data jsDelivr, sync v1.1.28 -> 426');
+globalThis.fetch = fetchBeforeJd;
 // v87: Sistem Koin Cerpen — auth aplikasi, dompet, voucher, VIP, leaderboard, riwayat, ban, pantauan.
 const DEV_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const DEV_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
