@@ -885,6 +885,14 @@ class MockDB {
     if (s.startsWith('INSERT INTO cerpen_content_votes')) { this.socialVotes.push({ kind: a[0], ref: a[1], voter_key: a[2], vote: a[3], device_id: a[4], user_id: a[5], created_at: a[6], updated_at: a[7] }); return []; }
     if (s.startsWith('UPDATE cerpen_content_votes SET vote = ?')) { const v = this.socialVotes.find(x => x.kind === a[2] && x.ref === a[3] && x.voter_key === a[4]); if (v) { v.vote = a[0]; v.updated_at = a[1]; } return []; }
     if (s.startsWith('DELETE FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND voter_key = ?')) { this.socialVotes = this.socialVotes.filter(v => !(v.kind === a[0] && v.ref === a[1] && v.voter_key === a[2])); return []; }
+    // v87.4: tracking like admin — daftar likers + tren + ringkasan per konten.
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND vote = 1')) return [{ n: this.socialVotes.filter(v => v.kind === a[0] && v.ref === a[1] && v.vote === 1).length }];
+    if (s.startsWith('SELECT kind, ref, voter_key, vote, device_id, user_id, created_at, updated_at FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND vote = 1 ORDER BY created_at DESC LIMIT ? OFFSET ?')) return [...this.socialVotes].filter(v => v.kind === a[0] && v.ref === a[1] && v.vote === 1).sort((x, y) => y.created_at - x.created_at).slice(a[3], a[3] + a[2]);
+    if (s.startsWith('SELECT created_at FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND vote = 1 AND created_at >= ?')) return this.socialVotes.filter(v => v.kind === a[0] && v.ref === a[1] && v.vote === 1 && Number(v.created_at) >= a[2]).map(v => ({ created_at: v.created_at }));
+    if (s.startsWith('SELECT created_at FROM cerpen_content_votes WHERE vote = 1 AND created_at >= ?')) return this.socialVotes.filter(v => v.vote === 1 && Number(v.created_at) >= a[0]).map(v => ({ created_at: v.created_at }));
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_content_stats WHERE likes > 0')) return [{ n: [...this.socialStats.values()].filter(x => x.likes > 0).length }];
+    if (s.startsWith('SELECT kind, ref, likes FROM cerpen_content_stats WHERE likes > 0 ORDER BY likes DESC LIMIT ? OFFSET ?')) return [...this.socialStats.values()].filter(x => x.likes > 0).sort((x, y) => y.likes - x.likes).slice(a[1], a[1] + a[0]).map(x => ({ kind: x.kind, ref: x.ref, likes: x.likes }));
+    if (s.startsWith('SELECT kind, ref, likes FROM cerpen_content_stats WHERE likes > 0 ORDER BY likes DESC LIMIT 20')) return [...this.socialStats.values()].filter(x => x.likes > 0).sort((x, y) => y.likes - x.likes).slice(0, 20).map(x => ({ kind: x.kind, ref: x.ref, likes: x.likes }));
     if (s.startsWith('SELECT id FROM cerpen_content_reports WHERE kind = ? AND ref = ? AND reporter_key = ? AND day = ?')) return this.socialReports.filter(r => r.kind === a[0] && r.ref === a[1] && r.reporter_key === a[2] && r.day === a[3]).map(r => ({ id: r.id }));
     if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_content_reports WHERE reporter_key = ? AND day = ?')) return [{ n: this.socialReports.filter(r => r.reporter_key === a[0] && r.day === a[1]).length }];
     if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_content_reports WHERE status = ?')) return [{ n: this.socialReports.filter(r => r.status === a[0]).length }];
@@ -2956,4 +2964,33 @@ assert(r.status === 200 && t.includes('Statistik Cerpen') && t.includes('Tidak d
 r = await call('GET', '/kendali', null, cookie);
 t = await r.text();
 assert(r.status === 200 && t.includes('Cerpen — Sosial') && t.includes('/kendali/statistik'), 'social dashboard: kartu ringkasan + tautan statistik');
+// v87.4: tracking like admin — daftar pemberi like + ringkasan + tren.
+env.DB.rateLimits = new Map();
+r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 1, device_id: SOC_DEV });
+assert(r.status === 200 && JSON.parse(await r.text()).likes === 1, 'social likers v87.4: like guest dulu (persiapan)');
+r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 1, device_id: SOC_DEV }, { authorization: 'Bearer ' + koinSession });
+assert(r.status === 200 && JSON.parse(await r.text()).likes === 2, 'social likers v87.4: like login dulu (persiapan)');
+r = await socialCall('GET', '/api/admin/cerpen-social/likes?kind=cerpen&ref=' + SOC_REF, null);
+assert(r.status === 401, 'social likers v87.4: tanpa sesi admin -> 401');
+r = await socialCall('GET', '/api/admin/cerpen-social/likes?kind=cerpen&ref=' + SOC_REF, null, { 'x-csrf': coinCsrf, cookie });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.total === 2 && sj.likers.length === 2, 'social likers v87.4: total 2 pemberi like');
+assert(sj.likers.some(l => l.voter_type === 'user' && l.username === 'koinuji' && l.voter === 'koinuji'), 'social likers v87.4: voter login tampil sebagai username koinuji');
+assert(sj.likers.some(l => l.voter_type === 'guest' && l.device_id === SOC_DEV && l.username === null), 'social likers v87.4: voter guest tampil sebagai device id');
+assert(sj.likers.every(l => l.created_at > 0 && typeof l.created_at_wib === 'string' && !('voter_key' in l) && !('user_id' in l)), 'social likers v87.4: waktu ada; voter_key/user_id mentah tidak bocor');
+assert(Array.isArray(sj.trend) && sj.trend.length === 7 && sj.trend.reduce((n, x) => n + x.likes, 0) === 2, 'social likers v87.4: tren 7 hari menjumlah 2 like');
+r = await socialCall('GET', '/api/admin/cerpen-social/likes?kind=cerpen&ref=' + SOC_REF + '&limit=1&offset=0', null, { 'x-csrf': coinCsrf, cookie });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.likers.length === 1 && sj.total === 2 && sj.limit === 1 && sj.offset === 0, 'social likers v87.4: limit=1 -> 1 baris + total 2');
+r = await socialCall('GET', '/api/admin/cerpen-social/likes?kind=cerpen&ref=' + SOC_REF + '&limit=1&offset=1', null, { 'x-csrf': coinCsrf, cookie });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.likers.length === 1, 'social likers v87.4: offset=1 -> 1 baris berikutnya');
+r = await socialCall('GET', '/api/admin/cerpen-social/likes?kind=cerpen&ref=x', null, { 'x-csrf': coinCsrf, cookie });
+assert(r.status === 400, 'social likers v87.4: ref format salah -> 400');
+r = await socialCall('GET', '/api/admin/cerpen-social/likes', null, { 'x-csrf': coinCsrf, cookie });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.total === 1 && sj.contents.length === 1 && sj.contents[0].ref === SOC_REF && sj.contents[0].likes === 2 && sj.trend.reduce((n, x) => n + x.likes, 0) === 2, 'social likers v87.4: ringkasan tanpa ref -> 1 konten, 2 like + tren');
+r = await call('GET', '/kendali/statistik', null, cookie);
+t = await r.text();
+assert(r.status === 200 && t.includes('Pemberi Like') && t.includes('Like baru per hari') && t.includes(SOC_REF), 'social likers v87.4: panel statistik tampilkan kartu Pemberi Like + tren like + picker konten');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

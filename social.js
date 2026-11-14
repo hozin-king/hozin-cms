@@ -123,6 +123,62 @@ async function validContent(env, kind, ref) {
   return { parsed: p };
 }
 
+// Tren like harian (hari WIB, dilengkapi 0) dari baris created_at (ms).
+// v87.4: tracking like — dipakai overview + endpoint daftar likers.
+function likesTrend(rows, range) {
+  const m = new Map();
+  for (const r of rows || []) { const d = wibDay(Number(r.created_at) || 0); m.set(d, (m.get(d) || 0) + 1); }
+  const out = [];
+  for (let i = range - 1; i >= 0; i--) { const d = wibDay(Date.now() - i * 24 * 3600 * 1000); out.push({ day: d, likes: m.get(d) || 0 }); }
+  return out;
+}
+
+// Judul konten untuk satu ref (BACKUP_DB; '' bila tak ketemu).
+async function contentTitle(env, kind, p) {
+  try {
+    const B = env.BACKUP_DB;
+    if (!B) return '';
+    if (kind === 'cerpen') { const r = await B.prepare(`SELECT judul FROM cerpen_episodes WHERE series_id = ? AND season = ? AND no = ?`).bind(p.series, p.season, p.no).first(); return r ? String(r.judul || '') : ''; }
+    if (kind === 'komik') { const r = await B.prepare(`SELECT judul FROM cerpen_komik_episodes WHERE komik_id = ? AND no = ?`).bind(p.komik, p.no).first(); return r ? String(r.judul || '') : ''; }
+    const r = await B.prepare(`SELECT id, title, summary, topic FROM cerpen_news WHERE id = ?`).bind(p.id).first(); return r ? String(r.title || '') : '';
+  } catch (e) { return ''; }
+}
+
+// Baris vote -> tampil admin: HANYA username/device id + waktu + konten.
+// Login: username via cms_users; vote lama tanpa username -> "akun login (id)".
+// Guest: device_id. voter_key mentah + user_id mentah tidak ikut keluar.
+async function withUsernames(env, rows) {
+  const ids = [...new Set((rows || []).map(r => r.user_id).filter(Boolean))];
+  const nameMap = new Map();
+  if (ids.length) {
+    const users = await env.DB.prepare(`SELECT id, username FROM cms_users`).all();
+    for (const u of (users.results || [])) if (ids.includes(u.id)) nameMap.set(u.id, u.username);
+  }
+  return (rows || []).map(r => {
+    const keyId = String(r.voter_key || '').replace(/^(user|device):/, '');
+    const isUser = !!(r.user_id || String(r.voter_key || '').startsWith('user:'));
+    const username = r.user_id ? (nameMap.get(r.user_id) || null) : null;
+    const deviceId = isUser ? '' : (r.device_id || keyId);
+    return {
+      voter_type: isUser ? 'user' : 'guest',
+      voter: username || (isUser ? 'akun login (' + (r.user_id || keyId) + ')' : deviceId),
+      username,
+      device_id: deviceId,
+      vote: Number(r.vote) || 0,
+      created_at: Number(r.created_at) || 0,
+      created_at_wib: wibText(r.created_at),
+    };
+  });
+}
+
+// Konten yang punya like (segar, bukan cache overview) — untuk picker panel.
+async function listLikedContents(env) {
+  try {
+    const rows = await env.DB.prepare(`SELECT kind, ref, likes FROM cerpen_content_stats WHERE likes > 0 ORDER BY likes DESC LIMIT 20`).all();
+    return (rows.results || []).map(r => ({ kind: r.kind, ref: r.ref, likes: Number(r.likes) || 0 }));
+  } catch (e) { return []; }
+}
+
 // ===================== Endpoint aplikasi =====================
 export async function handleSocialApi(request, env, url) {
   const path = url.pathname;
@@ -327,10 +383,13 @@ export async function getSocialStatsOverview(env, rangeDays) {
   for (let i = range - 1; i >= 0; i--) { const d = wibDay(Date.now() - i * 24 * 3600 * 1000); trend.push({ day: d, views: trendMap.get(d) || 0 }); }
   const nameMap = new Map((userRows.results || []).map(u => [u.id, u.username]));
   const contentRef = /^(cerpen|komik):[A-Za-z0-9_-]+:\d+(:\d+)?$/;
+  // v87.4: tren like harian (vote=1 baru per hari WIB).
+  const likeRows = await D.prepare(`SELECT created_at FROM cerpen_content_votes WHERE vote = 1 AND created_at >= ?`).bind(Date.now() - (range - 1) * 24 * 3600 * 1000).all();
   const data = {
     range, today, since, generated_at: Date.now(),
     totals: { views: Number(totals && totals.views) || 0, likes: Number(totals && totals.likes) || 0, dislikes: Number(totals && totals.dislikes) || 0, reports: Number(totals && totals.reports) || 0 },
     trend,
+    likes_trend: likesTrend(likeRows.results || [], range),
     top_views: (topRows.results || []).map(r => ({ kind: r.kind, ref: r.ref, title: titles.get(r.kind + '|' + r.ref) || '', views: Number(r.views) || 0, likes: Number(r.likes) || 0, dislikes: Number(r.dislikes) || 0 })),
     top_liked: (likedRows.results || []).map(r => ({ kind: r.kind, ref: r.ref, title: titles.get(r.kind + '|' + r.ref) || '', views: Number(r.views) || 0, likes: Number(r.likes) || 0, dislikes: Number(r.dislikes) || 0 })),
     reading: { total_seconds: Number(readTotal && readTotal.total) || 0, top: (readTopRows.results || []).map(r => ({ post_id: r.post_id, seconds: Number(r.total) || 0 })) },
@@ -369,6 +428,35 @@ export async function handleSocialAdminApi(request, env, url, admin) {
   if (method === 'GET' && path === '/api/admin/cerpen-social/stats-overview') {
     const range = Number(url.searchParams.get('range') || '7') === 28 ? 28 : 7;
     return aj({ ok: true, ...(await getSocialStatsOverview(env, range)) });
+  }
+  // GET /api/admin/cerpen-social/likes — tracking like (v87.4).
+  // Detail per konten (?kind=&ref=): daftar pemberi like — username untuk
+  // akun login, device id untuk guest — + waktu + tren harian konten itu.
+  // Tanpa ref: ringkasan total like per konten (paginasi) + tren global.
+  // Hanya username/device id + waktu + konten; tanpa data pribadi lain.
+  if (method === 'GET' && path === '/api/admin/cerpen-social/likes') {
+    const kind = String(url.searchParams.get('kind') || '');
+    const ref = String(url.searchParams.get('ref') || '');
+    const range = Number(url.searchParams.get('range') || '7') === 28 ? 28 : 7;
+    const limitRaw = Number(url.searchParams.get('limit'));
+    const offsetRaw = Number(url.searchParams.get('offset'));
+    const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : 50;
+    const offset = Number.isInteger(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
+    const sinceMs = Date.now() - (range - 1) * 24 * 3600 * 1000;
+    if (kind || ref) {
+      const p = ['cerpen', 'komik', 'berita'].includes(kind) ? parseRef(kind, ref) : null;
+      if (!p) return aj({ ok: false, error: 'invalid_ref' }, 400);
+      const totalRow = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND vote = 1`).bind(kind, ref).first();
+      const total = Number(totalRow && totalRow.n) || 0;
+      const rows = await env.DB.prepare(`SELECT kind, ref, voter_key, vote, device_id, user_id, created_at, updated_at FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND vote = 1 ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(kind, ref, limit, offset).all();
+      const trendRows = await env.DB.prepare(`SELECT created_at FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND vote = 1 AND created_at >= ?`).bind(kind, ref, sinceMs).all();
+      return aj({ ok: true, kind, ref, title: await contentTitle(env, kind, p), total, limit, offset, likers: await withUsernames(env, rows.results || []), trend: likesTrend(trendRows.results || [], range) });
+    }
+    const totalRow = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cerpen_content_stats WHERE likes > 0`).first();
+    const total = Number(totalRow && totalRow.n) || 0;
+    const rows = await env.DB.prepare(`SELECT kind, ref, likes FROM cerpen_content_stats WHERE likes > 0 ORDER BY likes DESC LIMIT ? OFFSET ?`).bind(limit, offset).all();
+    const trendRows = await env.DB.prepare(`SELECT created_at FROM cerpen_content_votes WHERE vote = 1 AND created_at >= ?`).bind(sinceMs).all();
+    return aj({ ok: true, total, limit, offset, contents: (rows.results || []).map(r => ({ kind: r.kind, ref: r.ref, likes: Number(r.likes) || 0 })), trend: likesTrend(trendRows.results || [], range) });
   }
   const m = path.match(/^\/api\/admin\/cerpen-social\/reports\/(rep-[0-9a-f]+)\/status$/);
   if (m && method === 'POST') {
@@ -414,6 +502,10 @@ export async function renderSocialStatsPanel(env, csrf, nav, notice, url) {
   const d = await getSocialStatsOverview(env, range);
   const num = n => Number(n || 0).toLocaleString('id-ID');
   const mins = s => Math.floor((Number(s) || 0) / 60).toLocaleString('id-ID');
+  const likedContents = await listLikedContents(env); // segar (bukan cache overview)
+  const likeOpts = likedContents.map(c => `<option value="${esc(c.kind + '|' + c.ref)}">${esc(c.kind)} · ${esc(c.ref)} (${num(c.likes)} like)</option>`).join('');
+  const likersCard = `<div class="card"><h3>❤️ Pemberi Like</h3><p class="meta">Siapa yang like, per konten — username untuk akun login, device id untuk guest. Hanya itu yang dicatat.</p>${likeOpts ? `<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">Konten<select id="likers-ref">${likeOpts}</select></label><button type="button" id="likers-load">Lihat pemberi like</button></div><div id="likers-out" style="margin-top:12px"></div>` : '<p>Belum ada like.</p>'}</div>`;
+  const likersScript = `<script>(function(){var csrf=${JSON.stringify(csrf)};var sel=document.getElementById('likers-ref');var out=document.getElementById('likers-out');if(!sel||!out)return;function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}var off=0;function load(o){off=o;var kv=sel.value.split('|');fetch('/api/admin/cerpen-social/likes?kind='+encodeURIComponent(kv[0])+'&ref='+encodeURIComponent(kv[1])+'&limit=50&offset='+off,{headers:{'x-csrf':csrf}}).then(function(r){return r.json()}).then(function(j){if(!j.ok){out.innerHTML='<p>Gagal: '+esc(j.error||'unknown')+'</p>';return}var rows=j.likers.map(function(l){return '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">'+esc(l.voter)+'</span><div class="adm-row-meta">'+(l.voter_type==='user'?'akun login':'guest')+' · '+esc(l.created_at_wib)+' WIB</div></div></div>'}).join('')||'<p>Belum ada pemberi like.</p>';var nav='';if(off>0)nav+='<button type="button" id="likers-prev">← Sebelumnya</button> ';if(off+50<j.total)nav+='<button type="button" id="likers-next">Berikutnya →</button>';out.innerHTML='<p class="meta">'+j.total+' pemberi like · '+esc(j.title||j.ref)+'</p>'+rows+'<div style="display:flex;gap:8px;margin-top:8px">'+nav+'</div>';var pv=document.getElementById('likers-prev');if(pv)pv.addEventListener('click',function(){load(Math.max(0,off-50))});var nx=document.getElementById('likers-next');if(nx)nx.addEventListener('click',function(){load(off+50)})}).catch(function(){out.innerHTML='<p>Gagal terhubung</p>'})}document.getElementById('likers-load').addEventListener('click',function(){load(0)});sel.addEventListener('change',function(){load(0)})})();<\/script>`;
   const maxTrend = Math.max(1, ...d.trend.map(t => t.views));
   const bar = (label, val, max, suffix) => `<div style="display:flex;align-items:center;gap:8px;margin:3px 0"><span style="flex:0 0 92px;font-size:12px;opacity:.8">${esc(label)}</span><span style="display:block;height:14px;background:#3b82f6;border-radius:4px;width:${Math.max(2, Math.round((Number(val) || 0) / max * 100))}%"></span><span style="font-size:12px">${num(val)}${suffix || ''}</span></div>`;
   const row = (cells) => `<div class="adm-row"><div class="adm-row-body">${cells}</div></div>`;
@@ -435,6 +527,8 @@ export async function renderSocialStatsPanel(env, csrf, nav, notice, url) {
     + `<div class="card"><h3>Views per hari — ${d.range} hari terakhir (penonton unik)</h3>${d.trend.map(t => bar(t.day.slice(5), t.views, maxTrend)).join('')}</div>`
     + `<div class="card"><h3>🔥 Konten teratas (views)</h3>${topViewsHtml}</div>`
     + `<div class="card"><h3>❤️ Konten teratas (like)</h3>${topLikedHtml}</div>`
+    + `<div class="card"><h3>❤️ Like baru per hari — ${d.range} hari terakhir</h3>${(d.likes_trend || []).map(t => bar(t.day.slice(5), t.likes, Math.max(1, ...(d.likes_trend || []).map(x => x.likes)), ' like')).join('') || '<p>Belum ada data.</p>'}</div>`
+    + likersCard + likersScript
     + `<div class="card"><h3>⏱️ Waktu baca per konten</h3>${readTopHtml}</div>`
     + `<div class="card"><h3>🔓 Episode paling banyak dibuka (unlock)</h3>${unlockHtml}</div>`
     + `<div class="card"><h3>🪙 Koin terpakai per konten</h3>${coinHtml}</div>`
