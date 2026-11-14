@@ -604,6 +604,9 @@ class MockDB {
     if (s.startsWith('DELETE FROM cerpen_unlocks WHERE owner_key = ?')) { this.coinUnlocks = this.coinUnlocks.filter(u => u.owner_key !== a[0]); return []; }
     if (s.startsWith('SELECT owner_key FROM cerpen_unlocks WHERE owner_key = ? AND kind = ?')) return this.coinUnlocks.filter(u => u.owner_key === a[0] && u.kind === a[1] && u.target_id === a[2] && u.season === a[3] && u.no === a[4]).map(u => ({ owner_key: u.owner_key }));
     if (s.startsWith('SELECT kind, target_id, season, no FROM cerpen_unlocks WHERE owner_key = ? ORDER BY created_at ASC')) return [...this.coinUnlocks].filter(u => u.owner_key === a[0]).sort((x, y) => x.created_at - y.created_at).map(u => ({ kind: u.kind, target_id: u.target_id, season: u.season, no: u.no }));
+    // v87.4: history berpaginasi (LIMIT ? OFFSET ?) — HARUS sebelum cabang
+    // generik tanpa ORDER BY di bawah (prefix sama, startsWith menang dulu).
+    if (s.startsWith('SELECT kind, target_id, season, no, created_at FROM cerpen_unlocks WHERE owner_key = ? ORDER BY created_at DESC LIMIT ? OFFSET ?')) return [...this.coinUnlocks].filter(u => u.owner_key === a[0]).sort((x, y) => y.created_at - x.created_at).slice(a[2], a[2] + a[1]);
     if (s.startsWith('SELECT kind, target_id, season, no, created_at FROM cerpen_unlocks WHERE owner_key = ?')) return [...this.coinUnlocks].filter(u => u.owner_key === a[0]).map(u => ({ kind: u.kind, target_id: u.target_id, season: u.season, no: u.no, created_at: u.created_at }));
     if (s.startsWith('SELECT kind, target_id, season, no, created_at FROM cerpen_unlocks WHERE owner_key = ? ORDER BY created_at DESC LIMIT 100')) return [...this.coinUnlocks].filter(u => u.owner_key === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 100);
     if (s.startsWith('SELECT kind, target_id, season, no FROM cerpen_unlocks WHERE owner_key = ?')) return this.coinUnlocks.filter(u => u.owner_key === a[0]).map(u => ({ kind: u.kind, target_id: u.target_id, season: u.season, no: u.no }));
@@ -725,6 +728,8 @@ class MockDB {
       return [{ c: set.size }];
     }
     if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_devices')) return [{ c: this.coinDevices.size }];
+    // v87.4: total unlock per akun (history) — sebelum hitungan global.
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_unlocks WHERE owner_key = ?')) return [{ c: this.coinUnlocks.filter(u => u.owner_key === a[0]).length }];
     if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_unlocks')) return [{ c: this.coinUnlocks.length }];
     // --- VIP ---
     if (s.startsWith('SELECT expires_at FROM cerpen_vip WHERE user_id = ?')) return this.coinVip.has(a[0]) ? [{ expires_at: this.coinVip.get(a[0]).expires_at }] : [];
@@ -2539,7 +2544,7 @@ rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.ok === true && rj.balance === 40 && rj.price === 10, 'koin purchase: episode 2 (10 koin) -> saldo 40');
 r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 2, device_id: DEV_A }, { cookie: koinUserCookie });
 rj = JSON.parse(await r.text());
-assert(r.status === 200 && rj.already === true, 'koin purchase: beli ulang episode yang sama -> already');
+assert(r.status === 200 && rj.already === true && rj.already_owned === true, 'koin purchase: beli ulang episode yang sama -> already + already_owned');
 r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 1, device_id: DEV_A }, { cookie: koinUserCookie });
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.free === true && rj.balance === 40, 'koin purchase: episode 1 gratis, saldo tetap 40');
@@ -2680,6 +2685,45 @@ assert(rj.leaderboard.some(x => x.username === 'koinuji'), 'koin leaderboard: se
 r = await coinCall('GET', '/api/cerpen-coins/history', null, { cookie: koinUserCookie });
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.unlocks.some(u => u.kind === 'cerpen' && u.target_id === 'cerpen-01' && u.no === 2) && rj.reading.some(x => x.target_id === 'cerpen-01' && x.no === 1 && x.seconds === 60), 'koin history: unlock + terakhir dibaca tampil');
+// v87.4: anti beli dobel + paginasi history ("Konten Dibeli").
+env.DB.rateLimits = new Map();
+r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
+me = JSON.parse(await r.text());
+const balDobel = me.balance;
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 2, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.already === true && rj.already_owned === true && rj.balance === balDobel, 'koin anti-dobel v87.4: beli ulang S1E2 berbayar -> already_owned, saldo tetap ' + balDobel);
+const ledgerBeforeDobel = env.DB.coinLedger.length;
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 1, device_id: DEV_A }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.already_owned === true && rj.balance === balDobel && env.DB.coinLedger.length === ledgerBeforeDobel, 'koin anti-dobel v87.4: beli ulang episode gratis -> already_owned, tanpa ledger baru');
+// Paginasi history: 6 unlock akun ini (cerpen S1E1, S1E2, S2E1, S3E1, S1E3 VIP + komik E1).
+r = await coinCall('GET', '/api/cerpen-coins/history?limit=2&offset=0', null, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.total === 6 && rj.unlocks.length === 2 && rj.limit === 2 && rj.offset === 0, 'koin history v87.4: limit=2 -> 2 unlock + total 6');
+const page1 = rj.unlocks.map(u => u.kind + ':' + u.target_id + ':' + u.season + ':' + u.no);
+r = await coinCall('GET', '/api/cerpen-coins/history?limit=2&offset=2', null, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.total === 6 && rj.unlocks.length === 2, 'koin history v87.4: offset=2 -> 2 unlock berikutnya');
+const page2 = rj.unlocks.map(u => u.kind + ':' + u.target_id + ':' + u.season + ':' + u.no);
+r = await coinCall('GET', '/api/cerpen-coins/history?limit=2&offset=4', null, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.total === 6 && rj.unlocks.length === 2, 'koin history v87.4: offset=4 -> 2 unlock terakhir');
+const page3 = rj.unlocks.map(u => u.kind + ':' + u.target_id + ':' + u.season + ':' + u.no);
+assert(new Set([...page1, ...page2, ...page3]).size === 6, 'koin history v87.4: 3 halaman menutupi 6 unlock berbeda');
+r = await coinCall('GET', '/api/cerpen-coins/history?limit=500', null, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.limit === 200 && rj.total === 6 && rj.unlocks.length === 6, 'koin history v87.4: limit=500 dijepit ke 200');
+r = await coinCall('GET', '/api/cerpen-coins/history', null, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.total === 6 && rj.unlocks.length === 6 && rj.limit === 100 && rj.offset === 0, 'koin history v87.4: tanpa param -> default limit 100 + total 6 (backward-compatible)');
+// Primitif atomik jalur balapan: INSERT OR IGNORE kedua -> changes 0;
+// UPDATE kondisional saldo kurang -> changes 0 (hanya satu pemenang).
+const raceKey = ['user:race-probe', 'cerpen', 'cerpen-01', 9, 9];
+const ri1 = await env.DB.prepare(`INSERT OR IGNORE INTO cerpen_unlocks (owner_key, kind, target_id, season, no, created_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(...raceKey, Date.now()).run();
+const ri2 = await env.DB.prepare(`INSERT OR IGNORE INTO cerpen_unlocks (owner_key, kind, target_id, season, no, created_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(...raceKey, Date.now()).run();
+assert(ri1.meta.changes === 1 && ri2.meta.changes === 0, 'koin anti-dobel v87.4: INSERT OR IGNORE kedua -> changes 0 (balapan ditolak)');
+await env.DB.prepare(`DELETE FROM cerpen_unlocks WHERE owner_key = ?`).bind('user:race-probe').run();
 // Admin adjust / ban / lock.
 r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/adjust', 'POST', { delta: 100, reason: 'uji beri' });
 rj = JSON.parse(await r.text());

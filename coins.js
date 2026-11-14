@@ -517,7 +517,9 @@ export async function handleCoinApi(request, env, url, adminEmail) {
     const existing = await env.DB.prepare(`SELECT owner_key FROM cerpen_unlocks WHERE owner_key = ? AND kind = ? AND target_id = ? AND season = ? AND no = ?`).bind(ident.ownerKey, kind, targetId, season, no).first();
     if (existing) {
       const w0 = await getWallet(env, ident.ownerKey);
-      return aj({ ok: true, already: true, balance: w0 ? Number(w0.balance) || 0 : 0 });
+      // v87.4: sudah-punya mengembalikan already_owned (alias eksplisit dari
+      // already) supaya klien "Konten Dibeli" tidak perlu menebak.
+      return aj({ ok: true, already: true, already_owned: true, balance: w0 ? Number(w0.balance) || 0 : 0 });
     }
     // VIP aktif: semua episode terkunci gratis, tanpa potong koin (cek
     // server-side; aplikasi tidak boleh memutuskan sendiri).
@@ -556,7 +558,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
       // Balapan beli ganda: unlock sudah ada (dari request lain) — refund.
       await env.DB.prepare(`UPDATE cerpen_wallets SET balance = balance + ?, updated_at = ? WHERE owner_key = ?`).bind(price, now, ident.ownerKey).run();
       await addLedger(env, { ownerKey: ident.ownerKey, userId: ident.userId, deviceId: ident.deviceId, delta: price, balanceAfter: balBefore, reason: 'refund beli ganda', ref: kind + ':' + targetId + ':' + season + ':' + no });
-      return aj({ ok: true, already: true, balance: balBefore });
+      return aj({ ok: true, already: true, already_owned: true, balance: balBefore });
     }
     await addLedger(env, { ownerKey: ident.ownerKey, userId: ident.userId, deviceId: ident.deviceId, delta: -price, balanceAfter: balAfter, reason: 'beli episode', ref: kind + ':' + targetId + ':' + season + ':' + no });
     await touchDeviceWatch(env, ident.deviceId, ident.androidId);
@@ -640,7 +642,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
       await env.DB.batch(fresh.map(e => env.DB.prepare(`INSERT OR IGNORE INTO cerpen_unlocks (owner_key, kind, target_id, season, no, created_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(ident.ownerKey, e.kind, e.target_id, e.season, e.no, now)));
     }
     await addLedger(env, { ownerKey: ident.ownerKey, userId: ident.userId, deviceId: ident.deviceId, delta: 0, balanceAfter: balBefore, reason: 'tukar kode: ' + rewardLabel(v), ref: codeHash.slice(0, 8) });
-    return aj({ ok: true, reward_type: rewardType, reward_label: rewardLabel(v), unlocks_granted: fresh.length, unlocks_total: episodes.length, already: fresh.length === 0, balance: balBefore });
+    return aj({ ok: true, reward_type: rewardType, reward_label: rewardLabel(v), unlocks_granted: fresh.length, unlocks_total: episodes.length, already: fresh.length === 0, already_owned: fresh.length === 0, balance: balBefore });
   }
 
   // ---- Waktu baca aplikasi (19:17) — tulis ke tabel pelacak v81 ----
@@ -696,19 +698,27 @@ export async function handleCoinApi(request, env, url, adminEmail) {
   }
 
   // ---- Riwayat konten (19:17) — yang dibeli + terakhir dibaca ----
+  // v87.4: paginasi untuk daftar "Konten Dibeli" — ?limit= (default 100,
+  // maks 200) & ?offset= (default 0); respons membawa total unlock akun.
   if (method === 'GET' && path === '/api/cerpen-coins/history') {
     const ident = await resolveCoinIdentity(request, env, null);
     if (!ident) return aj({ ok: false, error: 'Login dulu atau kirim device_id.' }, 401);
     const banned = await bannedIfSession(env, ident);
     if (banned) return banned;
-    const unlocks = await env.DB.prepare(`SELECT kind, target_id, season, no, created_at FROM cerpen_unlocks WHERE owner_key = ? ORDER BY created_at DESC LIMIT 100`).bind(ident.ownerKey).all();
+    const limitRaw = Number(url.searchParams.get('limit'));
+    const offsetRaw = Number(url.searchParams.get('offset'));
+    const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 100;
+    const offset = Number.isInteger(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
+    const totalRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM cerpen_unlocks WHERE owner_key = ?`).bind(ident.ownerKey).first();
+    const total = Number(totalRow?.c) || 0;
+    const unlocks = await env.DB.prepare(`SELECT kind, target_id, season, no, created_at FROM cerpen_unlocks WHERE owner_key = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(ident.ownerKey, limit, offset).all();
     // Tabel v81 keyed by id akun mentah (bukan ownerKey); guest tidak
     // punya baris di sana -> reading kosong.
     const read = ident.kind === 'user'
       ? await env.DB.prepare(`SELECT post_id, SUM(seconds) AS s, MAX(day_wib) AS last_day FROM cms_reading_sessions WHERE user_id = ? AND (post_id LIKE 'cerpen:%' OR post_id LIKE 'komik:%') GROUP BY post_id ORDER BY last_day DESC LIMIT 50`).bind(ident.userId).all()
       : { results: [] };
     const reading = (read.results || []).map(r => ({ ...(parsePostId(r.post_id) || { kind: '', target_id: r.post_id, season: 1, no: 0 }), seconds: Number(r.s) || 0, last_day: r.last_day }));
-    return aj({ ok: true, unlocks: unlocks.results || [], reading });
+    return aj({ ok: true, unlocks: unlocks.results || [], total, limit, offset, reading });
   }
 
   // ---- Privasi papan peringkat (19:17) — sembunyikan diri ----
