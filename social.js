@@ -1,5 +1,7 @@
 // Fitur sosial Cerpen Hozin (CMS v87.3, 14 Nov 2026) — view + like +
 // dislike + report per konten, + statistik ala YouTube Studio (admin).
+// v87.5 (15 Nov 2026): bookmark ikut akun — GET/POST/DELETE
+// /api/cerpen-bookmarks (tabel cerpen_bookmarks, wajib sesi akun).
 //
 // Kontrak API (frozen): kind ∈ {cerpen, komik, berita}; ref cerpen =
 // "series:season:no", komik = "komik:no", berita = id baris cerpen_news.
@@ -310,6 +312,74 @@ export async function handleSocialApi(request, env, url) {
     }
     return aj({ ok: true, stats });
   }
+  return null;
+}
+
+// ===================== Bookmark ikut akun (v87.5, 15 Nov 2026) =====================
+// GET / POST / DELETE /api/cerpen-bookmarks — sinkron bookmark series
+// (cerpen/komik/berita) ke akun. WAJIB sesi akun (resolveSocialUser,
+// cookie cms_user ATAU Bearer — sama seperti vote/dislike); guest
+// ditolak 401 login_required (guest tetap simpan lokal di aplikasi).
+// content_id = id series/komik/berita — untuk berita, judul juga
+// diterima (fallback aplikasi untuk data lama tanpa id baris).
+// Tabel cerpen_bookmarks tinggal di D1 cms-db (env.DB); keberadaan
+// konten dicek di stopwatch-db (env.BACKUP_DB) seperti endpoint sosial.
+function validBookmarkId(v) {
+  return typeof v === 'string' && v.trim().length >= 1 && v.length <= 500 && !/[\u0000-\u001F\u007F]/.test(v);
+}
+
+async function bookmarkContentExists(env, kind, contentId) {
+  const B = env.BACKUP_DB;
+  if (!B) return false;
+  if (kind === 'cerpen') return !!(await B.prepare(`SELECT id FROM cerpen_series WHERE id = ?`).bind(contentId).first());
+  if (kind === 'komik') return !!(await B.prepare(`SELECT id FROM cerpen_komik WHERE id = ?`).bind(contentId).first());
+  if (await B.prepare(`SELECT id, title, summary, topic FROM cerpen_news WHERE id = ?`).bind(contentId).first()) return true;
+  return !!(await B.prepare(`SELECT id FROM cerpen_news WHERE title = ?`).bind(contentId).first());
+}
+
+export async function handleBookmarksApi(request, env, url) {
+  const path = url.pathname;
+  const method = request.method;
+  if (path !== '/api/cerpen-bookmarks') return null;
+  if (!env.DB) return aj({ ok: false, error: 'database_unavailable' }, 503);
+  const user = await resolveSocialUser(request, env);
+  if (!user) return aj({ ok: false, error: 'login_required' }, 401);
+  const ban = await socialBanCheck(env, user.id);
+  if (ban) return aj(ban, 403);
+
+  // GET /api/cerpen-bookmarks — daftar bookmark milik akun ini.
+  if (method === 'GET') {
+    const rows = await env.DB.prepare(`SELECT kind, content_id, created_at FROM cerpen_bookmarks WHERE user_id = ? ORDER BY created_at DESC`).bind(user.id).all();
+    return aj({ ok: true, bookmarks: (rows.results || []).map(r => ({ kind: r.kind, content_id: r.content_id, created_at: Number(r.created_at) || 0, created_at_wib: wibText(r.created_at) })) });
+  }
+
+  // POST /api/cerpen-bookmarks {kind, content_id} — idempotent.
+  if (method === 'POST') {
+    if (!(await checkRateLimit(env, 'bm-add:' + user.id, 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'too_many_requests' }, 429);
+    const { body, err } = await readJsonBody(request);
+    if (err) return aj({ ok: false, error: err }, 400);
+    const kind = String(body.kind || '');
+    const contentId = String(body.content_id || '');
+    if (!['cerpen', 'komik', 'berita'].includes(kind)) return aj({ ok: false, error: 'invalid_kind' }, 400);
+    if (!validBookmarkId(contentId)) return aj({ ok: false, error: 'invalid_content_id' }, 400);
+    if (!(await bookmarkContentExists(env, kind, contentId))) return aj({ ok: false, error: 'invalid_ref' }, 400);
+    const ins = await env.DB.prepare(`INSERT OR IGNORE INTO cerpen_bookmarks (user_id, kind, content_id, created_at) VALUES (?, ?, ?, ?)`).bind(user.id, kind, contentId, Date.now()).run();
+    const added = ins && ins.meta && Number(ins.meta.changes) === 1;
+    return aj({ ok: true, added, already: !added });
+  }
+
+  // DELETE /api/cerpen-bookmarks?kind=&content_id= — hapus bookmark.
+  if (method === 'DELETE') {
+    if (!(await checkRateLimit(env, 'bm-del:' + user.id, 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'too_many_requests' }, 429);
+    const kind = String(url.searchParams.get('kind') || '');
+    const contentId = String(url.searchParams.get('content_id') || '');
+    if (!['cerpen', 'komik', 'berita'].includes(kind)) return aj({ ok: false, error: 'invalid_kind' }, 400);
+    if (!validBookmarkId(contentId)) return aj({ ok: false, error: 'invalid_content_id' }, 400);
+    const del = await env.DB.prepare(`DELETE FROM cerpen_bookmarks WHERE user_id = ? AND kind = ? AND content_id = ?`).bind(user.id, kind, contentId).run();
+    const removed = del && del.meta && Number(del.meta.changes) === 1;
+    return aj({ ok: true, removed });
+  }
+
   return null;
 }
 

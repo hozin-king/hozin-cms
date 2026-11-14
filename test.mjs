@@ -99,6 +99,8 @@ class MockDB {
     this.socialVotes = []; // {kind, ref, voter_key, vote, device_id, user_id, created_at, updated_at}
     this.socialViews = []; // {kind, ref, viewer_key, day, created_at}
     this.socialReports = []; // {id, kind, ref, reporter_key, device_id, user_id, category, note, status, day, created_at, updated_at}
+    // v87.5: bookmark ikut akun (cms-db).
+    this.bookmarks = []; // {user_id, kind, content_id, created_at}
     // v81: agregat waktu baca (sudah ada array-nya di constructor; isi di
     // sini hanya penegas — handler upsert ada di bawah).
     this.readingSessions = this.readingSessions || [];
@@ -887,6 +889,12 @@ class MockDB {
     if (s.startsWith('UPDATE cerpen_content_votes SET vote = ?')) { const v = this.socialVotes.find(x => x.kind === a[2] && x.ref === a[3] && x.voter_key === a[4]); if (v) { v.vote = a[0]; v.updated_at = a[1]; } return []; }
     if (s.startsWith('DELETE FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND voter_key = ?')) { this.socialVotes = this.socialVotes.filter(v => !(v.kind === a[0] && v.ref === a[1] && v.voter_key === a[2])); return []; }
     // v87.4: tracking like admin — daftar likers + tren + ringkasan per konten.
+    if (s.startsWith('SELECT id FROM cerpen_komik WHERE id = ?')) return this.cerpenKomik.filter(x => x.id === a[0]).map(x => ({ id: x.id }));
+    if (s.startsWith('SELECT id FROM cerpen_news WHERE title = ?')) return this.cerpenNews.filter(x => x.title === a[0]).map(x => ({ id: x.id }));
+    // v87.5: bookmark ikut akun (tabel cerpen_bookmarks).
+    if (s.startsWith('INSERT OR IGNORE INTO cerpen_bookmarks')) { const ex = this.bookmarks.some(b => b.user_id === a[0] && b.kind === a[1] && b.content_id === a[2]); if (ex) return { changes: 0 }; this.bookmarks.push({ user_id: a[0], kind: a[1], content_id: a[2], created_at: a[3] }); return { changes: 1 }; }
+    if (s.startsWith('SELECT kind, content_id, created_at FROM cerpen_bookmarks WHERE user_id = ? ORDER BY created_at DESC')) return [...this.bookmarks].filter(b => b.user_id === a[0]).sort((x, y) => y.created_at - x.created_at).map(b => ({ kind: b.kind, content_id: b.content_id, created_at: b.created_at }));
+    if (s.startsWith('DELETE FROM cerpen_bookmarks WHERE user_id = ? AND kind = ? AND content_id = ?')) { const before = this.bookmarks.length; this.bookmarks = this.bookmarks.filter(b => !(b.user_id === a[0] && b.kind === a[1] && b.content_id === a[2])); return { changes: before - this.bookmarks.length }; }
     if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND vote = 1')) return [{ n: this.socialVotes.filter(v => v.kind === a[0] && v.ref === a[1] && v.vote === 1).length }];
     if (s.startsWith('SELECT kind, ref, voter_key, vote, device_id, user_id, created_at, updated_at FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND vote = 1 ORDER BY created_at DESC LIMIT ? OFFSET ?')) return [...this.socialVotes].filter(v => v.kind === a[0] && v.ref === a[1] && v.vote === 1).sort((x, y) => y.created_at - x.created_at).slice(a[3], a[3] + a[2]);
     if (s.startsWith('SELECT created_at FROM cerpen_content_votes WHERE kind = ? AND ref = ? AND vote = 1 AND created_at >= ?')) return this.socialVotes.filter(v => v.kind === a[0] && v.ref === a[1] && v.vote === 1 && Number(v.created_at) >= a[2]).map(v => ({ created_at: v.created_at }));
@@ -3063,4 +3071,42 @@ assert(r.status === 200 && sj.total === 1 && sj.contents.length === 1 && sj.cont
 r = await call('GET', '/kendali/statistik', null, cookie);
 t = await r.text();
 assert(r.status === 200 && t.includes('Pemberi Like') && t.includes('Like baru per hari') && t.includes(SOC_REF), 'social likers v87.4: panel statistik tampilkan kartu Pemberi Like + tren like + picker konten');
+// v87.5: bookmark ikut akun — GET/POST/DELETE /api/cerpen-bookmarks.
+async function bmCall(method, path, obj, headers = {}) {
+  const h = { 'content-type': 'application/json', ...headers };
+  const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
+  return worker.fetch(req, env);
+}
+r = await bmCall('GET', '/api/cerpen-bookmarks', null);
+assert(r.status === 401 && JSON.parse(await r.text()).error === 'login_required', 'bookmark v87.5: tanpa sesi -> 401 login_required');
+r = await bmCall('POST', '/api/cerpen-bookmarks', { kind: 'cerpen', content_id: 'cerpen-01' });
+assert(r.status === 401, 'bookmark v87.5: POST tanpa sesi -> 401');
+r = await bmCall('DELETE', '/api/cerpen-bookmarks?kind=cerpen&content_id=cerpen-01', null);
+assert(r.status === 401, 'bookmark v87.5: DELETE tanpa sesi -> 401');
+env.DB.rateLimits = new Map();
+r = await bmCall('POST', '/api/cerpen-bookmarks', { kind: 'cerpen', content_id: 'cerpen-01' }, { authorization: 'Bearer ' + koinSession });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.added === true, 'bookmark v87.5: tambah cerpen-01 ok, added=true');
+r = await bmCall('POST', '/api/cerpen-bookmarks', { kind: 'cerpen', content_id: 'cerpen-01' }, { authorization: 'Bearer ' + koinSession });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.added === false && sj.already === true, 'bookmark v87.5: tambah kedua = idempotent already');
+r = await bmCall('POST', '/api/cerpen-bookmarks', { kind: 'komik', content_id: 'komik-01' }, { authorization: 'Bearer ' + koinSession });
+assert(r.status === 200 && JSON.parse(await r.text()).added === true, 'bookmark v87.5: tambah komik-01 ok');
+r = await bmCall('POST', '/api/cerpen-bookmarks', { kind: 'berita', content_id: 'Judul Berita' }, { authorization: 'Bearer ' + koinSession });
+assert(r.status === 200 && JSON.parse(await r.text()).added === true, 'bookmark v87.5: tambah berita via judul ok');
+r = await bmCall('POST', '/api/cerpen-bookmarks', { kind: 'cerpen', content_id: 'cerpen-99' }, { authorization: 'Bearer ' + koinSession });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'invalid_ref', 'bookmark v87.5: series tak ada -> 400 invalid_ref');
+r = await bmCall('POST', '/api/cerpen-bookmarks', { kind: 'ngaco', content_id: 'x' }, { authorization: 'Bearer ' + koinSession });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'invalid_kind', 'bookmark v87.5: kind tak dikenal -> 400 invalid_kind');
+r = await bmCall('GET', '/api/cerpen-bookmarks', null, { authorization: 'Bearer ' + koinSession });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.bookmarks.length === 3 && sj.bookmarks.some(b => b.kind === 'cerpen' && b.content_id === 'cerpen-01') && sj.bookmarks.some(b => b.kind === 'berita' && b.content_id === 'Judul Berita'), 'bookmark v87.5: GET daftar 3 bookmark milik akun');
+r = await bmCall('DELETE', '/api/cerpen-bookmarks?kind=cerpen&content_id=cerpen-01', null, { authorization: 'Bearer ' + koinSession });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.removed === true, 'bookmark v87.5: hapus cerpen-01 removed=true');
+r = await bmCall('DELETE', '/api/cerpen-bookmarks?kind=cerpen&content_id=cerpen-01', null, { authorization: 'Bearer ' + koinSession });
+assert(r.status === 200 && JSON.parse(await r.text()).removed === false, 'bookmark v87.5: hapus kedua removed=false');
+r = await bmCall('GET', '/api/cerpen-bookmarks', null, { authorization: 'Bearer ' + koinSession });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.bookmarks.length === 2 && !sj.bookmarks.some(b => b.kind === 'cerpen'), 'bookmark v87.5: GET setelah hapus tinggal 2');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

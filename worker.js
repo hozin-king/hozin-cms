@@ -31,7 +31,7 @@ import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRe
 import { checkRateLimit } from './security.js';
 import { validEmail, issueOtp, verifyOtp, OTP_SEND_LIMIT, OTP_SEND_WINDOW_MS } from './otp.js';
 import { handleCoinApi, handleCoinAdmin, renderCoinPanel } from './coins.js';
-import { handleSocialApi, handleSocialAdminApi, renderSocialReportsPanel, renderSocialStatsPanel, getSocialDashboardSummary } from './social.js';
+import { handleSocialApi, handleSocialAdminApi, handleBookmarksApi, renderSocialReportsPanel, renderSocialStatsPanel, getSocialDashboardSummary } from './social.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
 import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, STOPWATCH_EVENTS, nextEventMs, readingTrackerScript, HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
 import { ensureSchema, getSetting, getAllSettings, getEnabledPlugins, doBackup, renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
@@ -1640,6 +1640,12 @@ async function handleFetch(request, env) {
     // formData()) karena membaca body JSON.
     if (path.startsWith('/api/cerpen-social/')) {
       const r = await handleSocialApi(request, env, url);
+      if (r) return r;
+    }
+    // ---- Bookmark ikut akun (v87.5, modul social.js) ----
+    // GET/POST/DELETE /api/cerpen-bookmarks — sinkron ke akun.
+    if (path === '/api/cerpen-bookmarks') {
+      const r = await handleBookmarksApi(request, env, url);
       if (r) return r;
     }
     if (path.startsWith('/api/admin/cerpen-social/')) {
