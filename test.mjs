@@ -84,6 +84,12 @@ class MockDB {
     this.tttPlayers = new Map(); // account_id -> row pemain
     this.tttChats = []; // {id, sender_id, sender_name, message, created_at}
     this.tttChatSeq = 0;
+    // v1.1.0: wilayah + banned + flags TTT.
+    this.tttRegions = []; // {code, parent_code, level, name}
+    this.tttBans = []; // {id, account_id, ban_type, reason, created_by, created_at, expires_at, revoked_at}
+    this.tttBanSeq = 0;
+    this.tttFlags = []; // {id, account_id, reason, details, created_at, reviewed}
+    this.tttFlagSeq = 0;
     // v87: state Sistem Koin Cerpen (cms-db) — dompet, unlock, voucher, VIP,
     // ban, pantauan, ledger, audit + tabel pelacak baca v81 (dipakai papan
     // peringkat/riwayat). BACKUP_DB memakai instance MockDB yang sama,
@@ -966,13 +972,31 @@ class MockDB {
     if (s.startsWith('SELECT id, title, added_at FROM cerpen_news ORDER BY added_at DESC LIMIT 5')) return [...this.cerpenNews].sort((x, y) => String(y.added_at || '').localeCompare(String(x.added_at || ''))).slice(0, 5).map(x => ({ id: x.id, title: x.title, added_at: x.added_at }));
     // Tap Tap Tycoon (D1 stopwatch-db, binding BACKUP_DB).
     if (s.startsWith('SELECT account_id, player_name, total_energy_all_time, likes FROM ttt_players')) return [...this.tttPlayers.values()].sort((x, y) => (Number(y.total_energy_all_time) || 0) - (Number(x.total_energy_all_time) || 0)).slice(0, a[0]).map(x => ({ account_id: x.account_id, player_name: x.player_name, total_energy_all_time: x.total_energy_all_time, likes: x.likes }));
+    // v1.1.0: leaderboard scope (tanpa LIMIT di SQL — filter + rank di JS).
+    if (s.startsWith('SELECT account_id, player_name, total_energy_all_time, likes, province_code, regency_code, district_code, ban_type, ban_until FROM ttt_players')) return [...this.tttPlayers.values()].sort((x, y) => (Number(y.total_energy_all_time) || 0) - (Number(x.total_energy_all_time) || 0)).map(x => ({ account_id: x.account_id, player_name: x.player_name, total_energy_all_time: x.total_energy_all_time, likes: x.likes, province_code: x.province_code || '', regency_code: x.regency_code || '', district_code: x.district_code || '', ban_type: x.ban_type || null, ban_until: x.ban_until || '' }));
     if (s.startsWith('SELECT * FROM ttt_players WHERE account_id = ?')) return this.tttPlayers.has(a[0]) ? [this.tttPlayers.get(a[0])] : [];
-    if (s.startsWith('SELECT score, total_energy_all_time, levels, last_seen_at FROM ttt_players WHERE account_id = ?')) { const r = this.tttPlayers.get(a[0]); return r ? [{ score: r.score, total_energy_all_time: r.total_energy_all_time, levels: r.levels, last_seen_at: r.last_seen_at }] : []; }
+    if (s.startsWith('SELECT score, total_energy_all_time, levels, last_seen_at, ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?')) { const r = this.tttPlayers.get(a[0]); return r ? [{ score: r.score, total_energy_all_time: r.total_energy_all_time, levels: r.levels, last_seen_at: r.last_seen_at, ban_type: r.ban_type || null, ban_reason: r.ban_reason || '', ban_until: r.ban_until || '' }] : []; }
+    if (s.startsWith('SELECT ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?')) { const r = this.tttPlayers.get(a[0]); return r ? [{ ban_type: r.ban_type || null, ban_reason: r.ban_reason || '', ban_until: r.ban_until || '' }] : []; }
     if (s.startsWith('UPDATE ttt_players SET score = ?')) { const r = this.tttPlayers.get(a[4]); if (r) { r.score = a[0]; r.total_energy_all_time = a[1]; r.last_seen_at = a[2]; r.updated_at = a[3]; } return []; }
-    if (s.startsWith('INSERT INTO ttt_players')) { this.tttPlayers.set(a[0], { account_id: a[0], player_name: a[1], score: a[2], total_energy_all_time: a[3], click_level: a[4], auto_level: a[5], levels: a[6], last_seen_at: a[7], friends: a[8], likes: a[9], updated_at: a[10] }); return []; }
+    if (s.startsWith('INSERT INTO ttt_players')) { this.tttPlayers.set(a[0], { account_id: a[0], player_name: a[1], score: a[2], total_energy_all_time: a[3], click_level: a[4], auto_level: a[5], levels: a[6], last_seen_at: a[7], friends: a[8], likes: a[9], updated_at: a[10], province_code: '', regency_code: '', district_code: '', region_updated_at: '', ban_type: null, ban_reason: '', ban_until: '', ban_created_at: '' }); return []; }
     if (s.startsWith('UPDATE ttt_players SET likes = likes + 1')) { const r = this.tttPlayers.get(a[1]); if (!r) return []; r.likes = (Number(r.likes) || 0) + 1; r.updated_at = a[0]; return [{ likes: r.likes }]; }
     if (s.startsWith('SELECT sender_id, sender_name, message, created_at FROM ttt_chats')) return [...this.tttChats].sort((x, y) => y.id - x.id).slice(0, a[0]).map(x => ({ sender_id: x.sender_id, sender_name: x.sender_name, message: x.message, created_at: x.created_at }));
+    if (s.startsWith('SELECT c.sender_id, c.sender_name, c.message, c.created_at, p.ban_type, p.ban_until FROM ttt_chats c LEFT JOIN ttt_players p')) return [...this.tttChats].sort((x, y) => y.id - x.id).slice(0, a[0]).map(x => { const p = this.tttPlayers.get(x.sender_id); return { sender_id: x.sender_id, sender_name: x.sender_name, message: x.message, created_at: x.created_at, ban_type: p ? (p.ban_type || null) : null, ban_until: p ? (p.ban_until || '') : '' }; });
     if (s.startsWith('INSERT INTO ttt_chats')) { this.tttChats.push({ id: ++this.tttChatSeq, sender_id: a[0], sender_name: a[1], message: a[2], created_at: a[3] }); return []; }
+    // v1.1.0: regions.
+    if (s.startsWith('SELECT code, parent_code, level, name FROM ttt_regions WHERE code = ?')) { const r = this.tttRegions.find(x => x.code === a[0]); return r ? [{ code: r.code, parent_code: r.parent_code, level: r.level, name: r.name }] : []; }
+    if (s.startsWith('SELECT code, name, level FROM ttt_regions WHERE parent_code = ? ORDER BY name ASC')) return [...this.tttRegions].filter(x => x.parent_code === a[0]).sort((x, y) => x.name.localeCompare(y.name)).map(x => ({ code: x.code, name: x.name, level: x.level }));
+    if (s.startsWith('SELECT code, name, level FROM ttt_regions WHERE level = ? ORDER BY name ASC')) return [...this.tttRegions].filter(x => x.level === a[0]).sort((x, y) => x.name.localeCompare(y.name)).map(x => ({ code: x.code, name: x.name, level: x.level }));
+    if (s.startsWith('SELECT code, name, level FROM ttt_regions ORDER BY name ASC')) return [...this.tttRegions].sort((x, y) => x.name.localeCompare(y.name)).map(x => ({ code: x.code, name: x.name, level: x.level }));
+    // v1.1.0: region pemain + ban + flags.
+    if (s.startsWith('UPDATE ttt_players SET province_code = ?, regency_code = ?, district_code = ?, region_updated_at = ?, updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[5]); if (r) { r.province_code = a[0]; r.regency_code = a[1]; r.district_code = a[2]; r.region_updated_at = a[3]; r.updated_at = a[4]; } return []; }
+    if (s.startsWith('UPDATE ttt_players SET ban_type = NULL, ban_reason = ?, ban_until = ?, ban_created_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[3]); if (r) { r.ban_type = null; r.ban_reason = ''; r.ban_until = ''; r.ban_created_at = ''; } return []; }
+    if (s.startsWith('UPDATE ttt_players SET ban_type = ?, ban_reason = ?, ban_until = ?, ban_created_at = ?, updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[5]); if (r) { r.ban_type = a[0]; r.ban_reason = a[1]; r.ban_until = a[2]; r.ban_created_at = a[3]; r.updated_at = a[4]; } return []; }
+    if (s.startsWith('INSERT INTO ttt_bans')) { this.tttBans.push({ id: ++this.tttBanSeq, account_id: a[0], ban_type: a[1], reason: a[2], created_by: a[3], created_at: a[4], expires_at: a[5], revoked_at: a[6] }); return []; }
+    if (s.startsWith('SELECT id FROM ttt_bans WHERE account_id = ? AND revoked_at = ? ORDER BY id DESC LIMIT 1')) { const rows = this.tttBans.filter(x => x.account_id === a[0] && x.revoked_at === a[1]).sort((x, y) => y.id - x.id); return rows.length ? [{ id: rows[0].id }] : []; }
+    if (s.startsWith('UPDATE ttt_bans SET revoked_at = ? WHERE id = ?')) { const r = this.tttBans.find(x => x.id === a[1]); if (r) r.revoked_at = a[0]; return []; }
+    if (s.startsWith('INSERT INTO ttt_flags')) { this.tttFlags.push({ id: ++this.tttFlagSeq, account_id: a[0], reason: a[1], details: a[2], created_at: a[3], reviewed: 0 }); return []; }
+    if (s.startsWith('SELECT id, account_id, reason, details, created_at, reviewed FROM ttt_flags WHERE reviewed = 0 ORDER BY id DESC LIMIT 100')) return [...this.tttFlags].filter(x => x.reviewed === 0).sort((x, y) => y.id - x.id).map(x => ({ id: x.id, account_id: x.account_id, reason: x.reason, details: x.details, created_at: x.created_at, reviewed: x.reviewed }));
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -3231,12 +3255,13 @@ r = await bmCall('GET', '/api/cerpen-bookmarks', null, { authorization: 'Bearer 
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.bookmarks.length === 2 && !sj.bookmarks.some(b => b.kind === 'cerpen'), 'bookmark v87.5: GET setelah hapus tinggal 2');
 // Tap Tap Tycoon — API /api/taptap/* (D1 stopwatch-db via BACKUP_DB).
-async function tttCall(method, path, obj) {
-  const req = new Request(base + path, { method, headers: { 'content-type': 'application/json' }, body: obj === null ? undefined : JSON.stringify(obj) });
+async function tttCall(method, path, obj, headers = {}) {
+  const req = new Request(base + path, { method, headers: { 'content-type': 'application/json', ...headers }, body: obj === null ? undefined : JSON.stringify(obj) });
   return worker.fetch(req, env);
 }
+const TTT_ADMIN_H = { authorization: 'Bearer test-admin-token' };
 r = await tttCall('GET', '/api/taptap/version', null);
-assert(r.status === 200 && JSON.parse(await r.text()).latest_version === '1.0.0', 'taptap: GET /version -> 1.0.0');
+assert(r.status === 200 && JSON.parse(await r.text()).latest_version === '1.1.0', 'taptap: GET /version -> 1.1.0');
 r = await tttCall('GET', '/api/taptap/leaderboard', null);
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && Array.isArray(sj.players) && sj.players.length === 0, 'taptap: leaderboard kosong awal');
@@ -3270,4 +3295,154 @@ sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.players.length === 1 && sj.players[0].account_id === '12345678', 'taptap: leaderboard tampilkan pemain setelah upsert');
 r = await tttCall('GET', '/api/taptap/ngaco', null);
 assert(r.status === 404, 'taptap: segmen tak dikenal -> 404');
+// ---- v1.1.0: regions + leaderboard per wilayah + banned + validasi skor ----
+// Seed wilayah mock (kode dotted ala Kemendagri: 15 Jambi, 15.09 Tebo, 15.09.01 Tebo Tengah).
+env.BACKUP_DB.tttRegions.push(
+  { code: '15', parent_code: '', level: 'province', name: 'Jambi' },
+  { code: '16', parent_code: '', level: 'province', name: 'Sumatera Selatan' },
+  { code: '15.09', parent_code: '15', level: 'regency', name: 'Tebo' },
+  { code: '15.01', parent_code: '15', level: 'regency', name: 'Kerinci' },
+  { code: '15.09.01', parent_code: '15.09', level: 'district', name: 'Tebo Tengah' },
+  { code: '15.09.02', parent_code: '15.09', level: 'district', name: 'Tebo Ilir' },
+  { code: '16.01', parent_code: '16', level: 'regency', name: 'Musi Banyuasin' },
+);
+r = await tttCall('GET', '/api/taptap/regions?level=province', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.regions.length === 2 && sj.regions[0].name === 'Jambi' && sj.regions[1].code === '16', 'taptap v1.1.0: regions level=province -> 2 provinsi urut nama');
+r = await tttCall('GET', '/api/taptap/regions?parent=15', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.regions.length === 2 && sj.regions.every(x => x.level === 'regency'), 'taptap v1.1.0: regions parent=15 -> 2 kabupaten');
+r = await tttCall('GET', '/api/taptap/regions?parent=15.09', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.regions.length === 2 && sj.regions[0].name === 'Tebo Ilir' && sj.regions[1].name === 'Tebo Tengah', 'taptap v1.1.0: regions parent=15.09 -> 2 kecamatan urut nama');
+r = await tttCall('GET', '/api/taptap/regions?level=bogus', null);
+assert(r.status === 400, 'taptap v1.1.0: regions level tak dikenal -> 400');
+// Pemain berwilayah: 22222222 Tebo Tengah (total 5000), 33333333 Tebo Ilir (3000), 44444444 Sumsel (4000).
+for (const [id, name, total] of [['22222222', 'JambiOne', 5000], ['33333333', 'TeboDua', 3000], ['44444444', 'Sumsel', 4000]]) {
+  r = await tttCall('POST', '/api/taptap/profile', { account_id: id, player_name: name, score: total, total_energy_all_time: total, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+  assert(r.status === 200, 'taptap v1.1.0: buat pemain ' + id + ' ok');
+}
+r = await tttCall('POST', '/api/taptap/profile/region', { account_id: '22222222', province_code: '15', regency_code: '15.09', district_code: '15.09.01' });
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap v1.1.0: set region 22222222 ok');
+r = await tttCall('POST', '/api/taptap/profile/region', { account_id: '33333333', province_code: '15', regency_code: '15.09', district_code: '15.09.02' });
+assert(r.status === 200, 'taptap v1.1.0: set region 33333333 ok');
+r = await tttCall('POST', '/api/taptap/profile/region', { account_id: '44444444', province_code: '16', regency_code: '16.01', district_code: '' });
+assert(r.status === 200, 'taptap v1.1.0: set region 44444444 (tanpa kecamatan) ok');
+r = await tttCall('GET', '/api/taptap/profile/22222222', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.region.province_code === '15' && sj.region.district_code === '15.09.01' && sj.ban === null && sj.ban_warning === false, 'taptap v1.1.0: GET /profile tampilkan region + ban null');
+r = await tttCall('POST', '/api/taptap/profile/region', { account_id: '22222222', province_code: '15', regency_code: '15.09', district_code: '15.09.02' });
+sj = JSON.parse(await r.text());
+assert(r.status === 403 && sj.error === 'region_change_cooldown' && typeof sj.next_change_at === 'string', 'taptap v1.1.0: ganti region <30 hari -> 403 cooldown');
+r = await tttCall('POST', '/api/taptap/profile/region', { account_id: '22222222', province_code: '16', regency_code: '15.09', district_code: '15.09.01' });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'region_hierarchy_mismatch', 'taptap v1.1.0: hierarki tak konsisten -> 400');
+r = await tttCall('POST', '/api/taptap/profile/region', { account_id: '22222222', province_code: '99', regency_code: '', district_code: '' });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'invalid_region', 'taptap v1.1.0: kode wilayah tak ada -> 400');
+r = await tttCall('POST', '/api/taptap/profile/region', { account_id: '12121212', province_code: '15', regency_code: '15.09', district_code: '15.09.01' });
+assert(r.status === 404, 'taptap v1.1.0: set region akun tak ada -> 404');
+// Leaderboard scope: 12345678 (tanpa wilayah, total ~36100) hanya global/national.
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=global&account_id=22222222', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.scope === 'global' && sj.total_in_scope === 4 && sj.players.length === 4 && sj.players[0].account_id === '12345678' && sj.players[0].rank === 1 && sj.my_rank === 2, 'taptap v1.1.0: leaderboard global 4 pemain, rank + my_rank benar');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=national', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.total_in_scope === 4, 'taptap v1.1.0: leaderboard national ikut sertakan pemain tanpa wilayah');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=province&province=15&account_id=12345678', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.total_in_scope === 2 && sj.players.every(p => p.account_id !== '12345678') && sj.my_rank === null, 'taptap v1.1.0: leaderboard provinsi Jambi 2 pemain, tanpa wilayah tidak masuk, my_rank null');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=regency&regency=15.09', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.total_in_scope === 2 && sj.players[0].account_id === '22222222', 'taptap v1.1.0: leaderboard kabupaten Tebo 2 pemain, urut total');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=district&district=15.09.01', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.total_in_scope === 1 && sj.players[0].account_id === '22222222' && sj.players[0].rank === 1, 'taptap v1.1.0: leaderboard kecamatan Tebo Tengah 1 pemain');
+r = await tttCall('GET', '/api/taptap/leaderboard', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.scope === 'global' && Array.isArray(sj.players), 'taptap v1.1.0: leaderboard tanpa scope = global (kompatibel mundur)');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=bogus', null);
+assert(r.status === 400, 'taptap v1.1.0: scope tak dikenal -> 400');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=district', null);
+assert(r.status === 400, 'taptap v1.1.0: scope district tanpa district -> 400');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=district&district=99.99.99', null);
+assert(r.status === 400, 'taptap v1.1.0: scope district kode tak ada -> 400');
+// Validasi skor.
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '77777777', player_name: 'Curang', score: 2000, total_energy_all_time: 1000, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'score_exceeds_total', 'taptap v1.1.0: score > total -> 400');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '77777777', player_name: 'Negatif', score: -5, total_energy_all_time: 100, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'bad_score', 'taptap v1.1.0: skor negatif -> 400');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '88888888', player_name: 'Base', score: 1000, total_energy_all_time: 1000, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 200, 'taptap v1.1.0: buat akun 88888888 ok');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '88888888', player_name: 'Base', score: 6000001, total_energy_all_time: 6000001, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'score_implausible', 'taptap v1.1.0: lompatan mustahil (CPS 0, +6jt) -> 400');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '99999999', player_name: 'Base', score: 1000, total_energy_all_time: 1000, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 200, 'taptap v1.1.0: buat akun 99999999 ok');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '99999999', player_name: 'Base', score: 2001000, total_energy_all_time: 2001000, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap v1.1.0: pertumbuhan mencurigakan (+2jt) tetap diterima');
+r = await tttCall('GET', '/api/taptap/admin/flags', null);
+assert(r.status === 401, 'taptap v1.1.0: GET /admin/flags tanpa token -> 401');
+r = await tttCall('GET', '/api/taptap/admin/flags', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.flags.some(f => f.account_id === '99999999' && f.reason === 'score_growth_suspicious'), 'taptap v1.1.0: flag pertumbuhan tercatat + terbaca admin');
+// Admin ban: tanpa token -> 401; ban temp7 -> keluar leaderboard + 403 di profile/claim/chat.
+r = await tttCall('POST', '/api/taptap/chat', { sender_id: '33333333', sender_name: 'TeboDua', message: 'halo tebo' });
+assert(r.status === 200, 'taptap v1.1.0: chat 33333333 sebelum ban ok');
+r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '22222222', ban_type: 'temp7', reason: 'skor curang' });
+assert(r.status === 401, 'taptap v1.1.0: admin/ban tanpa token -> 401');
+r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '22222222', ban_type: 'temp7', reason: 'skor curang' }, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.ban.type === 'temp7' && Date.parse(sj.ban.until) > Date.now() + 6 * 24 * 3600 * 1000, 'taptap v1.1.0: admin ban temp7 ok, ban_until ~7 hari');
+r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '33333333', ban_type: 'temp7', reason: 'spam chat' }, TTT_ADMIN_H);
+assert(r.status === 200, 'taptap v1.1.0: admin ban 33333333 ok');
+r = await tttCall('GET', '/api/taptap/profile/22222222', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ban && sj.ban.type === 'temp7' && sj.ban.reason === 'skor curang' && sj.ban_warning === false, 'taptap v1.1.0: GET /profile tampilkan ban temp7');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=global', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && !sj.players.some(p => p.account_id === '22222222' || p.account_id === '33333333'), 'taptap v1.1.0: pemain diblokir keluar dari leaderboard global');
+r = await tttCall('POST', '/api/taptap/claim', { account_id: '22222222' });
+sj = JSON.parse(await r.text());
+assert(r.status === 403 && sj.error === 'banned' && sj.ban_type === 'temp7', 'taptap v1.1.0: klaim saat diblokir -> 403 banned');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '22222222', player_name: 'JambiOne', score: 5000, total_energy_all_time: 5000, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 403 && JSON.parse(await r.text()).error === 'banned', 'taptap v1.1.0: save saat diblokir -> 403 banned');
+r = await tttCall('POST', '/api/taptap/chat', { sender_id: '22222222', sender_name: 'JambiOne', message: 'saya diblokir' });
+assert(r.status === 403 && JSON.parse(await r.text()).error === 'banned', 'taptap v1.1.0: chat saat diblokir -> 403 banned');
+r = await tttCall('GET', '/api/taptap/chat', null);
+sj = JSON.parse(await r.text());
+const msgTebo = sj.messages.find(m => m.sender_id === '33333333');
+const msgTester = sj.messages.find(m => m.sender_id === '12345678');
+assert(r.status === 200 && msgTebo && msgTebo.banned === true && msgTester && msgTester.banned === false, 'taptap v1.1.0: GET /chat tandai banned per pesan');
+// Warning: rank tetap, tidak memblokir.
+r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '44444444', ban_type: 'warning', reason: 'nama tidak pantas' }, TTT_ADMIN_H);
+assert(r.status === 200, 'taptap v1.1.0: admin ban warning ok');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=global', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.players.some(p => p.account_id === '44444444'), 'taptap v1.1.0: warning tetap di leaderboard');
+r = await tttCall('GET', '/api/taptap/profile/44444444', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ban && sj.ban.type === 'warning' && sj.ban_warning === true, 'taptap v1.1.0: warning tampil di profil + ban_warning=true');
+r = await tttCall('POST', '/api/taptap/claim', { account_id: '44444444' });
+assert(r.status === 200, 'taptap v1.1.0: klaim saat warning tetap jalan');
+// Unban: kembali ke leaderboard + riwayat revoked.
+r = await tttCall('POST', '/api/taptap/admin/unban', { account_id: '22222222' }, TTT_ADMIN_H);
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap v1.1.0: admin unban ok');
+r = await tttCall('GET', '/api/taptap/profile/22222222', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ban === null, 'taptap v1.1.0: profil setelah unban ban=null');
+assert(env.BACKUP_DB.tttBans.find(x => x.account_id === '22222222' && x.revoked_at !== ''), 'taptap v1.1.0: unban set revoked_at di riwayat ttt_bans');
+r = await tttCall('GET', '/api/taptap/leaderboard?scope=global', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.players.some(p => p.account_id === '22222222'), 'taptap v1.1.0: setelah unban kembali ke leaderboard');
+// Habis masa blokir -> lazy restore: elapsed dihitung dari ban_until (bukan last_seen_at lama).
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '55555555', player_name: 'Lama', score: 1000, total_energy_all_time: 1000, levels: [10, 2, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 200, 'taptap v1.1.0: buat akun 55555555 ok');
+env.BACKUP_DB.tttPlayers.get('55555555').last_seen_at = new Date(Date.now() - 5 * 3600 * 1000).toISOString();
+r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '55555555', ban_type: 'temp7', reason: 'klaim abnormal' }, TTT_ADMIN_H);
+assert(r.status === 200, 'taptap v1.1.0: ban 55555555 ok');
+env.BACKUP_DB.tttPlayers.get('55555555').ban_until = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+r = await tttCall('POST', '/api/taptap/claim', { account_id: '55555555' });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.elapsed_seconds >= 7200 && sj.elapsed_seconds <= 7210 && Math.abs(sj.earned - sj.elapsed_seconds * 3.25) < 0.001, 'taptap v1.1.0: klaim setelah ban habis -> elapsed dari ban_until (~2 jam), periode blokir tidak dibayar');
+r = await tttCall('GET', '/api/taptap/profile/55555555', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ban === null, 'taptap v1.1.0: lazy restore bersihkan field ban');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

@@ -780,18 +780,22 @@ async function fetchFbmLatestRelease(env) {
 }
 
 
-// ---- API Tap Tap Tycoon (game Android, v1.0.0, 16 Nov 2026) ----
+// ---- API Tap Tap Tycoon (game Android, v1.1.0, 16 Nov 2026) ----
 // Backend game dipindah dari Supabase ke domain sendiri. Database D1
 // stopwatch-db (binding BACKUP_DB — database yang SAMA dengan Cerpen,
-// BUKAN database baru); tabel ttt_players + ttt_chats (prefix ttt_).
+// BUKAN database baru); tabel ttt_players + ttt_chats + ttt_regions +
+// ttt_bans + ttt_flags (prefix ttt_).
 // env.DB (cms-db) JANGAN dipakai untuk data TTT; bila BACKUP_DB hilang
 // -> 503. Route: /api/taptap/* (leaderboard, profile, claim AFK, chat,
-// version). Desain klaim AFK timestamp-lazy: server hanya simpan
-// last_seen_at (jam server) + state; klaim = 1 SELECT by PK + 1 UPDATE,
-// cap 8 jam (28800 dtk); tanpa ticking/polling. CPS TIDAK PERNAH
-// dipercaya dari client — dihitung ulang dari levels (replay tabel
-// upgrade yang sama dengan engine C++). Tulis (profile/claim/chat/like)
-// di-rate-limit 60/10 mnt/IP (pola checkRateLimit CMS).
+// version, regions, admin ban/flags). Desain klaim AFK timestamp-lazy:
+// server hanya simpan last_seen_at (jam server) + state; klaim = 1 SELECT
+// by PK + 1 UPDATE, cap 8 jam (28800 dtk); tanpa ticking/polling. CPS
+// TIDAK PERNAH dipercaya dari client — dihitung ulang dari levels (replay
+// tabel upgrade yang sama dengan engine C++). Tulis (profile/claim/chat/
+// like/region/admin) di-rate-limit 60/10 mnt/IP (pola checkRateLimit CMS).
+// v1.1.0: leaderboard per wilayah 5 tingkat (district < regency <
+// province < national < global), banned (warning/temp7/temp30/permanent),
+// validasi skor di POST /profile (lihat ambang di bawah).
 function taptapJson(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -847,6 +851,81 @@ function taptapCpsFromLevels(levels) {
   return cps;
 }
 
+// --- v1.1.0: wilayah, banned, validasi skor ---
+const TAPTAP_BAN_TYPES = ['warning', 'temp7', 'temp30', 'permanent'];
+const TAPTAP_BAN_BLOCKING = ['temp7', 'temp30', 'permanent'];
+const TAPTAP_REGION_COOLDOWN_MS = 30 * 24 * 3600 * 1000; // ganti wilayah 1x/30 hari
+// Ambang validasi skor (POST /profile) — CPS dihitung dari levels LAMA
+// (replay server, bukan kiriman client); elapsed dari updated_at lama.
+// TOLAK bila total_baru > total_lama + CPS*elapsed*10 + 5.000.000
+// (lompatan mustahil: 10x CPS + 5 jt toleransi tap manual).
+// FLAG (tetap terima) bila total_baru > total_lama + CPS*elapsed*3 + 1.000.000.
+const TAPTAP_SCORE_REJECT_MULT = 10;
+const TAPTAP_SCORE_REJECT_FLAT = 5000000;
+const TAPTAP_SCORE_FLAG_MULT = 3;
+const TAPTAP_SCORE_FLAG_FLAT = 1000000;
+
+function taptapBanActive(row, nowMs) {
+  if (!row || !TAPTAP_BAN_BLOCKING.includes(row.ban_type)) return false;
+  if (row.ban_type === 'permanent') return true;
+  const until = Date.parse(row.ban_until || '');
+  return Number.isFinite(until) && until > nowMs;
+}
+
+function taptapBanInfo(row) {
+  if (!row || !row.ban_type) return null;
+  return { type: row.ban_type, reason: row.ban_reason || '', until: row.ban_until || '' };
+}
+
+function taptapBannedResponse(row) {
+  const info = taptapBanInfo(row) || { type: '', reason: '', until: '' };
+  return taptapJson({ error: 'banned', ban_type: info.type, ban_reason: info.reason, ban_until: info.until }, 403);
+}
+
+async function taptapRegionByCode(db, code) {
+  if (!code) return null;
+  return await db.prepare(
+    'SELECT code, parent_code, level, name FROM ttt_regions WHERE code = ?'
+  ).bind(code).first();
+}
+
+// Validasi satu set wilayah. Aturan: province wajib bila regency/district
+// diisi; regency wajib bila district diisi; level tiap kode harus cocok;
+// parent harus konsisten (district->regency->province).
+async function taptapValidateRegionSet(db, province, regency, district) {
+  const p = province ? await taptapRegionByCode(db, province) : null;
+  const r = regency ? await taptapRegionByCode(db, regency) : null;
+  const d = district ? await taptapRegionByCode(db, district) : null;
+  if ((province && !p) || (regency && !r) || (district && !d)) return { ok: false, error: 'invalid_region' };
+  if (p && p.level !== 'province') return { ok: false, error: 'invalid_region' };
+  if (r && r.level !== 'regency') return { ok: false, error: 'invalid_region' };
+  if (d && d.level !== 'district') return { ok: false, error: 'invalid_region' };
+  // Bila induk ikut diberikan, harus konsisten dengan rantai di DB. Bila
+  // tidak diberikan, rantai diambil dari DB (pemanggil boleh auto-isi).
+  if (r && p && r.parent_code !== province) return { ok: false, error: 'region_hierarchy_mismatch' };
+  if (d && r && d.parent_code !== regency) return { ok: false, error: 'region_hierarchy_mismatch' };
+  return { ok: true };
+}
+
+// Hapus field ban pemain (riwayat tetap di ttt_bans).
+async function taptapClearBan(db, accountId) {
+  await db.prepare(
+    'UPDATE ttt_players SET ban_type = NULL, ban_reason = ?, ban_until = ?, ban_created_at = ? WHERE account_id = ?'
+  ).bind('', '', '', accountId).run();
+}
+
+// Admin TTT: sesi admin CMS (cookie, isAdmin) ATAU token ADMIN_TOKEN
+// langsung via header Authorization: Bearer <token> / x-admin-token.
+async function taptapIsAdmin(request, env) {
+  if (await isAdmin(request, env)) return true;
+  if (!env.ADMIN_TOKEN) return false;
+  const auth = request.headers.get('authorization') || '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const headerToken = request.headers.get('x-admin-token') || '';
+  return (bearer !== '' && bearer === env.ADMIN_TOKEN) ||
+    (headerToken !== '' && headerToken === env.ADMIN_TOKEN);
+}
+
 async function handleTapTap(request, env, url) {
   // BACKUP_DB -> stopwatch-db. TIDAK ada fallback ke env.DB (cms-db):
   // data TTT wajib tinggal di database yang sama dengan Cerpen.
@@ -856,13 +935,82 @@ async function handleTapTap(request, env, url) {
   const seg = parts[2] || '';
   const now = new Date().toISOString();
 
-  // GET /api/taptap/leaderboard?limit=20
+  // GET /api/taptap/leaderboard?scope=global|national|province|regency|district&province=&regency=&district=&limit=20&account_id=
+  // v1.1.0: rank dihitung server tiap request (ORDER BY total DESC, tanpa
+  // cache); pemain yang sedang diblokir aktif dikeluarkan dari semua scope;
+  // pemain tanpa wilayah hanya masuk national + global. Tanpa param scope =
+  // global persis seperti v1.0.0 (respons lama {players:[...]} tetap valid —
+  // field rank/scope/my_rank/total_in_scope hanya ditambahkan).
   if (request.method === 'GET' && seg === 'leaderboard') {
     const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '20', 10) || 20));
+    const scope = url.searchParams.get('scope') || 'global';
+    if (!['global', 'national', 'province', 'regency', 'district'].includes(scope)) {
+      return taptapJson({ error: 'invalid_scope' }, 400);
+    }
+    const province = url.searchParams.get('province') || '';
+    const regency = url.searchParams.get('regency') || '';
+    const district = url.searchParams.get('district') || '';
+    if (scope === 'province' && !province) return taptapJson({ error: 'missing_region' }, 400);
+    if (scope === 'regency' && !regency) return taptapJson({ error: 'missing_region' }, 400);
+    if (scope === 'district' && !district) return taptapJson({ error: 'missing_region' }, 400);
+    if (scope !== 'global' && scope !== 'national') {
+      const v = await taptapValidateRegionSet(db, province, regency, district);
+      if (!v.ok) return taptapJson({ error: v.error }, 400);
+    }
     const { results } = await db.prepare(
-      'SELECT account_id, player_name, total_energy_all_time, likes FROM ttt_players ORDER BY total_energy_all_time DESC LIMIT ?'
-    ).bind(limit).all();
-    return taptapJson({ players: results || [] });
+      'SELECT account_id, player_name, total_energy_all_time, likes, province_code, regency_code, district_code, ban_type, ban_until FROM ttt_players ORDER BY total_energy_all_time DESC'
+    ).all();
+    const nowMs = Date.now();
+    const inScope = (p) => {
+      if (taptapBanActive(p, nowMs)) return false;
+      if (scope === 'global' || scope === 'national') return true;
+      if (scope === 'province') return (p.province_code || '') === province;
+      if (scope === 'regency') return (p.regency_code || '') === regency;
+      return (p.district_code || '') === district;
+    };
+    const scoped = (results || []).filter(inScope);
+    const myId = url.searchParams.get('account_id') || '';
+    let myRank = null;
+    if (myId) {
+      const idx = scoped.findIndex((p) => p.account_id === myId);
+      if (idx >= 0) myRank = idx + 1;
+    }
+    const players = scoped.slice(0, limit).map((p, i) => ({
+      rank: i + 1,
+      account_id: p.account_id,
+      player_name: p.player_name,
+      total_energy_all_time: p.total_energy_all_time,
+      likes: p.likes,
+    }));
+    return taptapJson({ players, scope, my_rank: myRank, total_in_scope: scoped.length });
+  }
+
+  // GET /api/taptap/regions?level=province | ?parent=<code> (v1.1.0).
+  // Tanpa param: semua wilayah. Urut nama ASC. Tabel belum ter-seed ->
+  // list kosong, BUKAN 500.
+  if (request.method === 'GET' && seg === 'regions') {
+    const parent = url.searchParams.get('parent') || '';
+    const level = url.searchParams.get('level') || '';
+    try {
+      let res;
+      if (parent) {
+        res = await db.prepare(
+          'SELECT code, name, level FROM ttt_regions WHERE parent_code = ? ORDER BY name ASC'
+        ).bind(parent).all();
+      } else if (level) {
+        if (!['province', 'regency', 'district'].includes(level)) return taptapJson({ error: 'invalid_level' }, 400);
+        res = await db.prepare(
+          'SELECT code, name, level FROM ttt_regions WHERE level = ? ORDER BY name ASC'
+        ).bind(level).all();
+      } else {
+        res = await db.prepare(
+          'SELECT code, name, level FROM ttt_regions ORDER BY name ASC'
+        ).all();
+      }
+      return taptapJson({ regions: (res.results || []).map((r) => ({ code: r.code, name: r.name, level: r.level })) });
+    } catch (e) {
+      return taptapJson({ regions: [] });
+    }
   }
 
   // GET /api/taptap/profile/:id
@@ -883,6 +1031,13 @@ async function handleTapTap(request, env, url) {
       friends: JSON.parse(row.friends || '[]'),
       likes: row.likes,
       updated_at: row.updated_at,
+      region: {
+        province_code: row.province_code || '',
+        regency_code: row.regency_code || '',
+        district_code: row.district_code || '',
+      },
+      ban: taptapBanInfo(row),
+      ban_warning: row.ban_type === 'warning',
     });
   }
 
@@ -895,10 +1050,21 @@ async function handleTapTap(request, env, url) {
       return taptapJson({ error: 'bad_account_id' }, 400);
     }
     const row = await db.prepare(
-      'SELECT score, total_energy_all_time, levels, last_seen_at FROM ttt_players WHERE account_id = ?'
+      'SELECT score, total_energy_all_time, levels, last_seen_at, ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?'
     ).bind(b.account_id).first();
     if (!row) return taptapJson({ error: 'not_found' }, 404);
-    const lastSeen = Date.parse(row.last_seen_at || '');
+    // v1.1.0: banned aktif -> 403. Ban temp yang sudah habis -> lazy
+    // restore: periode blokir TIDAK menghasilkan AFK (elapsed dihitung dari
+    // ban_until, bukan last_seen_at lama), field ban dibersihkan. Warning
+    // tidak pernah memblokir dan tidak di-restore di sini.
+    const nowMs = Date.now();
+    if (taptapBanActive(row, nowMs)) return taptapBannedResponse(row);
+    let effectiveLastSeen = row.last_seen_at || '';
+    if (row.ban_type && row.ban_type !== 'warning') {
+      effectiveLastSeen = row.ban_until || effectiveLastSeen;
+      await taptapClearBan(db, b.account_id);
+    }
+    const lastSeen = Date.parse(effectiveLastSeen || '');
     let elapsed = Number.isFinite(lastSeen)
       ? Math.floor((Date.now() - lastSeen) / 1000)
       : 0;
@@ -918,11 +1084,44 @@ async function handleTapTap(request, env, url) {
   }
 
   // POST /api/taptap/profile (upsert cloud save)
-  if (request.method === 'POST' && seg === 'profile') {
+  // v1.1.0: validasi skor — angka harus finite + non-negatif; score tidak
+  // boleh melebihi total kumulatif; lompatan mustahil (vs CPS levels LAMA
+  // x elapsed x 10 + 5 jt) ditolak 400; pertumbuhan mencurigakan (x 3 +
+  // 1 jt) di-flag ke ttt_flags tapi tetap diterima. Akun baru selalu
+  // diterima. Banned aktif -> 403; ban temp kedaluwarsa di-restore malas
+  // (field ban dibersihkan; last_seen_at = now oleh upsert ini, jadi AFK
+  // periode blokir tetap tidak masuk — klaim-lah yang membayar AFK).
+  if (request.method === 'POST' && seg === 'profile' && !parts[3]) {
     if (!(await checkRateLimit(env, 'taptap-profile:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
     const b = await request.json().catch(() => null);
     if (!b || !taptapValidAccountId(b.account_id)) {
       return taptapJson({ error: 'bad_account_id' }, 400);
+    }
+    const scoreNum = Number(b.score);
+    const totalNum = Number(b.total_energy_all_time);
+    if (!Number.isFinite(scoreNum) || !Number.isFinite(totalNum) || scoreNum < 0 || totalNum < 0) {
+      return taptapJson({ error: 'bad_score' }, 400);
+    }
+    if (scoreNum > totalNum) return taptapJson({ error: 'score_exceeds_total' }, 400);
+    const old = await db.prepare(
+      'SELECT * FROM ttt_players WHERE account_id = ?'
+    ).bind(b.account_id).first();
+    if (old && taptapBanActive(old, Date.now())) return taptapBannedResponse(old);
+    let flagReason = null;
+    let flagDetails = '';
+    if (old) {
+      const elapsedRaw = Math.floor((Date.now() - Date.parse(old.updated_at || '')) / 1000);
+      const elapsed = Number.isFinite(elapsedRaw) ? Math.max(0, elapsedRaw) : 0;
+      const cps = taptapCpsFromLevels(old.levels);
+      const oldTotal = Number(old.total_energy_all_time) || 0;
+      const growth = totalNum - oldTotal;
+      if (growth > cps * elapsed * TAPTAP_SCORE_REJECT_MULT + TAPTAP_SCORE_REJECT_FLAT) {
+        return taptapJson({ error: 'score_implausible' }, 400);
+      }
+      if (growth > cps * elapsed * TAPTAP_SCORE_FLAG_MULT + TAPTAP_SCORE_FLAG_FLAT) {
+        flagReason = 'score_growth_suspicious';
+        flagDetails = JSON.stringify({ old_total: oldTotal, new_total: totalNum, growth, cps, elapsed_seconds: elapsed });
+      }
     }
     const name = String(b.player_name || 'Hozinking').slice(0, 14);
     const levels = taptapLevels(b.levels);
@@ -938,12 +1137,61 @@ async function handleTapTap(request, env, url) {
          friends = excluded.friends, likes = excluded.likes,
          updated_at = excluded.updated_at`
     ).bind(
-      b.account_id, name, +b.score || 0, +b.total_energy_all_time || 0,
+      b.account_id, name, scoreNum, totalNum,
       levels[0], levels[1], JSON.stringify(levels), now,
       JSON.stringify(Array.isArray(b.friends) ? b.friends.slice(0, 100) : []),
       Math.max(0, +b.likes || 0), now
     ).run();
+    if (flagReason) {
+      await db.prepare(
+        'INSERT INTO ttt_flags (account_id, reason, details, created_at, reviewed) VALUES (?, ?, ?, ?, 0)'
+      ).bind(b.account_id, flagReason, flagDetails, now).run();
+    }
+    if (old && old.ban_type && old.ban_type !== 'warning' && !taptapBanActive(old, Date.now())) {
+      await taptapClearBan(db, b.account_id);
+    }
     return taptapJson({ ok: true });
+  }
+
+  // POST /api/taptap/profile/region — set wilayah pemain (v1.1.0).
+  // Validasi kode + hierarki; ganti wilayah 1x/30 hari (set pertama selalu
+  // boleh; <30 hari -> 403 region_change_cooldown + next_change_at).
+  if (request.method === 'POST' && seg === 'profile' && parts[3] === 'region') {
+    if (!(await checkRateLimit(env, 'taptap-region:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const b = await request.json().catch(() => null);
+    if (!b || !taptapValidAccountId(b.account_id)) {
+      return taptapJson({ error: 'bad_account_id' }, 400);
+    }
+    const province = String(b.province_code || '');
+    const regency = String(b.regency_code || '');
+    const district = String(b.district_code || '');
+    const v = await taptapValidateRegionSet(db, province, regency, district);
+    if (!v.ok) return taptapJson({ error: v.error }, 400);
+    const row = await db.prepare(
+      'SELECT * FROM ttt_players WHERE account_id = ?'
+    ).bind(b.account_id).first();
+    if (!row) return taptapJson({ error: 'not_found' }, 404);
+    // Auto-isi induk dari rantai DB bila tidak diberikan (mis. hanya
+    // kecamatan dikirim -> kabupaten + provinsi ikut terisi, supaya
+    // pemain muncul di semua scope induknya).
+    let provinceFinal = province;
+    let regencyFinal = regency;
+    if (district && !regencyFinal) {
+      const d = await taptapRegionByCode(db, district);
+      regencyFinal = d ? d.parent_code : '';
+    }
+    if (regencyFinal && !provinceFinal) {
+      const r = await taptapRegionByCode(db, regencyFinal);
+      provinceFinal = r ? r.parent_code : '';
+    }
+    const lastChange = Date.parse(row.region_updated_at || '');
+    if (Number.isFinite(lastChange) && Date.now() - lastChange < TAPTAP_REGION_COOLDOWN_MS) {
+      return taptapJson({ error: 'region_change_cooldown', next_change_at: new Date(lastChange + TAPTAP_REGION_COOLDOWN_MS).toISOString() }, 403);
+    }
+    await db.prepare(
+      'UPDATE ttt_players SET province_code = ?, regency_code = ?, district_code = ?, region_updated_at = ?, updated_at = ? WHERE account_id = ?'
+    ).bind(provinceFinal, regencyFinal, district, now, now, b.account_id).run();
+    return taptapJson({ ok: true, region: { province_code: provinceFinal, regency_code: regencyFinal, district_code: district } });
   }
 
   // PATCH /api/taptap/profile/:id/like
@@ -957,15 +1205,27 @@ async function handleTapTap(request, env, url) {
   }
 
   // GET /api/taptap/chat?limit=30
+  // v1.1.0: tiap pesan menyertakan `banned` (true bila pengirim sedang
+  // diblokir aktif — LEFT JOIN ttt_players).
   if (request.method === 'GET' && seg === 'chat') {
     const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '30', 10) || 30));
     const { results } = await db.prepare(
-      'SELECT sender_id, sender_name, message, created_at FROM ttt_chats ORDER BY id DESC LIMIT ?'
+      'SELECT c.sender_id, c.sender_name, c.message, c.created_at, p.ban_type, p.ban_until FROM ttt_chats c LEFT JOIN ttt_players p ON p.account_id = c.sender_id ORDER BY c.id DESC LIMIT ?'
     ).bind(limit).all();
-    return taptapJson({ messages: (results || []).reverse() });
+    const nowMs = Date.now();
+    return taptapJson({
+      messages: (results || []).reverse().map((m) => ({
+        sender_id: m.sender_id,
+        sender_name: m.sender_name,
+        message: m.message,
+        created_at: m.created_at,
+        banned: taptapBanActive(m, nowMs),
+      })),
+    });
   }
 
   // POST /api/taptap/chat
+  // v1.1.0: pengirim yang sedang diblokir aktif -> 403 banned.
   if (request.method === 'POST' && seg === 'chat') {
     if (!(await checkRateLimit(env, 'taptap-chat:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
     const b = await request.json().catch(() => null);
@@ -973,15 +1233,86 @@ async function handleTapTap(request, env, url) {
         typeof b.message !== 'string' || b.message.trim().length === 0) {
       return taptapJson({ error: 'bad_request' }, 400);
     }
+    const sender = await db.prepare(
+      'SELECT ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?'
+    ).bind(b.sender_id).first();
+    if (sender && taptapBanActive(sender, Date.now())) return taptapBannedResponse(sender);
     await db.prepare(
       'INSERT INTO ttt_chats (sender_id, sender_name, message, created_at) VALUES (?, ?, ?, ?)'
     ).bind(b.sender_id, String(b.sender_name || 'Anon').slice(0, 14), b.message.trim().slice(0, 500), now).run();
     return taptapJson({ ok: true });
   }
 
+  // ---- Admin TTT (v1.1.0, butuh ADMIN_TOKEN via sesi CMS / header) ----
+  if (seg === 'admin') {
+    const sub = parts[3] || '';
+    // POST /api/taptap/admin/ban {account_id, ban_type, reason}
+    // ban_until = now+7 hari (temp7) / now+30 hari (temp30) / '' (permanent,
+    // warning). Riwayat ditulis ke ttt_bans.
+    if (request.method === 'POST' && sub === 'ban') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const b = await request.json().catch(() => null);
+      if (!b || !taptapValidAccountId(b.account_id) || !TAPTAP_BAN_TYPES.includes(b.ban_type)) {
+        return taptapJson({ error: 'bad_request' }, 400);
+      }
+      const row = await db.prepare(
+        'SELECT * FROM ttt_players WHERE account_id = ?'
+      ).bind(b.account_id).first();
+      if (!row) return taptapJson({ error: 'not_found' }, 404);
+      const reason = String(b.reason || '').slice(0, 200);
+      let until = '';
+      if (b.ban_type === 'temp7') until = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+      if (b.ban_type === 'temp30') until = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+      await db.prepare(
+        'UPDATE ttt_players SET ban_type = ?, ban_reason = ?, ban_until = ?, ban_created_at = ?, updated_at = ? WHERE account_id = ?'
+      ).bind(b.ban_type, reason, until, now, now, b.account_id).run();
+      await db.prepare(
+        'INSERT INTO ttt_bans (account_id, ban_type, reason, created_by, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).bind(b.account_id, b.ban_type, reason, 'admin', now, until, '').run();
+      return taptapJson({ ok: true, ban: { type: b.ban_type, reason, until } });
+    }
+    // POST /api/taptap/admin/unban {account_id} — bersihkan field ban +
+    // set revoked_at pada baris ttt_bans terbaru yang belum revoked.
+    if (request.method === 'POST' && sub === 'unban') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const b = await request.json().catch(() => null);
+      if (!b || !taptapValidAccountId(b.account_id)) {
+        return taptapJson({ error: 'bad_request' }, 400);
+      }
+      const row = await db.prepare(
+        'SELECT * FROM ttt_players WHERE account_id = ?'
+      ).bind(b.account_id).first();
+      if (!row) return taptapJson({ error: 'not_found' }, 404);
+      await taptapClearBan(db, b.account_id);
+      const latest = await db.prepare(
+        'SELECT id FROM ttt_bans WHERE account_id = ? AND revoked_at = ? ORDER BY id DESC LIMIT 1'
+      ).bind(b.account_id, '').first();
+      if (latest) {
+        await db.prepare(
+          'UPDATE ttt_bans SET revoked_at = ? WHERE id = ?'
+        ).bind(now, latest.id).run();
+      }
+      return taptapJson({ ok: true });
+    }
+    // GET /api/taptap/admin/flags — daftar ttt_flags yang belum direview.
+    if (request.method === 'GET' && sub === 'flags') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const { results } = await db.prepare(
+        'SELECT id, account_id, reason, details, created_at, reviewed FROM ttt_flags WHERE reviewed = 0 ORDER BY id DESC LIMIT 100'
+      ).all();
+      return taptapJson({ flags: results || [] });
+    }
+    return taptapJson({ error: 'not_found' }, 404);
+  }
+
   // GET /api/taptap/version
+  // v1.1.0: min_version tetap 1.0.0 — aplikasi v1.0.0 tetap boleh jalan
+  // (kompatibel mundur, tanpa force-update).
   if (request.method === 'GET' && seg === 'version') {
-    return taptapJson({ latest_version: '1.0.0', min_version: '1.0.0' });
+    return taptapJson({ latest_version: '1.1.0', min_version: '1.0.0' });
   }
 
   return taptapJson({ error: 'not_found' }, 404);
