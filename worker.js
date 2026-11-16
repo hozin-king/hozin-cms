@@ -780,6 +780,213 @@ async function fetchFbmLatestRelease(env) {
 }
 
 
+// ---- API Tap Tap Tycoon (game Android, v1.0.0, 16 Nov 2026) ----
+// Backend game dipindah dari Supabase ke domain sendiri. Database D1
+// stopwatch-db (binding BACKUP_DB — database yang SAMA dengan Cerpen,
+// BUKAN database baru); tabel ttt_players + ttt_chats (prefix ttt_).
+// env.DB (cms-db) JANGAN dipakai untuk data TTT; bila BACKUP_DB hilang
+// -> 503. Route: /api/taptap/* (leaderboard, profile, claim AFK, chat,
+// version). Desain klaim AFK timestamp-lazy: server hanya simpan
+// last_seen_at (jam server) + state; klaim = 1 SELECT by PK + 1 UPDATE,
+// cap 8 jam (28800 dtk); tanpa ticking/polling. CPS TIDAK PERNAH
+// dipercaya dari client — dihitung ulang dari levels (replay tabel
+// upgrade yang sama dengan engine C++). Tulis (profile/claim/chat/like)
+// di-rate-limit 60/10 mnt/IP (pola checkRateLimit CMS).
+function taptapJson(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+  });
+}
+
+function taptapValidAccountId(id) {
+  return typeof id === 'string' && /^[1-9][0-9]{7}$/.test(id);
+}
+
+// --- Ekonomi (cermin engine C++ — SATU sumber kebenaran untuk replay) ---
+// [baseBonus, baseCost, costMult, depIdx] per upgrade 0..9.
+// CPS TIDAK PERNAH dipercaya dari client: klaim menghitungnya dari levels.
+const TAPTAP_UPGRADES = [
+  [1, 25, 1.6, -1],          // Plasma Glove (per tap, bukan CPS)
+  [1, 50, 1.5, 0],           // Neon Drone
+  [10, 500, 1.7, 1],         // Quantum Core
+  [75, 5000, 1.8, 2],        // Anti-Matter Gen
+  [500, 75000, 1.9, 3],      // Dyson Sphere
+  [5000, 500000, 2.0, 4],    // Nova
+  [50000, 5000000, 2.1, 5],  // Singularity
+  [500000, 50000000, 2.2, 6],// Infinity
+  [5000000, 500000000, 2.3, 7], // Omega
+  [50000000, 5000000000, 2.5, 8], // God
+];
+const TAPTAP_OFFLINE_CAP_SECONDS = 28800; // 8 jam — sama dengan client
+
+function taptapLevels(input) {
+  // levels tersimpan di D1 sebagai string JSON — parse dulu; bila sudah
+  // array (pemanggil internal), pakai langsung. Tanpa parse, klaim
+  // menghitung CPS dari array kosong (= 0) dan selalu membayar 0.
+  let src = input;
+  if (typeof src === 'string') { try { src = JSON.parse(src); } catch (e) { src = []; } }
+  const lv = Array.isArray(src) ? src.slice(0, 10) : [];
+  while (lv.length < 10) lv.push(0);
+  if (lv[0] < 1) lv[0] = 1;
+  return lv.map((v) => Math.max(0, Math.floor(+v || 0)));
+}
+
+function taptapCpsFromLevels(levels) {
+  let cps = 0;
+  const lv = taptapLevels(levels);
+  for (let i = 1; i < 10; i++) {
+    const dep = TAPTAP_UPGRADES[i][3];
+    if (dep >= 0 && lv[dep] < 10) continue; // rantai unlock
+    let cost = TAPTAP_UPGRADES[i][1];
+    for (let j = 0; j < lv[i]; j++) {
+      cps += TAPTAP_UPGRADES[i][0] + cost * 0.01;
+      cost = Math.floor(cost * TAPTAP_UPGRADES[i][2]);
+    }
+  }
+  return cps;
+}
+
+async function handleTapTap(request, env, url) {
+  // BACKUP_DB -> stopwatch-db. TIDAK ada fallback ke env.DB (cms-db):
+  // data TTT wajib tinggal di database yang sama dengan Cerpen.
+  const db = env.BACKUP_DB;
+  if (!db) return taptapJson({ error: 'db_unavailable' }, 503);
+  const parts = url.pathname.split('/').filter(Boolean); // api, taptap, ...
+  const seg = parts[2] || '';
+  const now = new Date().toISOString();
+
+  // GET /api/taptap/leaderboard?limit=20
+  if (request.method === 'GET' && seg === 'leaderboard') {
+    const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '20', 10) || 20));
+    const { results } = await db.prepare(
+      'SELECT account_id, player_name, total_energy_all_time, likes FROM ttt_players ORDER BY total_energy_all_time DESC LIMIT ?'
+    ).bind(limit).all();
+    return taptapJson({ players: results || [] });
+  }
+
+  // GET /api/taptap/profile/:id
+  if (request.method === 'GET' && seg === 'profile' && parts[3]) {
+    const row = await db.prepare(
+      'SELECT * FROM ttt_players WHERE account_id = ?'
+    ).bind(parts[3]).first();
+    if (!row) return taptapJson({ error: 'not_found' }, 404);
+    return taptapJson({
+      account_id: row.account_id,
+      player_name: row.player_name,
+      score: row.score,
+      total_energy_all_time: row.total_energy_all_time,
+      click_level: row.click_level,
+      auto_level: row.auto_level,
+      levels: JSON.parse(row.levels || '[1,0,0,0,0,0,0,0,0,0]'),
+      last_seen_at: row.last_seen_at || '',
+      friends: JSON.parse(row.friends || '[]'),
+      likes: row.likes,
+      updated_at: row.updated_at,
+    });
+  }
+
+  // POST /api/taptap/claim — klaim pendapatan AFK (lazy evaluation).
+  // 1 SELECT (PK) + 1 UPDATE. Tanpa ticking per pemain, tanpa polling.
+  if (request.method === 'POST' && seg === 'claim') {
+    if (!(await checkRateLimit(env, 'taptap-claim:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const b = await request.json().catch(() => null);
+    if (!b || !taptapValidAccountId(b.account_id)) {
+      return taptapJson({ error: 'bad_account_id' }, 400);
+    }
+    const row = await db.prepare(
+      'SELECT score, total_energy_all_time, levels, last_seen_at FROM ttt_players WHERE account_id = ?'
+    ).bind(b.account_id).first();
+    if (!row) return taptapJson({ error: 'not_found' }, 404);
+    const lastSeen = Date.parse(row.last_seen_at || '');
+    let elapsed = Number.isFinite(lastSeen)
+      ? Math.floor((Date.now() - lastSeen) / 1000)
+      : 0;
+    if (elapsed < 0) elapsed = 0; // jam server mundur / data aneh
+    const capped = elapsed > TAPTAP_OFFLINE_CAP_SECONDS;
+    if (capped) elapsed = TAPTAP_OFFLINE_CAP_SECONDS;
+    const earned = elapsed * taptapCpsFromLevels(row.levels);
+    const newScore = (row.score || 0) + earned;
+    const newTotal = (row.total_energy_all_time || 0) + earned;
+    await db.prepare(
+      'UPDATE ttt_players SET score = ?, total_energy_all_time = ?, last_seen_at = ?, updated_at = ? WHERE account_id = ?'
+    ).bind(newScore, newTotal, now, now, b.account_id).run();
+    return taptapJson({
+      ok: true, earned, elapsed_seconds: elapsed, capped,
+      score: newScore, total_energy_all_time: newTotal,
+    });
+  }
+
+  // POST /api/taptap/profile (upsert cloud save)
+  if (request.method === 'POST' && seg === 'profile') {
+    if (!(await checkRateLimit(env, 'taptap-profile:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const b = await request.json().catch(() => null);
+    if (!b || !taptapValidAccountId(b.account_id)) {
+      return taptapJson({ error: 'bad_account_id' }, 400);
+    }
+    const name = String(b.player_name || 'Hozinking').slice(0, 14);
+    const levels = taptapLevels(b.levels);
+    await db.prepare(
+      `INSERT INTO ttt_players
+         (account_id, player_name, score, total_energy_all_time, click_level, auto_level, levels, last_seen_at, friends, likes, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(account_id) DO UPDATE SET
+         player_name = excluded.player_name, score = excluded.score,
+         total_energy_all_time = excluded.total_energy_all_time,
+         click_level = excluded.click_level, auto_level = excluded.auto_level,
+         levels = excluded.levels, last_seen_at = excluded.last_seen_at,
+         friends = excluded.friends, likes = excluded.likes,
+         updated_at = excluded.updated_at`
+    ).bind(
+      b.account_id, name, +b.score || 0, +b.total_energy_all_time || 0,
+      levels[0], levels[1], JSON.stringify(levels), now,
+      JSON.stringify(Array.isArray(b.friends) ? b.friends.slice(0, 100) : []),
+      Math.max(0, +b.likes || 0), now
+    ).run();
+    return taptapJson({ ok: true });
+  }
+
+  // PATCH /api/taptap/profile/:id/like
+  if (request.method === 'PATCH' && seg === 'profile' && parts[3] && parts[4] === 'like') {
+    if (!(await checkRateLimit(env, 'taptap-like:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const row = await db.prepare(
+      'UPDATE ttt_players SET likes = likes + 1, updated_at = ? WHERE account_id = ? RETURNING likes'
+    ).bind(now, parts[3]).first();
+    if (!row) return taptapJson({ error: 'not_found' }, 404);
+    return taptapJson({ ok: true, likes: row.likes });
+  }
+
+  // GET /api/taptap/chat?limit=30
+  if (request.method === 'GET' && seg === 'chat') {
+    const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '30', 10) || 30));
+    const { results } = await db.prepare(
+      'SELECT sender_id, sender_name, message, created_at FROM ttt_chats ORDER BY id DESC LIMIT ?'
+    ).bind(limit).all();
+    return taptapJson({ messages: (results || []).reverse() });
+  }
+
+  // POST /api/taptap/chat
+  if (request.method === 'POST' && seg === 'chat') {
+    if (!(await checkRateLimit(env, 'taptap-chat:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const b = await request.json().catch(() => null);
+    if (!b || !taptapValidAccountId(b.sender_id) ||
+        typeof b.message !== 'string' || b.message.trim().length === 0) {
+      return taptapJson({ error: 'bad_request' }, 400);
+    }
+    await db.prepare(
+      'INSERT INTO ttt_chats (sender_id, sender_name, message, created_at) VALUES (?, ?, ?, ?)'
+    ).bind(b.sender_id, String(b.sender_name || 'Anon').slice(0, 14), b.message.trim().slice(0, 500), now).run();
+    return taptapJson({ ok: true });
+  }
+
+  // GET /api/taptap/version
+  if (request.method === 'GET' && seg === 'version') {
+    return taptapJson({ latest_version: '1.0.0', min_version: '1.0.0' });
+  }
+
+  return taptapJson({ error: 'not_found' }, 404);
+}
+
 async function handleFetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -979,6 +1186,15 @@ async function handleFetch(request, env) {
       const rel = await resolveCerpenRelease(env);
       if (!rel) return cvJson({ ok: false, error: 'versi belum tersedia' }, 404);
       return cvJson({ ok: true, tag: rel.tag, version: rel.version, apk_url: rel.apk_url, published_at: rel.published_at, tags: rel.tags, source: rel.source, min_version: CERPEN_MIN_VERSION }, 200);
+    }
+
+    // ---- Publik: API Tap Tap Tycoon (game Android, v1.0.0) ----
+    // Leaderboard, cloud save, klaim AFK, chat — handler handleTapTap
+    // di atas (D1 stopwatch-db via BACKUP_DB). BUKAN endpoint Cerpen:
+    // gerbang versi Cerpen (426) TIDAK berlaku di sini; TTT punya
+    // /api/taptap/version sendiri.
+    if (path.startsWith('/api/taptap/')) {
+      return handleTapTap(request, env, url);
     }
 
     // ---- Publik: laporan tamper Hozin FB Manager (aplikasi Android, v1.0.33) ----

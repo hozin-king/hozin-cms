@@ -80,6 +80,10 @@ class MockDB {
     // v1.1.38: jejak percobaan kunci + blok anti-bypass gerbang versi Cerpen
     this.cerpenLockAttempts = [];
     this.cerpenAppBlocks = [];
+    // Tap Tap Tycoon (D1 stopwatch-db, binding BACKUP_DB).
+    this.tttPlayers = new Map(); // account_id -> row pemain
+    this.tttChats = []; // {id, sender_id, sender_name, message, created_at}
+    this.tttChatSeq = 0;
     // v87: state Sistem Koin Cerpen (cms-db) — dompet, unlock, voucher, VIP,
     // ban, pantauan, ledger, audit + tabel pelacak baca v81 (dipakai papan
     // peringkat/riwayat). BACKUP_DB memakai instance MockDB yang sama,
@@ -960,6 +964,15 @@ class MockDB {
     if (s.startsWith('SELECT id, judul, created_at FROM cerpen_series ORDER BY created_at DESC LIMIT 5')) return [...this.cerpenSeries].sort((x, y) => (Number(y.created_at) || 0) - (Number(x.created_at) || 0)).slice(0, 5).map(x => ({ id: x.id, judul: x.judul, created_at: Number(x.created_at) || 0 }));
     if (s.startsWith('SELECT series_id, season, no, judul, created_at FROM cerpen_episodes ORDER BY created_at DESC LIMIT 5')) return [...this.cerpenEpisodes].sort((x, y) => (Number(y.created_at) || 0) - (Number(x.created_at) || 0)).slice(0, 5).map(x => ({ series_id: x.series_id, season: x.season, no: x.no, judul: x.judul, created_at: Number(x.created_at) || 0 }));
     if (s.startsWith('SELECT id, title, added_at FROM cerpen_news ORDER BY added_at DESC LIMIT 5')) return [...this.cerpenNews].sort((x, y) => String(y.added_at || '').localeCompare(String(x.added_at || ''))).slice(0, 5).map(x => ({ id: x.id, title: x.title, added_at: x.added_at }));
+    // Tap Tap Tycoon (D1 stopwatch-db, binding BACKUP_DB).
+    if (s.startsWith('SELECT account_id, player_name, total_energy_all_time, likes FROM ttt_players')) return [...this.tttPlayers.values()].sort((x, y) => (Number(y.total_energy_all_time) || 0) - (Number(x.total_energy_all_time) || 0)).slice(0, a[0]).map(x => ({ account_id: x.account_id, player_name: x.player_name, total_energy_all_time: x.total_energy_all_time, likes: x.likes }));
+    if (s.startsWith('SELECT * FROM ttt_players WHERE account_id = ?')) return this.tttPlayers.has(a[0]) ? [this.tttPlayers.get(a[0])] : [];
+    if (s.startsWith('SELECT score, total_energy_all_time, levels, last_seen_at FROM ttt_players WHERE account_id = ?')) { const r = this.tttPlayers.get(a[0]); return r ? [{ score: r.score, total_energy_all_time: r.total_energy_all_time, levels: r.levels, last_seen_at: r.last_seen_at }] : []; }
+    if (s.startsWith('UPDATE ttt_players SET score = ?')) { const r = this.tttPlayers.get(a[4]); if (r) { r.score = a[0]; r.total_energy_all_time = a[1]; r.last_seen_at = a[2]; r.updated_at = a[3]; } return []; }
+    if (s.startsWith('INSERT INTO ttt_players')) { this.tttPlayers.set(a[0], { account_id: a[0], player_name: a[1], score: a[2], total_energy_all_time: a[3], click_level: a[4], auto_level: a[5], levels: a[6], last_seen_at: a[7], friends: a[8], likes: a[9], updated_at: a[10] }); return []; }
+    if (s.startsWith('UPDATE ttt_players SET likes = likes + 1')) { const r = this.tttPlayers.get(a[1]); if (!r) return []; r.likes = (Number(r.likes) || 0) + 1; r.updated_at = a[0]; return [{ likes: r.likes }]; }
+    if (s.startsWith('SELECT sender_id, sender_name, message, created_at FROM ttt_chats')) return [...this.tttChats].sort((x, y) => y.id - x.id).slice(0, a[0]).map(x => ({ sender_id: x.sender_id, sender_name: x.sender_name, message: x.message, created_at: x.created_at }));
+    if (s.startsWith('INSERT INTO ttt_chats')) { this.tttChats.push({ id: ++this.tttChatSeq, sender_id: a[0], sender_name: a[1], message: a[2], created_at: a[3] }); return []; }
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -3217,4 +3230,44 @@ assert(r.status === 200 && JSON.parse(await r.text()).removed === false, 'bookma
 r = await bmCall('GET', '/api/cerpen-bookmarks', null, { authorization: 'Bearer ' + koinSession });
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.bookmarks.length === 2 && !sj.bookmarks.some(b => b.kind === 'cerpen'), 'bookmark v87.5: GET setelah hapus tinggal 2');
+// Tap Tap Tycoon — API /api/taptap/* (D1 stopwatch-db via BACKUP_DB).
+async function tttCall(method, path, obj) {
+  const req = new Request(base + path, { method, headers: { 'content-type': 'application/json' }, body: obj === null ? undefined : JSON.stringify(obj) });
+  return worker.fetch(req, env);
+}
+r = await tttCall('GET', '/api/taptap/version', null);
+assert(r.status === 200 && JSON.parse(await r.text()).latest_version === '1.0.0', 'taptap: GET /version -> 1.0.0');
+r = await tttCall('GET', '/api/taptap/leaderboard', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && Array.isArray(sj.players) && sj.players.length === 0, 'taptap: leaderboard kosong awal');
+r = await tttCall('GET', '/api/taptap/profile/12345678', null);
+assert(r.status === 404, 'taptap: profil belum ada -> 404');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '123', player_name: 'X', score: 1, total_energy_all_time: 1, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 400, 'taptap: account_id bukan 8 digit -> 400');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '12345678', player_name: 'Tester', score: 1000, total_energy_all_time: 1000, levels: [10, 2, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap: POST /profile upsert ok');
+r = await tttCall('GET', '/api/taptap/profile/12345678', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.score === 1000 && sj.levels[1] === 2 && sj.levels.length === 10, 'taptap: GET /profile kembalikan 10 level');
+// Klaim AFK: geser last_seen_at 3 jam ke belakang, CPS drone Lv 2 = 3.25
+// -> earned = elapsed * 3.25 (uji replay dari string JSON di D1).
+env.BACKUP_DB.tttPlayers.get('12345678').last_seen_at = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+r = await tttCall('POST', '/api/taptap/claim', { account_id: '12345678' });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.capped === false && sj.elapsed_seconds >= 10800 && sj.elapsed_seconds <= 10805 && Math.abs(sj.earned - sj.elapsed_seconds * 3.25) < 0.001 && sj.score === 1000 + sj.earned, 'taptap: klaim 3 jam x CPS 3.25, skor naik sebesar earned');
+r = await tttCall('POST', '/api/taptap/claim', { account_id: '87654321' });
+assert(r.status === 404, 'taptap: klaim akun tak ada -> 404');
+r = await tttCall('PATCH', '/api/taptap/profile/12345678/like', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.likes === 1, 'taptap: like +1');
+r = await tttCall('POST', '/api/taptap/chat', { sender_id: '12345678', sender_name: 'Tester', message: 'halo ttt' });
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap: POST /chat ok');
+r = await tttCall('GET', '/api/taptap/chat', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.messages.length === 1 && sj.messages[0].message === 'halo ttt', 'taptap: GET /chat kembalikan pesan');
+r = await tttCall('GET', '/api/taptap/leaderboard', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.players.length === 1 && sj.players[0].account_id === '12345678', 'taptap: leaderboard tampilkan pemain setelah upsert');
+r = await tttCall('GET', '/api/taptap/ngaco', null);
+assert(r.status === 404, 'taptap: segmen tak dikenal -> 404');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
