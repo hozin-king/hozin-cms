@@ -1309,10 +1309,10 @@ async function handleTapTap(request, env, url) {
   }
 
   // GET /api/taptap/version
-  // v1.1.0: min_version tetap 1.0.0 — aplikasi v1.0.0 tetap boleh jalan
-  // (kompatibel mundur, tanpa force-update).
+  // v1.1.1: latest naik ke 1.1.1 (deteksi wilayah GPS); min_version tetap
+  // 1.0.0 — aplikasi v1.0.0/v1.1.0 tetap boleh jalan (tanpa force-update).
   if (request.method === 'GET' && seg === 'version') {
-    return taptapJson({ latest_version: '1.1.0', min_version: '1.0.0' });
+    return taptapJson({ latest_version: '1.1.1', min_version: '1.0.0' });
   }
 
   return taptapJson({ error: 'not_found' }, 404);

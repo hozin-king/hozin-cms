@@ -3267,7 +3267,7 @@ async function tttCall(method, path, obj, headers = {}) {
 }
 const TTT_ADMIN_H = { authorization: 'Bearer test-admin-token' };
 r = await tttCall('GET', '/api/taptap/version', null);
-assert(r.status === 200 && JSON.parse(await r.text()).latest_version === '1.1.0', 'taptap: GET /version -> 1.1.0');
+assert(r.status === 200 && JSON.parse(await r.text()).latest_version === '1.1.1', 'taptap: GET /version -> 1.1.1');
 r = await tttCall('GET', '/api/taptap/leaderboard', null);
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && Array.isArray(sj.players) && sj.players.length === 0, 'taptap: leaderboard kosong awal');
