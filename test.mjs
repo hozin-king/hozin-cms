@@ -323,6 +323,10 @@ class MockDB {
       if (s.includes('WHERE viewed_at >= ?')) evs = evs.filter(e => String(e.viewed_at || '') >= a[0]);
       return evs.sort((x, y) => y.viewed_at.localeCompare(x.viewed_at));
     }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cms_view_events')) {
+      const evs = this.viewEvents.filter(e => String(e.viewed_at || '') >= a[0]);
+      return [{ c: evs.length }];
+    }
     if (s.startsWith('SELECT * FROM cms_comments WHERE id')) return this.comments.filter(c => c.id === a[0]);
     if (s.startsWith('UPDATE cms_comments SET text')) { const c = this.comments.find(x => x.id === a[1]); if (c) { c.text = a[0]; if (s.includes("status = 'pending'")) c.status = 'pending'; } return []; }
     if (s.startsWith('UPDATE cms_comments SET pinned = 0 WHERE post_id')) { this.comments.filter(c => c.post_id === a[0] && c.id !== a[1]).forEach(c => { c.pinned = 0; }); return []; }
@@ -1717,8 +1721,8 @@ r = await call('GET', '/bio'); t = await r.text();
 assert(r.status === 200 && t.includes('Link Bio'), '/bio: halaman Link Bio tampil');
 r = await call('GET', '/uptime'); t = await r.text();
 assert(r.status === 200 && t.includes('Status Situs') && t.includes('Online sejak 1 Januari 2024'), '/uptime: halaman status tampil');
-// v74: grafik kunjungan 30 hari + globe serangan (data fixture security_events)
-assert(t.includes('Kunjungan tercatat') && t.includes('attack-globe') && t.includes('"c":"US"') && t.includes('"c":"CN"') && t.includes('login admin gagal'), '/uptime: grafik kunjungan + globe serangan tampil (data fixture)');
+// v74: rata-rata kunjungan 30 hari + globe serangan (data fixture security_events)
+assert(t.includes('Kunjungan tercatat') && t.includes('kunjungan per hari (rata-rata)') && t.includes('attack-globe') && t.includes('"c":"US"') && t.includes('"c":"CN"') && t.includes('login admin gagal'), '/uptime: rata-rata kunjungan + globe serangan tampil (data fixture)');
 // v76: globe interaktif — seret untuk putar, warna busur per negara, ketuk titik untuk detail
 assert(t.includes('id="globe-detail"') && t.includes('Ketuk titik') && t.includes('Seret globe'), '/uptime: globe interaktif (seret + ketuk detail)');
 assert(t.includes('"col":"#') && t.includes('pointerdown'), '/uptime: warna busur per negara (drag + warna)');

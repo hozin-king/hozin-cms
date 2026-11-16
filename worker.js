@@ -2096,30 +2096,16 @@ async function handleFetch(request, env) {
       const startMs = Date.UTC(2023, 11, 31, 17, 0, 0); // 1 Jan 2024 00:00 WIB
       const days = Math.max(0, Math.floor((Date.now() - startMs) / 86400000));
       const checkedWib = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-      // Grafik kunjungan 30 hari: pola sama dengan dashboard (batang
-      // HTML/CSS murni dari cms_view_events, tanpa library/JS).
-      let dayChart = '';
+      // Rata-rata kunjungan 30 hari: halaman ini publik, jadi yang
+      // ditampilkan hanya angka rata-rata (bukan rincian per hari).
+      let avgVisits = '';
       try {
         const cutoff = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
-        const evs = await env.DB.prepare(`SELECT post_id, viewed_at FROM cms_view_events WHERE viewed_at >= ? ORDER BY viewed_at DESC`).bind(cutoff).all();
-        const perDay = new Map();
-        for (const e of (evs.results || [])) {
-          const d = new Date(new Date(String(e.viewed_at || '')).getTime() + 7 * 3600 * 1000).toISOString().slice(0, 10);
-          if (!d || d === 'NaN-NaN-NaN') continue;
-          perDay.set(d, (perDay.get(d) || 0) + 1);
-        }
-        const dayData = [];
-        for (let i = 29; i >= 0; i--) {
-          const d = new Date(Date.now() - i * 24 * 3600 * 1000 + 7 * 3600 * 1000).toISOString().slice(0, 10);
-          dayData.push([d, perDay.get(d) || 0]);
-        }
-        const dayMax = Math.max(1, ...dayData.map(([, n]) => n));
-        dayChart = dayData.map(([d, n]) => {
-          const w = Math.round((n / dayMax) * 100);
-          const bar = n > 0 ? `<span style="display:inline-block;height:18px;background:#3b82f6;border-radius:4px;min-width:18px;width:${w}%"></span>` : `<span style="display:inline-block;height:18px"></span>`;
-          return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0"><span style="min-width:92px;font-size:13px">${d}</span>${bar}<span style="font-size:13px"><b>${n}</b></span></div>`;
-        }).join('');
-      } catch (e) { dayChart = '<p class="meta">Grafik kunjungan tidak bisa dimuat saat ini.</p>'; }
+        const row = await env.DB.prepare(`SELECT COUNT(*) AS c FROM cms_view_events WHERE viewed_at >= ?`).bind(cutoff).first();
+        const total = Number((row && row.c) || 0);
+        const avg = (total / 30).toLocaleString('id-ID', { maximumFractionDigits: 1 });
+        avgVisits = `<p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${avg}</p><p style="margin:0;color:#5f6b7a">kunjungan per hari (rata-rata)</p><p class="meta" style="margin-top:14px">Total ${total} kunjungan tercatat dalam 30 hari terakhir.</p>`;
+      } catch (e) { avgVisits = '<p class="meta">Rata-rata kunjungan tidak bisa dimuat saat ini.</p>'; }
       // Warna busur per negara penyerang: 12 warna beda, ditentukan dari
       // kode negara (deterministik — negara yang sama selalu warna sama,
       // di globe maupun di daftar).
@@ -2349,7 +2335,7 @@ requestAnimationFrame(draw);
           }
         }
       } catch (e) { stopwatchCard = ''; }
-      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div>${stopwatchCard}<div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Jumlah kunjungan tercatat per hari (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal; hari tanpa batang berarti tidak ada kunjungan tercatat, bukan berarti situs mati.</p>${dayChart}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Seret globe untuk memutar. Ketuk titik untuk melihat detail serangan. Warna busur = negara penyerang (tiap negara warnanya beda). Semua busur menuju hozinking.my.id.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">${esc(feedStatus)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><p class="meta" id="globe-detail">Ketuk titik di globe untuk melihat detail serangan.</p><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul>${feedListHtml}</div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
+      const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div>${stopwatchCard}<div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Rata-rata kunjungan harian (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal.</p>${avgVisits}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Seret globe untuk memutar. Ketuk titik untuk melihat detail serangan. Warna busur = negara penyerang (tiap negara warnanya beda). Semua busur menuju hozinking.my.id.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">${esc(feedStatus)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><p class="meta" id="globe-detail">Ketuk titik di globe untuk melihat detail serangan.</p><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul>${feedListHtml}</div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
       return html(await renderPage(env, 'Status Situs', content), 200);
     }
 
