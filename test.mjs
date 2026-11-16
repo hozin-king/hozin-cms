@@ -77,6 +77,9 @@ class MockDB {
     // v86: fixture gambar + versi Cerpen (tabel cerpen_images + cerpen_version, D1 stopwatch-db)
     this.cerpenImages = [{ path: 'covers/cover_01.jpg.enc', data: 'GAMBAR-ENKRIPSI-UJI', sha256: 'abc123', size: 20 }];
     this.cerpenVersion = [{ key: 'latest', tag: 'v1.1.29', version: '1.1.29', apk_url: 'https://example.com/cerpen-1.1.29.apk', published_at: '2026-11-13T19:00:00+07:00' }];
+    // v1.1.38: jejak percobaan kunci + blok anti-bypass gerbang versi Cerpen
+    this.cerpenLockAttempts = [];
+    this.cerpenAppBlocks = [];
     // v87: state Sistem Koin Cerpen (cms-db) — dompet, unlock, voucher, VIP,
     // ban, pantauan, ledger, audit + tabel pelacak baca v81 (dipakai papan
     // peringkat/riwayat). BACKUP_DB memakai instance MockDB yang sama,
@@ -189,6 +192,23 @@ class MockDB {
     if (s.startsWith('SELECT comment_id, vote FROM cms_comment_votes WHERE user_key')) return this.votes.filter(v => v.user_key === a[0]).map(v => ({ comment_id: v.comment_id, vote: v.vote }));
     if (s.startsWith('SELECT * FROM cms_comment_votes ORDER')) return [...this.votes].sort((x, y) => x.comment_id - y.comment_id);
     if (s.startsWith('INSERT INTO cms_login_attempts')) { this.attempts.push({ id: ++this.attemptSeq, ip: a[0], created_at: a[1] }); return []; }
+    // v1.1.38: gerbang versi Cerpen — jejak percobaan kunci + blok anti-bypass.
+    if (s.startsWith('INSERT INTO cerpen_lock_attempts')) {
+      // bind: key, app_version, reason, now, key, reason, dedupSince
+      const dup = this.cerpenLockAttempts.some(x => x.subject_key === a[4] && x.reason === a[5] && x.created_at > a[6]);
+      if (!dup) this.cerpenLockAttempts.push({ subject_key: a[0], app_version: a[1] || '', reason: a[2], created_at: a[3] });
+      return [];
+    }
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_lock_attempts WHERE subject_key = ? AND reason IN')) return [{ n: this.cerpenLockAttempts.filter(x => x.subject_key === a[0] && (x.reason === 'signer_mismatch' || x.reason === 'signer_missing') && x.created_at > a[1]).length }];
+    if (s.startsWith('SELECT COUNT(*) AS n FROM cerpen_lock_attempts')) return [{ n: this.cerpenLockAttempts.filter(x => x.subject_key === a[0] && x.created_at > a[1]).length }];
+    if (s.startsWith('SELECT DISTINCT app_version FROM cerpen_lock_attempts')) return [...new Set(this.cerpenLockAttempts.filter(x => x.subject_key === a[0] && x.created_at > a[1]).map(x => x.app_version))].map(v => ({ app_version: v }));
+    if (s.startsWith('INSERT INTO cerpen_app_blocks')) {
+      const ex = this.cerpenAppBlocks.find(x => x.subject_key === a[0]);
+      if (ex) { ex.reason = a[1]; ex.blocked_until = a[2]; ex.violation_count = (ex.violation_count || 1) + 1; ex.updated_at = a[4]; }
+      else this.cerpenAppBlocks.push({ subject_key: a[0], reason: a[1], blocked_until: a[2], violation_count: 1, created_at: a[3], updated_at: a[4] });
+      return [];
+    }
+    if (s.startsWith('SELECT subject_key, reason, blocked_until FROM cerpen_app_blocks')) return this.cerpenAppBlocks.filter(x => x.subject_key === a[0] && x.blocked_until > a[1]);
     if (s.startsWith('SELECT COUNT(*) AS n FROM cms_login_attempts')) return [{ n: this.attempts.filter(x => x.ip === a[0] && x.created_at > a[1]).length }];
     if (s.startsWith('DELETE FROM cms_login_attempts')) {
       // Login admin sukses: hapus semua jejak IP itu.
@@ -952,13 +972,17 @@ globalThis.fetch = async (url, init) => {
   return realFetch0(url, init);
 };
 const base = 'https://cms.test';
-async function call(method, path, body = null, cookie = '') {
-  const headers = {};
+async function call(method, path, body = null, cookie = '', extraHeaders = {}) {
+  const headers = { ...extraHeaders };
   if (cookie) headers.cookie = cookie;
   if (body) headers['content-type'] = 'application/x-www-form-urlencoded';
   const req = new Request(base + path, { method, headers, body: body ? new URLSearchParams(body).toString() : undefined });
   return worker.fetch(req, env);
 }
+// v1.1.38: identitas aplikasi Cerpen resmi — dipakai semua panggilan tes
+// yang meniru klien aplikasi (gerbang versi menolak tanpa identitas ini).
+const CERPEN_SIGNER = '75ba028f4f9b401b3f414a2b9e63617fa35b503c692c5f6c188e3724a7a01c1d';
+const CERPEN_APP_H = { 'x-app-version': '1.1.37', 'x-app-signer-sha': CERPEN_SIGNER, 'x-device-id': 'test-device-1111' };
 function assert(cond, label) { console.log((cond ? 'OK  ' : 'GAGAL ') + label); if (!cond) process.exitCode = 1; }
 
 // 1. Beranda menampilkan post sambutan
@@ -1712,41 +1736,41 @@ async function cerpenHashForTest(offsetMs = 0) {
   return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 12);
 }
 const cHash = await cerpenHashForTest(0);
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, CERPEN_APP_H);
 j = await r.json();
 assert(r.status === 200 && j.version === '1' && j.counts && j.counts.cerpen_series === 1, 'cerpen-api: manifest terbaca dengan hash jam ini');
-r = await callJson('GET', `/api/c/${'0'.repeat(12)}/cerpen/manifest`, null);
+r = await callJson('GET', `/api/c/${'0'.repeat(12)}/cerpen/manifest`, null, CERPEN_APP_H);
 assert(r.status === 404, 'cerpen-api: hash salah ditolak 404');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/series`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/series`, null, CERPEN_APP_H);
 j = await r.json();
 assert(r.status === 200 && Array.isArray(j.series) && j.series.length === 1 && j.series[0].id === 'cerpen-01', 'cerpen-api: daftar series terbaca');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/episodes?series=cerpen-01&season=1`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/episodes?series=cerpen-01&season=1`, null, CERPEN_APP_H);
 j = await r.json();
 assert(r.status === 200 && Array.isArray(j.episodes) && j.episodes.length === 2, 'cerpen-api: daftar episode terbaca');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1&no=1`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1&no=1`, null, CERPEN_APP_H);
 j = await r.json();
 assert(r.status === 200 && j.episode && j.episode.isi_cipher === 'QUJD', 'cerpen-api: isi episode terbaca (cipher)');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1`, null, CERPEN_APP_H);
 assert(r.status === 400, 'cerpen-api: parameter kurang ditolak 400');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1&no=99`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1&no=99`, null, CERPEN_APP_H);
 assert(r.status === 404, 'cerpen-api: episode tidak ada ditolak 404');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/komik`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/komik`, null, CERPEN_APP_H);
 j = await r.json();
 assert(r.status === 200 && Array.isArray(j.komik) && j.komik.length === 1, 'cerpen-api: daftar komik terbaca');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/komik-episode?komik=komik-01&no=1`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/komik-episode?komik=komik-01&no=1`, null, CERPEN_APP_H);
 j = await r.json();
 assert(r.status === 200 && j.episode && j.episode.panels_cipher === 'UEFORQ==', 'cerpen-api: episode komik terbaca (cipher)');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/news?limit=1`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/news?limit=1`, null, CERPEN_APP_H);
 j = await r.json();
 assert(r.status === 200 && Array.isArray(j.news) && j.news.length === 1, 'cerpen-api: berita terbaca');
 const oldHash = await cerpenHashForTest(-3600000);
-r = await callJson('GET', `/api/c/${oldHash}/cerpen/manifest`, null);
+r = await callJson('GET', `/api/c/${oldHash}/cerpen/manifest`, null, CERPEN_APP_H);
 assert(r.status === 200, 'cerpen-api: hash jam sebelumnya masih diterima (toleransi ±1 jam)');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/all`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/all`, null, CERPEN_APP_H);
 j = await r.json();
 assert(r.status === 200 && j.version === '1' && j.series.length === 1 && j.episodes.length === 2 && j.komik.length === 1 && j.komik_episodes.length === 1 && j.news.length === 1 && j.counts.cerpen_episodes === 2, 'cerpen-api: dump penuh all berisi semua koleksi + counts');
 const savedCerpenBak = env.BACKUP_DB; delete env.BACKUP_DB;
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null);
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, CERPEN_APP_H);
 assert(r.status === 503, 'cerpen-api: tanpa BACKUP_DB -> 503');
 env.BACKUP_DB = savedCerpenBak;
 r = await callJson('GET', '/api/dracin/catalog', null);
@@ -2465,13 +2489,18 @@ assert(r.status === 429, 'fbm-apk: unduhan ke-11 dalam 1 jam ditolak 429');
 delete env.GITHUB_PAT_READ;
 globalThis.fetch = fetchBeforeFbm;
 // v86: endpoint publik Cerpen — gambar + versi dari D1 stopwatch-db.
-r = await call('GET', '/api/cerpen-img/covers/cover_01.jpg.enc');
+// v1.1.38: /api/cerpen-img/* ikut digerbang — panggilan meniru aplikasi resmi.
+r = await call('GET', '/api/cerpen-img/covers/cover_01.jpg.enc', null, '', CERPEN_APP_H);
 assert(r.status === 200 && r.headers.get('content-type') === 'application/octet-stream' && (r.headers.get('cache-control') || '').includes('max-age=3600'), 'cerpen-img: 200 + octet-stream + cache 1 jam');
 assert((await r.text()) === 'GAMBAR-ENKRIPSI-UJI', 'cerpen-img: byte gambar diteruskan apa adanya');
-r = await call('GET', '/api/cerpen-img/covers/tidak-ada.jpg.enc');
+r = await call('GET', '/api/cerpen-img/covers/tidak-ada.jpg.enc', null, '', CERPEN_APP_H);
 assert(r.status === 404 && (await r.text()).includes('gambar tidak ditemukan'), 'cerpen-img: path tidak ada -> 404');
-r = await call('GET', '/api/cerpen-img/..%2Fcover.jpg.enc');
+r = await call('GET', '/api/cerpen-img/..%2Fcover.jpg.enc', null, '', CERPEN_APP_H);
 assert(r.status === 400 && (await r.text()).includes('path gambar tidak valid'), 'cerpen-img: traversal ../ -> 400');
+r = await call('GET', '/api/cerpen-img/covers/cover_01.jpg.enc', null, '', { 'x-app-version': '1.1.36', 'x-app-signer-sha': CERPEN_SIGNER });
+assert(r.status === 426 && (await r.json()).reason === 'below_minimum', 'cerpen-img v1.1.38: versi di bawah lantai -> 426 below_minimum');
+r = await call('GET', '/api/cerpen-img/covers/cover_01.jpg.enc');
+assert(r.status === 426 && (await r.json()).reason === 'version_unknown', 'cerpen-img v1.1.38: tanpa identitas -> 426 version_unknown');
 // v86: endpoint publik Cerpen — gambar + versi dari D1 stopwatch-db.
 // v87.4: sumber utama GitHub live; stub fetch gagal -> fallback D1 (deterministik,
 // bukan bergantung pada rate limit jaringan sungguhan).
@@ -2480,19 +2509,33 @@ globalThis.fetch = async (url, init) => {
   if (String(url).includes('github.com') || String(url).includes('jsdelivr')) throw new Error('github down (uji fallback)');
   return fetchBeforeCerpenV(url, init);
 };
+// v1.1.38: gerbang memanggil resolveCerpenRelease di tiap request, jadi
+// cache bisa sudah hangat dari fetch live saat tes gambar — dan baris D1
+// ikut tersegarkan ke rilis live (v1.1.37) oleh refreshCerpenVersionRow.
+// Kosongkan cache + kembalikan baris D1 ke seed v1.1.29 supaya tes ini
+// benar-benar menguji jalur fallback D1.
+resetCerpenReleaseCacheForTest();
+env.BACKUP_DB.cerpenVersion = [{ key: 'latest', tag: 'v1.1.29', version: '1.1.29', apk_url: 'https://example.com/cerpen-1.1.29.apk', published_at: '2026-11-13T19:00:00+07:00' }];
 r = await call('GET', '/api/cerpen-version'); t = await r.text();
 assert(r.status === 200 && (r.headers.get('cache-control') || '').includes('no-store'), 'cerpen-version: 200 + no-store');
 let cerpenV = {};
 try { cerpenV = JSON.parse(t); } catch (e) {}
 assert(cerpenV.tag === 'v1.1.29' && cerpenV.version === '1.1.29' && cerpenV.apk_url === 'https://example.com/cerpen-1.1.29.apk' && cerpenV.published_at === '2026-11-13T19:00:00+07:00' && cerpenV.source === 'd1', 'cerpen-version: GitHub gagal -> fallback D1 v1.1.29 (source d1)');
 env.BACKUP_DB.cerpenVersion = [];
+resetCerpenReleaseCacheForTest();
 r = await call('GET', '/api/cerpen-version');
 assert(r.status === 404 && (await r.text()).includes('versi belum tersedia'), 'cerpen-version: tanpa baris -> 404');
 globalThis.fetch = fetchBeforeCerpenV;
 // v87.4: /api/cerpen-version live dari GitHub + penegakan update di sync.
 resetCerpenReleaseCacheForTest();
 env.BACKUP_DB.cerpenVersion = [{ key: 'latest', tag: 'v1.1.28', version: '1.1.28', apk_url: 'https://example.com/cerpen-1.1.28.apk', published_at: '2026-11-13T09:11:12Z' }];
-const cerpenReleasesUji = [
+let cerpenReleasesUji = [
+  { tag_name: 'v1.1.37', draft: false, prerelease: false, published_at: '2026-11-16T14:50:00Z', assets: [{ name: 'CerpenHozin-v1.1.37.apk', size: 1979822, browser_download_url: 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.37/CerpenHozin-v1.1.37.apk' }] },
+  { tag_name: 'v1.1.36', draft: false, prerelease: false, published_at: '2026-11-16T13:10:00Z', assets: [{ name: 'CerpenHozin-v1.1.36.apk', size: 1979822, browser_download_url: 'https://example.com/36.apk' }] },
+  { tag_name: 'v1.1.35', draft: false, prerelease: false, published_at: '2026-11-15T01:13:00Z', assets: [{ name: 'CerpenHozin-v1.1.35.apk', size: 1970000, browser_download_url: 'https://example.com/35.apk' }] },
+  { tag_name: 'v1.1.34', draft: false, prerelease: false, published_at: '2026-11-15T00:00:00Z', assets: [{ name: 'CerpenHozin-v1.1.34.apk', size: 1970000, browser_download_url: 'https://example.com/34.apk' }] },
+  { tag_name: 'v1.1.33', draft: false, prerelease: false, published_at: '2026-11-14T20:00:00Z', assets: [{ name: 'CerpenHozin-v1.1.33.apk', size: 1970000, browser_download_url: 'https://example.com/33.apk' }] },
+  { tag_name: 'v1.1.32', draft: false, prerelease: false, published_at: '2026-11-14T18:00:00Z', assets: [{ name: 'CerpenHozin-v1.1.32.apk', size: 1970000, browser_download_url: 'https://example.com/32.apk' }] },
   { tag_name: 'v1.1.31', draft: false, prerelease: false, published_at: '2026-11-14T16:18:47Z', assets: [{ name: 'CerpenHozin-v1.1.31.apk', size: 1977902, browser_download_url: 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.31/CerpenHozin-v1.1.31.apk' }] },
   { tag_name: 'v1.1.30.3', draft: false, prerelease: false, published_at: '2026-11-13T14:53:08Z', assets: [{ name: 'CerpenHozin-v1.1.30.3.apk', size: 1958366, browser_download_url: 'https://example.com/30.3.apk' }] },
   { tag_name: 'v1.1.30.2', draft: false, prerelease: false, published_at: '2026-11-13T14:29:45Z', assets: [{ name: 'CerpenHozin-v1.1.30.2.apk', size: 1958362, browser_download_url: 'https://example.com/30.2.apk' }] },
@@ -2514,32 +2557,90 @@ env.DB.rateLimits = new Map();
 r = await call('GET', '/api/cerpen-version'); t = await r.text();
 let cv2 = {};
 try { cv2 = JSON.parse(t); } catch (e) {}
-assert(r.status === 200 && cv2.ok === true && cv2.tag === 'v1.1.31' && cv2.version === '1.1.31' && cv2.apk_url === 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.31/CerpenHozin-v1.1.31.apk' && cv2.published_at === '2026-11-14T16:18:47Z' && Array.isArray(cv2.tags) && cv2.tags.length === 7 && cv2.tags[0] === 'v1.1.31' && cv2.source === 'github', 'cerpen-version v87.4: live GitHub -> v1.1.31 + tags + apk_url (source github)');
-assert(env.BACKUP_DB.cerpenVersion.some(x => x.key === 'latest' && x.tag === 'v1.1.31' && x.version === '1.1.31'), 'cerpen-version v87.4: baris D1 fallback disegarkan ke v1.1.31');
+assert(r.status === 200 && cv2.ok === true && cv2.tag === 'v1.1.37' && cv2.version === '1.1.37' && cv2.apk_url === 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.37/CerpenHozin-v1.1.37.apk' && cv2.published_at === '2026-11-16T14:50:00Z' && Array.isArray(cv2.tags) && cv2.tags.length === 13 && cv2.tags[0] === 'v1.1.37' && cv2.source === 'github' && cv2.min_version === '1.1.37', 'cerpen-version v1.1.38: live GitHub -> v1.1.37 + tags + apk_url + min_version (source github)');
+assert(env.BACKUP_DB.cerpenVersion.some(x => x.key === 'latest' && x.tag === 'v1.1.37' && x.version === '1.1.37'), 'cerpen-version v1.1.38: baris D1 fallback disegarkan ke v1.1.37');
 const ghAfterFirst = cerpenGhCalls;
 r = await call('GET', '/api/cerpen-version');
 assert(r.status === 200 && cerpenGhCalls === ghAfterFirst, 'cerpen-version v87.4: panggilan kedua memakai cache 5 menit (tanpa fetch GitHub lagi)');
 // Penegakan update di jalur sync (hash jam ini sudah dihitung di seksi v62: cHash).
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28' });
+// v1.1.38: lantai minimum 1.1.37 (perintah user 16 Nov 2026) + signer wajib
+// + tanpa identitas -> 426. Urutan tes sengaja memakai SEDIKIT versi
+// berbeda supaya ambang hopping (5 versi/jam) tidak terpicu oleh tes
+// itu sendiri — ambang diuji terpisah di seksi blok di bawah.
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28', 'x-app-signer-sha': CERPEN_SIGNER });
 j = await r.json();
-assert(r.status === 426 && j.ok === false && j.error === 'version_locked' && j.latest === 'v1.1.31' && j.reason === 'locked_3_behind', 'cerpen-lock v87.4: sync v1.1.28 (6 rilis di belakang) -> 426 version_locked');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.30' });
-assert(r.status === 426, 'cerpen-lock v87.4: sync v1.1.30 (4 rilis di belakang) -> 426');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.30.3' });
-assert(r.status === 200, 'cerpen-lock v87.4: sync v1.1.30.3 (1 rilis di belakang) -> 200, update kecil soft saja');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.31' });
-assert(r.status === 200, 'cerpen-lock v87.4: sync v1.1.31 (terbaru) -> 200');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.31', 'x-app-signer-sha': '00'.repeat(32) });
+assert(r.status === 426 && j.ok === false && j.error === 'app_update_required' && j.latest === 'v1.1.37' && j.reason === 'below_minimum' && j.min_version === '1.1.37', 'cerpen-lock v1.1.38: sync v1.1.28 (di bawah lantai) -> 426 below_minimum');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.35', 'x-app-signer-sha': CERPEN_SIGNER });
 j = await r.json();
-assert(r.status === 426 && j.error === 'version_locked' && j.reason === 'signer_mismatch', 'cerpen-lock v87.4: signer salah -> 426 signer_mismatch');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.31', 'x-app-signer-sha': '75:BA:02:8F:4F:9B:40:1B:3F:41:4A:2B:9E:63:61:7F:A3:5B:50:3C:69:2C:5F:6C:18:8E:37:24:A7:A0:1C:1D' });
-assert(r.status === 200, 'cerpen-lock v87.4: signer resmi (format ber-colon + huruf besar) -> 200');
+assert(r.status === 426 && j.reason === 'below_minimum', 'cerpen-lock v1.1.38: sync v1.1.35 (di bawah lantai, walau cuma 2 rilis di belakang) -> 426 below_minimum');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.34', 'x-app-signer-sha': CERPEN_SIGNER });
+j = await r.json();
+assert(r.status === 426 && j.reason === 'below_minimum', 'cerpen-lock v1.1.38: sync v1.1.34 (di bawah lantai) -> 426 below_minimum');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.37', 'x-app-signer-sha': CERPEN_SIGNER });
+assert(r.status === 200, 'cerpen-lock v1.1.38: sync v1.1.37 (terbaru) -> 200');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.37', 'x-app-signer-sha': '00'.repeat(32) });
+j = await r.json();
+assert(r.status === 426 && j.error === 'app_update_required' && j.reason === 'signer_mismatch', 'cerpen-lock v1.1.38: signer salah -> 426 signer_mismatch');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.37', 'x-app-signer-sha': '75:BA:02:8F:4F:9B:40:1B:3F:41:4A:2B:9E:63:61:7F:A3:5B:50:3C:69:2C:5F:6C:18:8E:37:24:A7:A0:1C:1D' });
+assert(r.status === 200, 'cerpen-lock v1.1.38: signer resmi (format ber-colon + huruf besar) -> 200');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.37' });
+j = await r.json();
+assert(r.status === 426 && j.reason === 'signer_missing', 'cerpen-lock v1.1.38: versi tanpa signer -> 426 signer_missing');
 r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null);
-assert(r.status === 200, 'cerpen-lock v87.4: tanpa header versi/signer (aplikasi lama) -> 200, tidak diblokir');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest?app_version=1.1.28`, null);
-assert(r.status === 426, 'cerpen-lock v87.4: fallback query ?app_version=1.1.28 -> 426');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': 'abc' });
-assert(r.status === 426, 'cerpen-lock v87.4: versi tak bisa diparse -> 426 version_unknown');
+j = await r.json();
+assert(r.status === 426 && j.reason === 'version_unknown', 'cerpen-lock v1.1.38: tanpa header versi/signer -> 426 version_unknown (fail-open lama dihapus)');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest?app_version=1.1.28&app_signer_sha=${CERPEN_SIGNER}`, null);
+j = await r.json();
+assert(r.status === 426 && j.reason === 'below_minimum', 'cerpen-lock v1.1.38: fallback query ?app_version=1.1.28&app_signer_sha=... -> 426 below_minimum');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': 'abc', 'x-app-signer-sha': CERPEN_SIGNER });
+j = await r.json();
+assert(r.status === 426 && j.reason === 'version_unknown', 'cerpen-lock v1.1.38: versi tak bisa diparse -> 426 version_unknown');
+// v1.1.38: locked_3_behind hanya terjangkau bila latest jauh di atas
+// lantai — uji dengan fixture "masa depan" (latest v1.1.40).
+cerpenReleasesUji = [
+  { tag_name: 'v1.1.40', draft: false, prerelease: false, published_at: '2026-11-20T10:00:00Z', assets: [{ name: 'CerpenHozin-v1.1.40.apk', size: 1980000, browser_download_url: 'https://example.com/40.apk' }] },
+  { tag_name: 'v1.1.39', draft: false, prerelease: false, published_at: '2026-11-19T10:00:00Z', assets: [{ name: 'CerpenHozin-v1.1.39.apk', size: 1980000, browser_download_url: 'https://example.com/39.apk' }] },
+  { tag_name: 'v1.1.38', draft: false, prerelease: false, published_at: '2026-11-18T10:00:00Z', assets: [{ name: 'CerpenHozin-v1.1.38.apk', size: 1980000, browser_download_url: 'https://example.com/38.apk' }] },
+  { tag_name: 'v1.1.37', draft: false, prerelease: false, published_at: '2026-11-16T14:50:00Z', assets: [{ name: 'CerpenHozin-v1.1.37.apk', size: 1979822, browser_download_url: 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.37/CerpenHozin-v1.1.37.apk' }] },
+];
+resetCerpenReleaseCacheForTest();
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.38', 'x-app-signer-sha': CERPEN_SIGNER });
+assert(r.status === 200, 'cerpen-lock v1.1.38: sync v1.1.38 (2 rilis di belakang latest v1.1.40) -> 200');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.37', 'x-app-signer-sha': CERPEN_SIGNER });
+j = await r.json();
+assert(r.status === 426 && j.reason === 'locked_3_behind' && j.latest === 'v1.1.40', 'cerpen-lock v1.1.38: sync v1.1.37 (3 rilis di belakang latest v1.1.40, di atas lantai) -> 426 locked_3_behind');
+// v1.1.38: anti-bypass — signer palsu berulang dari perangkat yang sama
+// -> beku total 24 jam (403 app_blocked); klien yang sudah update (lolos
+// cek versi) tetap lolos walau kuncinya pernah dibekukan (self-heal).
+// IP diisolasi (203.0.113.77) supaya ambang IP tes ini tidak mencemari
+// seksi lain yang berbagi IP default 'unknown'.
+const BLOCK_DEV = 'block-test-device-9999';
+const BLOCK_IP = { 'cf-connecting-ip': '203.0.113.77' };
+// Dedup pencatatan 10 detik: percobaan yang datang berurutan dalam <10 dtk
+// hanya tercatat sekali — tua-kan baris 11 detik antar percobaan supaya
+// tiap percobaan terhitung (di produksi, penyerang yang bertahan >20 dtk
+// tetap kena ambang; yang cuma burst <10 dtk tetap kena 426).
+const ageAttempts = () => env.BACKUP_DB.cerpenLockAttempts.forEach(x => { x.created_at -= 11000; });
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.37', 'x-app-signer-sha': '00'.repeat(32), 'x-device-id': BLOCK_DEV, ...BLOCK_IP });
+assert(r.status === 426, 'cerpen-block v1.1.38: percobaan signer palsu ke-1 -> 426');
+ageAttempts();
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.37', 'x-app-signer-sha': '00'.repeat(32), 'x-device-id': BLOCK_DEV, ...BLOCK_IP });
+assert(r.status === 426, 'cerpen-block v1.1.38: percobaan signer palsu ke-2 -> 426');
+ageAttempts();
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.37', 'x-app-signer-sha': '00'.repeat(32), 'x-device-id': BLOCK_DEV, ...BLOCK_IP });
+j = await r.json();
+assert(r.status === 403 && j.error === 'app_blocked' && typeof j.blocked_until === 'number' && j.blocked_until > Date.now(), 'cerpen-block v1.1.38: percobaan ke-3 (ambang 3/jam tercapai) -> 403 app_blocked 24 jam');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.37', 'x-app-signer-sha': '00'.repeat(32), 'x-device-id': BLOCK_DEV, ...BLOCK_IP });
+assert(r.status === 403, 'cerpen-block v1.1.38: percobaan ke-4 (sudah dibekukan) -> 403');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.38', 'x-app-signer-sha': CERPEN_SIGNER, 'x-device-id': BLOCK_DEV, ...BLOCK_IP });
+assert(r.status === 200, 'cerpen-block v1.1.38: perangkat yang sama dengan versi+signer resmi (self-heal, v1.1.38 lolos di fixture masa depan) -> 200');
+assert(env.BACKUP_DB.cerpenAppBlocks.length === 2, 'cerpen-block v1.1.38: blok tercatat untuk perangkat + IP (2 kunci)');
+env.BACKUP_DB.cerpenLockAttempts = [];
+env.BACKUP_DB.cerpenAppBlocks = [];
+// Fixture "masa depan" di atas ikut menyegarkan baris D1 ke v1.1.40 —
+// pulihkan ke v1.1.37 supaya seksi GitHub-down sesudahnya menguji
+// fallback yang benar.
+env.BACKUP_DB.cerpenVersion = [{ key: 'latest', tag: 'v1.1.37', version: '1.1.37', apk_url: 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.37/CerpenHozin-v1.1.37.apk', published_at: '2026-11-16T14:50:00Z' }];
 // GitHub down: fallback D1 (sudah disegarkan ke v1.1.31) + fail-open di
 // penegakan hitungan (tags tak lengkap) — sync lama lolos sementara.
 resetCerpenReleaseCacheForTest();
@@ -2551,9 +2652,10 @@ env.DB.rateLimits = new Map();
 r = await call('GET', '/api/cerpen-version'); t = await r.text();
 let cv3 = {};
 try { cv3 = JSON.parse(t); } catch (e) {}
-assert(r.status === 200 && cv3.tag === 'v1.1.31' && cv3.source === 'd1', 'cerpen-version v87.4: GitHub down -> fallback D1 segar v1.1.31 (source d1)');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28' });
-assert(r.status === 200, 'cerpen-lock v87.4: GitHub down (fallback D1) -> fail-open sementara, sync 1.1.28 lolos');
+assert(r.status === 200 && cv3.tag === 'v1.1.37' && cv3.source === 'd1', 'cerpen-version v1.1.38: GitHub down -> fallback D1 segar v1.1.37 (source d1)');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28', 'x-app-signer-sha': CERPEN_SIGNER });
+j = await r.json();
+assert(r.status === 426 && j.reason === 'below_minimum', 'cerpen-lock v1.1.38: GitHub down (fallback D1) -> lantai minimum tetap berlaku, sync 1.1.28 -> 426 below_minimum (fail-open lama dihapus)');
 globalThis.fetch = fetchBeforeCerpenLive;
 // v87.4 (lanjutan): API GitHub kena rate limit -> jalur git refs + halaman tag.
 resetCerpenReleaseCacheForTest();
@@ -2584,8 +2686,9 @@ let cv4 = {};
 try { cv4 = JSON.parse(t); } catch (e) {}
 assert(r.status === 200 && cv4.tag === 'v1.1.31.1' && cv4.version === '1.1.31.1' && cv4.apk_url === 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.31.1/CerpenHozin-v1.1.31.1.apk' && cv4.published_at === '2026-11-14T16:30:49Z' && cv4.source === 'github-refs' && Array.isArray(cv4.tags) && cv4.tags.length === 8 && cv4.tags[0] === 'v1.1.31.1' && !cv4.tags.includes('v1.2.0-beta'), 'cerpen-version v87.4: API rate-limited -> jalur git refs -> v1.1.31.1 + tags lengkap (beta dikecualikan)');
 assert(env.BACKUP_DB.cerpenVersion.some(x => x.key === 'latest' && x.tag === 'v1.1.31.1'), 'cerpen-version v87.4: jalur refs juga menyegarkan baris D1 ke v1.1.31.1');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28' });
-assert(r.status === 426 && (await r.json()).error === 'version_locked', 'cerpen-lock v87.4: dengan data refs, sync v1.1.28 -> 426 (7 rilis di belakang)');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28', 'x-app-signer-sha': CERPEN_SIGNER });
+j = await r.json();
+assert(r.status === 426 && j.error === 'app_update_required' && j.reason === 'below_minimum', 'cerpen-lock v1.1.38: dengan data refs, sync v1.1.28 -> 426 below_minimum');
 globalThis.fetch = fetchBeforeRefs;
 // v87.4 (lanjutan): API + github.com sama-sama gagal -> jalur jsDelivr.
 resetCerpenReleaseCacheForTest();
@@ -2604,8 +2707,9 @@ let cv5 = {};
 try { cv5 = JSON.parse(t); } catch (e) {}
 assert(r.status === 200 && cv5.tag === 'v1.1.31.1' && cv5.version === '1.1.31.1' && cv5.apk_url === 'https://github.com/hozin-king/cerpen-hozin/releases/download/v1.1.31.1/CerpenHozin-v1.1.31.1.apk' && cv5.published_at === '2026-11-14T16:30:49Z' && cv5.source === 'jsdelivr' && Array.isArray(cv5.tags) && cv5.tags.length === 8 && cv5.tags[0] === 'v1.1.31.1' && !cv5.tags.includes('v1.2.0-beta'), 'cerpen-version v87.4: API + github.com gagal -> jalur jsDelivr -> v1.1.31.1 (beta dikecualikan)');
 assert(env.BACKUP_DB.cerpenVersion.some(x => x.key === 'latest' && x.tag === 'v1.1.31.1'), 'cerpen-version v87.4: jalur jsDelivr juga menyegarkan baris D1 ke v1.1.31.1');
-r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28' });
-assert(r.status === 426 && (await r.json()).error === 'version_locked', 'cerpen-lock v87.4: dengan data jsDelivr, sync v1.1.28 -> 426');
+r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, { 'x-app-version': '1.1.28', 'x-app-signer-sha': CERPEN_SIGNER });
+j = await r.json();
+assert(r.status === 426 && j.error === 'app_update_required' && j.reason === 'below_minimum', 'cerpen-lock v1.1.38: dengan data jsDelivr, sync v1.1.28 -> 426 below_minimum');
 globalThis.fetch = fetchBeforeJd;
 // v87.4 (lanjutan): live tanpa published_at -> isi dari baris D1 tag sama.
 resetCerpenReleaseCacheForTest();
@@ -2636,7 +2740,7 @@ const DEV_H = '66666666-7777-4888-8999-aaaaaaaaaaaa';
 const DEV_I = '99999999-8888-4777-8666-555555555555';
 const DEV_J = '22222222-3333-4444-8555-666666666666';
 async function coinCall(method, path, obj, headers = {}) {
-  const h = { 'content-type': 'application/json', ...headers };
+  const h = { 'content-type': 'application/json', ...CERPEN_APP_H, ...headers };
   const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
   return worker.fetch(req, env);
 }
@@ -2967,7 +3071,7 @@ const devF = rj.devices.find(d => d.device_id === DEV_F);
 assert(devF && devF.status === 'perlu perhatian', 'koin pantauan: >=5 gagal redeem -> perlu perhatian (tidak memblokir)');
 // v87.3: Fitur sosial Cerpen — view/like/dislike/report + statistik admin.
 async function socialCall(method, path, obj, headers = {}) {
-  const h = { 'content-type': 'application/json', ...headers };
+  const h = { 'content-type': 'application/json', ...CERPEN_APP_H, ...headers };
   const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
   return worker.fetch(req, env);
 }
@@ -3073,7 +3177,7 @@ t = await r.text();
 assert(r.status === 200 && t.includes('Pemberi Like') && t.includes('Like baru per hari') && t.includes(SOC_REF), 'social likers v87.4: panel statistik tampilkan kartu Pemberi Like + tren like + picker konten');
 // v87.5: bookmark ikut akun — GET/POST/DELETE /api/cerpen-bookmarks.
 async function bmCall(method, path, obj, headers = {}) {
-  const h = { 'content-type': 'application/json', ...headers };
+  const h = { 'content-type': 'application/json', ...CERPEN_APP_H, ...headers };
   const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
   return worker.fetch(req, env);
 }
