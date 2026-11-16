@@ -1491,7 +1491,7 @@ async function handleFetch(request, env) {
       if (!env.BACKUP_DB) return ciJson({ ok: false, error: 'database tidak tersedia' }, 503);
       // v1.1.38: gerbang versi + anti-bypass — gambar adalah konten
       // berbayar/terkunci sama seperti manifest/episode; versi di bawah
-      // v1.1.37 tidak boleh mengunduh gambar apa pun (426/403).
+      // v1.1.39 tidak boleh mengunduh gambar apa pun (426/403).
       const gate = await enforceCerpenAppGate(request, env);
       if (gate) return gate;
       let imgPath;
@@ -2375,7 +2375,7 @@ async function handleFetch(request, env) {
       }
       if (!env.BACKUP_DB) return cpJson({ ok: false, error: 'database tidak tersedia' }, 503);
       // v1.1.38: gerbang versi + anti-bypass (cerpen-gate.js) — SATU sumber
-      // kebenaran untuk semua endpoint aplikasi. Di bawah v1.1.37 -> 426;
+      // kebenaran untuk semua endpoint aplikasi. Di bawah v1.1.39 -> 426;
       // signer tak dikenal/hilang -> 426; tanpa identitas -> 426;
       // percobaan berulang -> 403 (beku 24 jam). Fallback query
       // ?app_version= / ?app_signer_sha= (warisan v87.4) tetap didukung

@@ -262,14 +262,14 @@ export async function resolveCerpenRelease(env) {
 //   tolak (version_unknown): sejak v1.1.32 klien resmi SELALU mengirim
 //   keduanya, jadi permintaan tanpa identitas tak bisa dibedakan dari
 //   percobaan bypass — dan perintah user 16 Nov 2026 menuntut versi di
-//   bawah v1.1.37 diblokir TOTAL, bukan lolos lewat ketiadaan header.
+//   bawah v1.1.39 diblokir TOTAL, bukan lolos lewat ketiadaan header.
 // - versi di bawah CERPEN_MIN_VERSION -> tolak (below_minimum), TANPA
 //   tenggang, bahkan bila rilis terbaru tak bisa di-resolve (lantai ini
 //   tidak bergantung pada jaringan/GitHub).
-export const CERPEN_MIN_VERSION = '1.1.37';
+export const CERPEN_MIN_VERSION = '1.1.39';
 // Kode versi minimum yang bersesuaian (dipakai panel/admin; perbandingan
 // di gerbang memakai nama versi, bukan kode — klien lama tak mengirim kode).
-export const CERPEN_MIN_VERSION_CODE = 43;
+export const CERPEN_MIN_VERSION_CODE = 45;
 export async function checkCerpenAppLock(env, appVersion, appSigner) {
   const rel = await resolveCerpenRelease(env);
   const latest = rel ? rel.tag : null;
@@ -287,7 +287,7 @@ export async function checkCerpenAppLock(env, appVersion, appSigner) {
   if (!appVersion) return { latest, reason: 'version_unknown' };
   const v = parseAppVersion(appVersion);
   if (!v) return { latest, reason: 'version_unknown' };
-  // Lantai minimum (perintah user 16 Nov 2026): di bawah 1.1.37 -> kunci
+  // Lantai minimum (perintah user 16 Nov 2026): di bawah 1.1.39 -> kunci
   // total, tanpa tenggang. Diperiksa SEBELUM rilis terbaru supaya tetap
   // berlaku saat GitHub/jsDelivr/D1 tak bisa dijangkau (fail-open lama
   // dihapus: dulu `!rel -> return null` membuat versi lama lolos).
