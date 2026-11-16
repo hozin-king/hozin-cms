@@ -975,10 +975,13 @@ class MockDB {
     // v1.1.0: leaderboard scope (tanpa LIMIT di SQL — filter + rank di JS).
     if (s.startsWith('SELECT account_id, player_name, total_energy_all_time, likes, province_code, regency_code, district_code, ban_type, ban_until FROM ttt_players')) return [...this.tttPlayers.values()].sort((x, y) => (Number(y.total_energy_all_time) || 0) - (Number(x.total_energy_all_time) || 0)).map(x => ({ account_id: x.account_id, player_name: x.player_name, total_energy_all_time: x.total_energy_all_time, likes: x.likes, province_code: x.province_code || '', regency_code: x.regency_code || '', district_code: x.district_code || '', ban_type: x.ban_type || null, ban_until: x.ban_until || '' }));
     if (s.startsWith('SELECT * FROM ttt_players WHERE account_id = ?')) return this.tttPlayers.has(a[0]) ? [this.tttPlayers.get(a[0])] : [];
-    if (s.startsWith('SELECT score, total_energy_all_time, levels, last_seen_at, ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?')) { const r = this.tttPlayers.get(a[0]); return r ? [{ score: r.score, total_energy_all_time: r.total_energy_all_time, levels: r.levels, last_seen_at: r.last_seen_at, ban_type: r.ban_type || null, ban_reason: r.ban_reason || '', ban_until: r.ban_until || '' }] : []; }
+    if (s.startsWith('SELECT score, total_energy_all_time, levels, last_seen_at, ban_type, ban_reason, ban_until, savings, savings_updated_at FROM ttt_players WHERE account_id = ?')) { const r = this.tttPlayers.get(a[0]); return r ? [{ score: r.score, total_energy_all_time: r.total_energy_all_time, levels: r.levels, last_seen_at: r.last_seen_at, ban_type: r.ban_type || null, ban_reason: r.ban_reason || '', ban_until: r.ban_until || '', savings: r.savings || 0, savings_updated_at: r.savings_updated_at || '' }] : []; }
+    if (s.startsWith('SELECT savings, savings_updated_at FROM ttt_players WHERE account_id = ?')) { const r = this.tttPlayers.get(a[0]); return r ? [{ savings: r.savings || 0, savings_updated_at: r.savings_updated_at || '' }] : []; }
     if (s.startsWith('SELECT ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?')) { const r = this.tttPlayers.get(a[0]); return r ? [{ ban_type: r.ban_type || null, ban_reason: r.ban_reason || '', ban_until: r.ban_until || '' }] : []; }
     if (s.startsWith('UPDATE ttt_players SET score = ?')) { const r = this.tttPlayers.get(a[4]); if (r) { r.score = a[0]; r.total_energy_all_time = a[1]; r.last_seen_at = a[2]; r.updated_at = a[3]; } return []; }
-    if (s.startsWith('INSERT INTO ttt_players')) { this.tttPlayers.set(a[0], { account_id: a[0], player_name: a[1], score: a[2], total_energy_all_time: a[3], click_level: a[4], auto_level: a[5], levels: a[6], last_seen_at: a[7], friends: a[8], likes: a[9], updated_at: a[10], province_code: '', regency_code: '', district_code: '', region_updated_at: '', ban_type: null, ban_reason: '', ban_until: '', ban_created_at: '' }); return []; }
+    if (s.startsWith('INSERT INTO ttt_players')) { this.tttPlayers.set(a[0], { account_id: a[0], player_name: a[1], score: a[2], total_energy_all_time: a[3], click_level: a[4], auto_level: a[5], levels: a[6], last_seen_at: a[7], friends: a[8], likes: a[9], updated_at: a[10], province_code: '', regency_code: '', district_code: '', region_updated_at: '', ban_type: null, ban_reason: '', ban_until: '', ban_created_at: '', savings: 0, savings_updated_at: '' }); return []; }
+    if (s.startsWith('UPDATE ttt_players SET player_name = ?, score = ?, total_energy_all_time = ?, click_level = ?, auto_level = ?, levels = ?, last_seen_at = ?, friends = ?, likes = ?, savings = ?, savings_updated_at = ?, updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[12]); if (r) { r.player_name = a[0]; r.score = a[1]; r.total_energy_all_time = a[2]; r.click_level = a[3]; r.auto_level = a[4]; r.levels = a[5]; r.last_seen_at = a[6]; r.friends = a[7]; r.likes = a[8]; r.savings = a[9]; r.savings_updated_at = a[10]; r.updated_at = a[11]; } return []; }
+    if (s.startsWith('UPDATE ttt_players SET savings_updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[1]); if (r) { r.savings_updated_at = a[0]; } return []; }
     if (s.startsWith('UPDATE ttt_players SET likes = likes + 1')) { const r = this.tttPlayers.get(a[1]); if (!r) return []; r.likes = (Number(r.likes) || 0) + 1; r.updated_at = a[0]; return [{ likes: r.likes }]; }
     if (s.startsWith('SELECT sender_id, sender_name, message, created_at FROM ttt_chats')) return [...this.tttChats].sort((x, y) => y.id - x.id).slice(0, a[0]).map(x => ({ sender_id: x.sender_id, sender_name: x.sender_name, message: x.message, created_at: x.created_at }));
     if (s.startsWith('SELECT c.sender_id, c.sender_name, c.message, c.created_at, p.ban_type, p.ban_until FROM ttt_chats c LEFT JOIN ttt_players p')) return [...this.tttChats].sort((x, y) => y.id - x.id).slice(0, a[0]).map(x => { const p = this.tttPlayers.get(x.sender_id); return { sender_id: x.sender_id, sender_name: x.sender_name, message: x.message, created_at: x.created_at, ban_type: p ? (p.ban_type || null) : null, ban_until: p ? (p.ban_until || '') : '' }; });
@@ -3267,7 +3270,7 @@ async function tttCall(method, path, obj, headers = {}) {
 }
 const TTT_ADMIN_H = { authorization: 'Bearer test-admin-token' };
 r = await tttCall('GET', '/api/taptap/version', null);
-assert(r.status === 200 && JSON.parse(await r.text()).latest_version === '1.1.1', 'taptap: GET /version -> 1.1.1');
+assert(r.status === 200 && JSON.parse(await r.text()).latest_version === '1.1.2', 'taptap: GET /version -> 1.1.2');
 r = await tttCall('GET', '/api/taptap/leaderboard', null);
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && Array.isArray(sj.players) && sj.players.length === 0, 'taptap: leaderboard kosong awal');
@@ -3451,4 +3454,48 @@ assert(r.status === 200 && sj.ok === true && sj.elapsed_seconds >= 7200 && sj.el
 r = await tttCall('GET', '/api/taptap/profile/55555555', null);
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.ban === null, 'taptap v1.1.0: lazy restore bersihkan field ban');
+// ---- v1.1.2: Tabungan "Uang Anti-Habis" ----
+r = await tttCall('GET', '/api/taptap/savings/12345678', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.savings === 0 && sj.accrued_interest === 0 && sj.rate_per_hour === 0.01 && sj.cap_hours === 24, 'taptap v1.1.2: GET /savings akun baru -> 0, rate 1%/jam, cap 24 jam');
+r = await tttCall('GET', '/api/taptap/savings/00000000', null);
+assert(r.status === 404, 'taptap v1.1.2: GET /savings akun tak ada -> 404');
+r = await tttCall('GET', '/api/taptap/profile/12345678', null);
+sj = JSON.parse(await r.text());
+const svScore = sj.score, svTotal = sj.total_energy_all_time;
+r = await tttCall('POST', '/api/taptap/savings/deposit', { account_id: '12345678', amount: 0, score: svScore, total_energy_all_time: svTotal, levels: [10, 2, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'bad_amount', 'taptap v1.1.2: deposit 0 -> 400');
+r = await tttCall('POST', '/api/taptap/savings/deposit', { account_id: '12345678', amount: svScore + 1, score: svScore, total_energy_all_time: svTotal, levels: [10, 2, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'insufficient_balance', 'taptap v1.1.2: deposit melebihi skor -> 400');
+r = await tttCall('POST', '/api/taptap/savings/deposit', { account_id: '12345678', amount: 1000, score: svScore, total_energy_all_time: svTotal, levels: [10, 2, 0, 0, 0, 0, 0, 0, 0, 0] });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.savings === 1000 && Math.abs(sj.score - (svScore - 1000)) < 0.001 && Math.abs(sj.interest_earned) < 0.001, 'taptap v1.1.2: deposit 1000 ok, skor -1000, tabungan 1000');
+// Akrual 10 jam: 1000 * (1.01^10 - 1) ≈ 104.62.
+env.BACKUP_DB.tttPlayers.get('12345678').savings_updated_at = new Date(Date.now() - 10 * 3600 * 1000).toISOString();
+r = await tttCall('GET', '/api/taptap/savings/12345678', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && Math.abs(sj.accrued_interest - 1000 * (Math.pow(1.01, 10) - 1)) < 0.01 && Math.abs(sj.interest_per_hour - 10) < 0.001, 'taptap v1.1.2: akrual 10 jam ≈ 104.62, bunga/jam 10');
+// Tarik 500: tabungan 500, skor += 500 + bunga terakru.
+const expInterest10 = 1000 * (Math.pow(1.01, 10) - 1);
+r = await tttCall('POST', '/api/taptap/savings/withdraw', { account_id: '12345678', amount: 500, score: svScore - 1000, total_energy_all_time: svTotal, levels: [10, 2, 0, 0, 0, 0, 0, 0, 0, 0] });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.savings === 500 && Math.abs(sj.interest_earned - expInterest10) < 0.01 && Math.abs(sj.score - (svScore - 1000 + expInterest10 + 500)) < 0.01, 'taptap v1.1.2: tarik 500 ok, bunga terakru ikut ke skor');
+// Tarik melebihi tabungan -> 400.
+r = await tttCall('POST', '/api/taptap/savings/withdraw', { account_id: '12345678', amount: 501, score: svScore - 500 + expInterest10, total_energy_all_time: svTotal + expInterest10, levels: [10, 2, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'insufficient_savings', 'taptap v1.1.2: tarik melebihi tabungan -> 400');
+// Cap 24 jam: 48 jam mundur tetap hitung 24 jam.
+env.BACKUP_DB.tttPlayers.get('12345678').savings_updated_at = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+r = await tttCall('GET', '/api/taptap/savings/12345678', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && Math.abs(sj.accrued_interest - 500 * (Math.pow(1.01, 24) - 1)) < 0.01, 'taptap v1.1.2: akrual di-cap 24 jam (48 jam -> 24 jam)');
+// Klaim AFK ikut settle bunga tabungan.
+r = await tttCall('POST', '/api/taptap/claim', { account_id: '12345678' });
+sj = JSON.parse(await r.text());
+const expInterest24 = 500 * (Math.pow(1.01, 24) - 1);
+assert(r.status === 200 && Math.abs(sj.savings_interest - expInterest24) < 0.01, 'taptap v1.1.2: klaim settle bunga tabungan (cap 24 jam)');
+// Akun diblokir tidak bisa setor.
+r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '22222222', ban_type: 'temp7', reason: 'uji tabungan' }, TTT_ADMIN_H);
+assert(r.status === 200, 'taptap v1.1.2: ban 22222222 untuk uji tabungan ok');
+r = await tttCall('POST', '/api/taptap/savings/deposit', { account_id: '22222222', amount: 10, score: 5000, total_energy_all_time: 5000, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 403 && JSON.parse(await r.text()).error === 'banned', 'taptap v1.1.2: deposit saat diblokir -> 403 banned');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

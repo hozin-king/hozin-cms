@@ -787,7 +787,7 @@ async function fetchFbmLatestRelease(env) {
 // ttt_bans + ttt_flags (prefix ttt_).
 // env.DB (cms-db) JANGAN dipakai untuk data TTT; bila BACKUP_DB hilang
 // -> 503. Route: /api/taptap/* (leaderboard, profile, claim AFK, chat,
-// version, regions, admin ban/flags). Desain klaim AFK timestamp-lazy:
+// version, regions, admin ban/flags, savings). Desain klaim AFK timestamp-lazy:
 // server hanya simpan last_seen_at (jam server) + state; klaim = 1 SELECT
 // by PK + 1 UPDATE, cap 8 jam (28800 dtk); tanpa ticking/polling. CPS
 // TIDAK PERNAH dipercaya dari client — dihitung ulang dari levels (replay
@@ -796,6 +796,8 @@ async function fetchFbmLatestRelease(env) {
 // v1.1.0: leaderboard per wilayah 5 tingkat (district < regency <
 // province < national < global), banned (warning/temp7/temp30/permanent),
 // validasi skor di POST /profile (lihat ambang di bawah).
+// v1.1.2: Tabungan "Uang Anti-Habis" (savings + bunga 1%/jam lazy,
+// cap akrual 24 jam; lihat TAPTAP_SAVINGS_* di bawah).
 function taptapJson(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -864,6 +866,70 @@ const TAPTAP_SCORE_REJECT_MULT = 10;
 const TAPTAP_SCORE_REJECT_FLAT = 5000000;
 const TAPTAP_SCORE_FLAG_MULT = 3;
 const TAPTAP_SCORE_FLAG_FLAT = 1000000;
+
+// --- v1.1.2: Tabungan "Uang Anti-Habis" ---
+// Saldo Tabungan terpisah dari skor Energi biasa; disimpan server-side
+// (kolom savings + savings_updated_at di ttt_players). Bunga 1%/jam,
+// compounding, dihitung LAZY dari timestamp server (pola yang sama
+// dengan klaim AFK — tanpa cron/loop). Bunga mengalir ke skor Energi
+// biasa. JAMINAN: upgrade TIDAK PERNAH memakai saldo Tabungan —
+// buyUpgrade/buyAutoClick/buyBattery/refuel di client hanya membaca
+// score biasa — jadi pokok terlindungi walau skor biasa 0.
+// Cap akrual 24 jam: faktor maks (1.01)^24 ≈ 1.2697 (+26,97% pokok per
+// jendela settle). Alasan: (1) batas satu settlement — akun yang
+// ditinggal berminggu-minggu tidak mengakumulasi tanpa batas;
+// (2) 24 jam = siklus harian, mudah dipahami; (3) tetap 3x jendela AFK
+// 8 jam karena bunga adalah imbal atas modal yang SUDAH dikunci dari
+// peredaran (tidak bisa dipakai beli upgrade), sementara AFK adalah
+// pendapatan CPS gratis.
+const TAPTAP_SAVINGS_RATE_PER_HOUR = 0.01;
+const TAPTAP_SAVINGS_CAP_HOURS = 24;
+
+// Bunga yang sudah terakru (BELUM di-settle): principal * ((1+r)^jam - 1),
+// jam = min(elapsed, 24). Murni — dipakai server + tes.
+function taptapSavingsAccrued(savings, updatedAtIso, nowMs) {
+  const principal = Number(savings) || 0;
+  if (principal <= 0) return { interest: 0, hours: 0 };
+  const last = Date.parse(updatedAtIso || '');
+  if (!Number.isFinite(last)) return { interest: 0, hours: 0 };
+  let hours = (nowMs - last) / 3600000;
+  if (hours <= 0) return { interest: 0, hours: 0 };
+  if (hours > TAPTAP_SAVINGS_CAP_HOURS) hours = TAPTAP_SAVINGS_CAP_HOURS;
+  return { interest: principal * (Math.pow(1 + TAPTAP_SAVINGS_RATE_PER_HOUR, hours) - 1), hours };
+}
+
+function taptapSavingsPerHour(savings) {
+  const principal = Number(savings) || 0;
+  return principal > 0 ? principal * TAPTAP_SAVINGS_RATE_PER_HOUR : 0;
+}
+
+// Validasi pertumbuhan skor vs replay CPS levels LAMA — SATU sumber
+// kebenaran, dipakai POST /profile DAN operasi Tabungan (jangan
+// duplikasi). Return {ok:false, error} bila lompatan mustahil;
+// {ok:true, flag} bila mencurigakan (tetap diterima; pemanggil yang
+// menulis flag ke ttt_flags).
+function taptapValidateScoreGrowth(old, scoreNum, totalNum, nowMs) {
+  if (scoreNum > totalNum) return { ok: false, error: 'score_exceeds_total' };
+  if (!old) return { ok: true, flag: null };
+  const elapsedRaw = Math.floor((nowMs - Date.parse(old.updated_at || '')) / 1000);
+  const elapsed = Number.isFinite(elapsedRaw) ? Math.max(0, elapsedRaw) : 0;
+  const cps = taptapCpsFromLevels(old.levels);
+  const oldTotal = Number(old.total_energy_all_time) || 0;
+  const growth = totalNum - oldTotal;
+  if (growth > cps * elapsed * TAPTAP_SCORE_REJECT_MULT + TAPTAP_SCORE_REJECT_FLAT) {
+    return { ok: false, error: 'score_implausible' };
+  }
+  if (growth > cps * elapsed * TAPTAP_SCORE_FLAG_MULT + TAPTAP_SCORE_FLAG_FLAT) {
+    return { ok: true, flag: { reason: 'score_growth_suspicious', details: JSON.stringify({ old_total: oldTotal, new_total: totalNum, growth, cps, elapsed_seconds: elapsed }) } };
+  }
+  return { ok: true, flag: null };
+}
+
+async function taptapInsertFlag(db, accountId, reason, details, now) {
+  await db.prepare(
+    'INSERT INTO ttt_flags (account_id, reason, details, created_at, reviewed) VALUES (?, ?, ?, ?, 0)'
+  ).bind(accountId, reason, details, now).run();
+}
 
 function taptapBanActive(row, nowMs) {
   if (!row || !TAPTAP_BAN_BLOCKING.includes(row.ban_type)) return false;
@@ -1050,7 +1116,7 @@ async function handleTapTap(request, env, url) {
       return taptapJson({ error: 'bad_account_id' }, 400);
     }
     const row = await db.prepare(
-      'SELECT score, total_energy_all_time, levels, last_seen_at, ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?'
+      'SELECT score, total_energy_all_time, levels, last_seen_at, ban_type, ban_reason, ban_until, savings, savings_updated_at FROM ttt_players WHERE account_id = ?'
     ).bind(b.account_id).first();
     if (!row) return taptapJson({ error: 'not_found' }, 404);
     // v1.1.0: banned aktif -> 403. Ban temp yang sudah habis -> lazy
@@ -1072,14 +1138,26 @@ async function handleTapTap(request, env, url) {
     const capped = elapsed > TAPTAP_OFFLINE_CAP_SECONDS;
     if (capped) elapsed = TAPTAP_OFFLINE_CAP_SECONDS;
     const earned = elapsed * taptapCpsFromLevels(row.levels);
-    const newScore = (row.score || 0) + earned;
-    const newTotal = (row.total_energy_all_time || 0) + earned;
+    // v1.1.2: bunga Tabungan ikut di-settle di klaim (lazy, jam server).
+    // Bunga dilipat ke skor/total yang sama; savings_updated_at dimajukan
+    // lewat UPDATE kecil supaya jam berikutnya tidak double-count.
+    const sv = taptapSavingsAccrued(Number(row.savings) || 0, row.savings_updated_at || '', nowMs);
+    const savingsInterest = sv.interest;
+    if ((Number(row.savings) || 0) > 0 &&
+        (savingsInterest > 0 || !Number.isFinite(Date.parse(row.savings_updated_at || '')))) {
+      await db.prepare(
+        'UPDATE ttt_players SET savings_updated_at = ? WHERE account_id = ?'
+      ).bind(now, b.account_id).run();
+    }
+    const newScore = (row.score || 0) + earned + savingsInterest;
+    const newTotal = (row.total_energy_all_time || 0) + earned + savingsInterest;
     await db.prepare(
       'UPDATE ttt_players SET score = ?, total_energy_all_time = ?, last_seen_at = ?, updated_at = ? WHERE account_id = ?'
     ).bind(newScore, newTotal, now, now, b.account_id).run();
     return taptapJson({
       ok: true, earned, elapsed_seconds: elapsed, capped,
       score: newScore, total_energy_all_time: newTotal,
+      savings_interest: savingsInterest,
     });
   }
 
@@ -1107,22 +1185,8 @@ async function handleTapTap(request, env, url) {
       'SELECT * FROM ttt_players WHERE account_id = ?'
     ).bind(b.account_id).first();
     if (old && taptapBanActive(old, Date.now())) return taptapBannedResponse(old);
-    let flagReason = null;
-    let flagDetails = '';
-    if (old) {
-      const elapsedRaw = Math.floor((Date.now() - Date.parse(old.updated_at || '')) / 1000);
-      const elapsed = Number.isFinite(elapsedRaw) ? Math.max(0, elapsedRaw) : 0;
-      const cps = taptapCpsFromLevels(old.levels);
-      const oldTotal = Number(old.total_energy_all_time) || 0;
-      const growth = totalNum - oldTotal;
-      if (growth > cps * elapsed * TAPTAP_SCORE_REJECT_MULT + TAPTAP_SCORE_REJECT_FLAT) {
-        return taptapJson({ error: 'score_implausible' }, 400);
-      }
-      if (growth > cps * elapsed * TAPTAP_SCORE_FLAG_MULT + TAPTAP_SCORE_FLAG_FLAT) {
-        flagReason = 'score_growth_suspicious';
-        flagDetails = JSON.stringify({ old_total: oldTotal, new_total: totalNum, growth, cps, elapsed_seconds: elapsed });
-      }
-    }
+    const v = taptapValidateScoreGrowth(old, scoreNum, totalNum, Date.now());
+    if (!v.ok) return taptapJson({ error: v.error }, 400);
     const name = String(b.player_name || 'Hozinking').slice(0, 14);
     const levels = taptapLevels(b.levels);
     await db.prepare(
@@ -1142,11 +1206,7 @@ async function handleTapTap(request, env, url) {
       JSON.stringify(Array.isArray(b.friends) ? b.friends.slice(0, 100) : []),
       Math.max(0, +b.likes || 0), now
     ).run();
-    if (flagReason) {
-      await db.prepare(
-        'INSERT INTO ttt_flags (account_id, reason, details, created_at, reviewed) VALUES (?, ?, ?, ?, 0)'
-      ).bind(b.account_id, flagReason, flagDetails, now).run();
-    }
+    if (v.flag) await taptapInsertFlag(db, b.account_id, v.flag.reason, v.flag.details, now);
     if (old && old.ban_type && old.ban_type !== 'warning' && !taptapBanActive(old, Date.now())) {
       await taptapClearBan(db, b.account_id);
     }
@@ -1308,11 +1368,124 @@ async function handleTapTap(request, env, url) {
     return taptapJson({ error: 'not_found' }, 404);
   }
 
+  // ---- Tabungan "Uang Anti-Habis" (v1.1.2) ----
+  // GET /api/taptap/savings/:id — baca saldo + bunga terakru (TANPA
+  // settle — hanya hitung di tempat, supaya GET tetap read-only).
+  if (request.method === 'GET' && seg === 'savings' && parts[3]) {
+    const row = await db.prepare(
+      'SELECT savings, savings_updated_at FROM ttt_players WHERE account_id = ?'
+    ).bind(parts[3]).first();
+    if (!row) return taptapJson({ error: 'not_found' }, 404);
+    const sv = taptapSavingsAccrued(Number(row.savings) || 0, row.savings_updated_at || '', Date.now());
+    return taptapJson({
+      account_id: parts[3],
+      savings: Number(row.savings) || 0,
+      accrued_interest: sv.interest,
+      interest_per_hour: taptapSavingsPerHour(row.savings),
+      savings_updated_at: row.savings_updated_at || '',
+      rate_per_hour: TAPTAP_SAVINGS_RATE_PER_HOUR,
+      cap_hours: TAPTAP_SAVINGS_CAP_HOURS,
+    });
+  }
+
+  // POST /api/taptap/savings/deposit {account_id, amount, score,
+  // total_energy_all_time, levels, friends, likes, player_name}
+  // Setor Energi biasa -> Tabungan. Bunga yang terakru di-settle dulu
+  // (di atas skor kiriman client). Operasi ini SEKALIGUS sync profil
+  // (skor/total/levels/last_seen_at diperbarui seperti /profile) supaya
+  // satu sumber kebenaran. Validasi skor sama dengan /profile; jumlah
+  // setor tidak boleh melebihi skor + bunga terakru. Banned aktif -> 403.
+  if (request.method === 'POST' && seg === 'savings' && parts[3] === 'deposit') {
+    if (!(await checkRateLimit(env, 'taptap-savings:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const b = await request.json().catch(() => null);
+    if (!b || !taptapValidAccountId(b.account_id)) {
+      return taptapJson({ error: 'bad_account_id' }, 400);
+    }
+    const amount = Number(b.amount);
+    const scoreNum = Number(b.score);
+    const totalNum = Number(b.total_energy_all_time);
+    if (!Number.isFinite(amount) || amount <= 0) return taptapJson({ error: 'bad_amount' }, 400);
+    if (!Number.isFinite(scoreNum) || !Number.isFinite(totalNum) || scoreNum < 0 || totalNum < 0) {
+      return taptapJson({ error: 'bad_score' }, 400);
+    }
+    const row = await db.prepare(
+      'SELECT * FROM ttt_players WHERE account_id = ?'
+    ).bind(b.account_id).first();
+    if (!row) return taptapJson({ error: 'not_found' }, 404);
+    if (taptapBanActive(row, Date.now())) return taptapBannedResponse(row);
+    const v = taptapValidateScoreGrowth(row, scoreNum, totalNum, Date.now());
+    if (!v.ok) return taptapJson({ error: v.error }, 400);
+    const sv = taptapSavingsAccrued(Number(row.savings) || 0, row.savings_updated_at || '', Date.now());
+    if (amount > scoreNum + sv.interest) return taptapJson({ error: 'insufficient_balance' }, 400);
+    const name = String(b.player_name || 'Hozinking').slice(0, 14);
+    const levels = taptapLevels(b.levels);
+    const newScore = scoreNum + sv.interest - amount;
+    const newTotal = totalNum + sv.interest;
+    const newSavings = (Number(row.savings) || 0) + amount;
+    await db.prepare(
+      'UPDATE ttt_players SET player_name = ?, score = ?, total_energy_all_time = ?, click_level = ?, auto_level = ?, levels = ?, last_seen_at = ?, friends = ?, likes = ?, savings = ?, savings_updated_at = ?, updated_at = ? WHERE account_id = ?'
+    ).bind(
+      name, newScore, newTotal, levels[0], levels[1], JSON.stringify(levels), now,
+      JSON.stringify(Array.isArray(b.friends) ? b.friends.slice(0, 100) : []),
+      Math.max(0, +b.likes || 0), newSavings, now, now, b.account_id
+    ).run();
+    if (v.flag) await taptapInsertFlag(db, b.account_id, v.flag.reason, v.flag.details, now);
+    return taptapJson({
+      ok: true, savings: newSavings, savings_updated_at: now,
+      score: newScore, total_energy_all_time: newTotal, interest_earned: sv.interest,
+    });
+  }
+
+  // POST /api/taptap/savings/withdraw — tarik Tabungan -> Energi biasa,
+  // tanpa penalti. Jumlah tidak boleh melebihi saldo Tabungan server
+  // (otoritatif). Bunga terakru ikut di-settle ke skor.
+  if (request.method === 'POST' && seg === 'savings' && parts[3] === 'withdraw') {
+    if (!(await checkRateLimit(env, 'taptap-savings:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const b = await request.json().catch(() => null);
+    if (!b || !taptapValidAccountId(b.account_id)) {
+      return taptapJson({ error: 'bad_account_id' }, 400);
+    }
+    const amount = Number(b.amount);
+    const scoreNum = Number(b.score);
+    const totalNum = Number(b.total_energy_all_time);
+    if (!Number.isFinite(amount) || amount <= 0) return taptapJson({ error: 'bad_amount' }, 400);
+    if (!Number.isFinite(scoreNum) || !Number.isFinite(totalNum) || scoreNum < 0 || totalNum < 0) {
+      return taptapJson({ error: 'bad_score' }, 400);
+    }
+    const row = await db.prepare(
+      'SELECT * FROM ttt_players WHERE account_id = ?'
+    ).bind(b.account_id).first();
+    if (!row) return taptapJson({ error: 'not_found' }, 404);
+    if (taptapBanActive(row, Date.now())) return taptapBannedResponse(row);
+    const v = taptapValidateScoreGrowth(row, scoreNum, totalNum, Date.now());
+    if (!v.ok) return taptapJson({ error: v.error }, 400);
+    const sv = taptapSavingsAccrued(Number(row.savings) || 0, row.savings_updated_at || '', Date.now());
+    const savingsNow = Number(row.savings) || 0;
+    if (amount > savingsNow) return taptapJson({ error: 'insufficient_savings' }, 400);
+    const name = String(b.player_name || 'Hozinking').slice(0, 14);
+    const levels = taptapLevels(b.levels);
+    const newScore = scoreNum + sv.interest + amount;
+    const newTotal = totalNum + sv.interest;
+    const newSavings = savingsNow - amount;
+    await db.prepare(
+      'UPDATE ttt_players SET player_name = ?, score = ?, total_energy_all_time = ?, click_level = ?, auto_level = ?, levels = ?, last_seen_at = ?, friends = ?, likes = ?, savings = ?, savings_updated_at = ?, updated_at = ? WHERE account_id = ?'
+    ).bind(
+      name, newScore, newTotal, levels[0], levels[1], JSON.stringify(levels), now,
+      JSON.stringify(Array.isArray(b.friends) ? b.friends.slice(0, 100) : []),
+      Math.max(0, +b.likes || 0), newSavings, now, now, b.account_id
+    ).run();
+    if (v.flag) await taptapInsertFlag(db, b.account_id, v.flag.reason, v.flag.details, now);
+    return taptapJson({
+      ok: true, savings: newSavings, savings_updated_at: now,
+      score: newScore, total_energy_all_time: newTotal, interest_earned: sv.interest,
+    });
+  }
+
   // GET /api/taptap/version
-  // v1.1.1: latest naik ke 1.1.1 (deteksi wilayah GPS); min_version tetap
-  // 1.0.0 — aplikasi v1.0.0/v1.1.0 tetap boleh jalan (tanpa force-update).
+  // v1.1.2: latest naik ke 1.1.2 (Tabungan + hapus tombol reset + footer
+  // versi dinamis); min_version tetap 1.0.0 — aplikasi lama tetap jalan.
   if (request.method === 'GET' && seg === 'version') {
-    return taptapJson({ latest_version: '1.1.1', min_version: '1.0.0' });
+    return taptapJson({ latest_version: '1.1.2', min_version: '1.0.0' });
   }
 
   return taptapJson({ error: 'not_found' }, 404);
