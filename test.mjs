@@ -4,7 +4,7 @@ import worker, { resetCerpenReleaseCacheForTest } from './worker.js';
 import vm from 'node:vm';
 import { themes } from './themes.js';
 import { renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
-import { parseTags, tagSlug, sanitizeHtml, sha256Hex } from './util.js';
+import { parseTags, tagSlug, sanitizeHtml, sha256Hex, hmacHex } from './util.js';
 import { renderMarkdown } from './markdown.js';
 import { checkRateLimit } from './security.js';
 import { tagLinks } from './content.js';
@@ -1187,6 +1187,31 @@ const csrf3 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 r = await call('POST', '/kendali/logout', { csrf: csrf3 }, cookie); assert(r.status === 303, 'logout satu perangkat redirect');
 r = await call('GET', '/kendali', null, refreshOnly3); t = await r.text();
 assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'setelah logout, refresh perangkat itu dialihkan ke /akun');
+// 8a. Sesi admin di luar /kendali: refresh Path=/ + tryRefresh di /akun & /post/
+// (Bug: cookie refresh Path=/kendali tidak dikirim browser ke /akun/post,
+// dan tryRefresh hanya jalan di /kendali — admin diminta login lagi tiap
+// 1 jam di luar dashboard.)
+env.DB.attempts = [];
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' });
+assert(r.status === 303, 'sesi luar kendali: login ulang untuk uji refresh');
+const rawSetCookie = r.headers.getSetCookie ? r.headers.getSetCookie() : [(r.headers.get('set-cookie') || '')];
+const refreshSetCookie = rawSetCookie.find(c => c.startsWith('cms_refresh='));
+assert(refreshSetCookie && refreshSetCookie.includes('Path=/;'), 'sesi luar kendali: cookie refresh diterbitkan ber-Path=/');
+cookie = cookieHeader(cookiesOf(r));
+const refreshOnlyA = cookie.split('; ').find(c => c.startsWith('cms_refresh='));
+// Akses kedaluwarsa (tanda tangan sah) + refresh sah -> /akun mengenali admin.
+const expLalu = String(Date.now() - 60 * 1000);
+const sigLalu = await hmacHex('test-admin-token', 'access:' + expLalu);
+const expiredAccess = `cms_access=${expLalu}.${sigLalu}`;
+r = await call('GET', '/akun', null, expiredAccess + '; ' + refreshOnlyA); t = await r.text();
+assert(t.includes('Kamu login sebagai Admin'), 'sesi luar kendali: /akun dengan akses kedaluwarsa + refresh sah tampil sebagai Admin');
+assert(cookiesOf(r).some(c => c.startsWith('cms_access=')), 'sesi luar kendali: /akun memutar akses baru');
+// Tanpa refresh -> tetap form login.
+r = await call('GET', '/akun', null, expiredAccess); t = await r.text();
+assert(t.includes('Nama pengguna / email') && !t.includes('Kamu login sebagai Admin'), 'sesi luar kendali: /akun tanpa refresh tetap form login');
+// Halaman post juga mengenali admin setelah refresh.
+r = await call('GET', '/post/post-uji', null, expiredAccess + '; ' + refreshOnlyA); t = await r.text();
+assert(t.includes('Komentar sebagai Admin'), 'sesi luar kendali: halaman post dengan akses kedaluwarsa + refresh sah tampil sebagai Admin');
 // 9. Failsafe = halaman Pemeliharaan berbahasa Inggris untuk SELURUH situs
 // saat database hilang/error (perintah pemilik 29 Okt 2026 20:44 WIB;
 // sebelumnya 20:42-20:43: tanpa detail teknis di situs, bentuk pemeliharaan).

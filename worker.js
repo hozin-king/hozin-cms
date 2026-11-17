@@ -653,11 +653,14 @@ export default {
       // kedaluwarsa tapi refresh masih sah, putar refresh dan teruskan request
       // dengan cookie baru. Login/logout dikecualikan karena mereka sendiri
       // yang mengelola token (rotasi di sini akan menimpa cookie hapus/login).
-      // Jalur publik tidak disentuh supaya tidak membakar tulis D1 sia-sia.
+      // /akun dan halaman post ikut dicakup: refresh hanya jalan bila ada
+      // cookie refresh yang sah DAN akses sudah kedaluwarsa — pengunjung
+      // biasa tidak punya cookie itu, jadi tidak ada tulis D1 tambahan
+      // untuk publik.
       let req = request;
       let refreshedCookies = [];
       const u0 = new URL(request.url);
-      if ((u0.pathname.startsWith('/kendali') || u0.pathname.startsWith('/api/admin/')) && u0.pathname !== '/kendali/login' && u0.pathname !== '/kendali/logout') {
+      if ((u0.pathname.startsWith('/kendali') || u0.pathname.startsWith('/api/admin/') || u0.pathname.startsWith('/akun') || u0.pathname.startsWith('/post/')) && u0.pathname !== '/kendali/login' && u0.pathname !== '/kendali/logout' && u0.pathname !== '/akun/login' && u0.pathname !== '/akun/logout') {
         if (!(await isAdmin(request, env))) {
           const r = await tryRefresh(request, env);
           if (r) { req = r.request; refreshedCookies = r.cookies; }
