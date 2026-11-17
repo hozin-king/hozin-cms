@@ -1491,6 +1491,84 @@ async function handleTapTap(request, env, url) {
   return taptapJson({ error: 'not_found' }, 404);
 }
 
+// ---- API Hozin Dompet (aplikasi Android, v1.1, 17 Nov 2026) ----
+// Sinkronisasi catatan keuangan ke D1 stopwatch-db (binding BACKUP_DB,
+// database yang SAMA dengan Cerpen/TTT; tabel dompet_*). Tanpa auth —
+// identitas = account_id UUID acak tersimpan di HP (pola TTT).
+// Last-write-wins per baris (updated_at millis): kiriman hanya menang
+// bila updated_at-nya LEBIH BESAR dari yang tersimpan. Route:
+// POST /api/dompet/sync, GET /api/dompet/backup/:account,
+// GET /api/dompet/version.
+const DOMPET_VERSION = '1.1.0';
+
+function dompetValidAccountId(id) {
+  return typeof id === 'string' && id.length > 0 && id.length <= 200;
+}
+
+async function handleDompet(request, env, url) {
+  // BACKUP_DB -> stopwatch-db. TIDAK ada fallback ke env.DB (cms-db):
+  // data Dompet wajib tinggal di database yang sama dengan Cerpen/TTT.
+  const db = env.BACKUP_DB;
+  if (!db) return taptapJson({ ok: false, error: 'db_unavailable' }, 503);
+  const parts = url.pathname.split('/').filter(Boolean); // api, dompet, ...
+  const seg = parts[2] || '';
+
+  // GET /api/dompet/version
+  if (request.method === 'GET' && seg === 'version') {
+    return taptapJson({ ok: true, version: DOMPET_VERSION });
+  }
+
+  // GET /api/dompet/backup/:account — dump penuh tanpa baris deleted=1.
+  if (request.method === 'GET' && seg === 'backup') {
+    let accountId = '';
+    try { accountId = parts[3] ? decodeURIComponent(parts[3]) : ''; } catch (e) { accountId = ''; }
+    if (!dompetValidAccountId(accountId)) return taptapJson({ ok: false, error: 'invalid_account_id' }, 400);
+    const tx = await db.prepare('SELECT id, dateMillis, type, category, method, amount, note, updated_at, deleted FROM dompet_transactions WHERE account_id = ? AND deleted = 0 ORDER BY updated_at ASC').bind(accountId).all();
+    const cats = await db.prepare('SELECT id, name, type, color, isDefault, updated_at, deleted FROM dompet_categories WHERE account_id = ? AND deleted = 0 ORDER BY updated_at ASC').bind(accountId).all();
+    return taptapJson({ ok: true, account_id: accountId, transactions: tx.results || [], categories: cats.results || [] });
+  }
+
+  // POST /api/dompet/sync — body {account_id, since, transactions, categories}.
+  // Kembalikan semua baris server dengan updated_at > since (termasuk
+  // yang baru di-upsert dari klien — klien juga last-write-wins, jadi
+  // echo tidak berbahaya).
+  if (request.method === 'POST' && seg === 'sync') {
+    let body;
+    try { body = await request.json(); } catch (e) { return taptapJson({ ok: false, error: 'invalid_body' }, 400); }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return taptapJson({ ok: false, error: 'invalid_body' }, 400);
+    const accountId = body.account_id;
+    if (!dompetValidAccountId(accountId)) return taptapJson({ ok: false, error: 'invalid_account_id' }, 400);
+    const since = Number.isFinite(+body.since) ? Math.max(0, Math.floor(+body.since)) : 0;
+    const txIn = Array.isArray(body.transactions) ? body.transactions : [];
+    const catIn = Array.isArray(body.categories) ? body.categories : [];
+    const now = Date.now();
+    await db.prepare('INSERT OR IGNORE INTO dompet_accounts (account_id, created_at) VALUES (?, ?)').bind(accountId, now).run();
+    for (const row of txIn) {
+      if (!row || typeof row !== 'object') continue;
+      const id = Math.floor(+row.id);
+      const updatedAt = Math.floor(+row.updated_at);
+      if (!Number.isFinite(id) || !Number.isFinite(updatedAt)) continue;
+      const cur = await db.prepare('SELECT updated_at FROM dompet_transactions WHERE account_id = ? AND id = ?').bind(accountId, id).first();
+      if (cur && Number(cur.updated_at) >= updatedAt) continue;
+      await db.prepare('INSERT OR REPLACE INTO dompet_transactions (account_id, id, dateMillis, type, category, method, amount, note, updated_at, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(accountId, id, Math.floor(+row.dateMillis) || 0, Math.floor(+row.type) || 0, String(row.category ?? ''), String(row.method ?? ''), Math.floor(+row.amount) || 0, String(row.note ?? ''), updatedAt, row.deleted ? 1 : 0).run();
+    }
+    for (const row of catIn) {
+      if (!row || typeof row !== 'object') continue;
+      const id = Math.floor(+row.id);
+      const updatedAt = Math.floor(+row.updated_at);
+      if (!Number.isFinite(id) || !Number.isFinite(updatedAt)) continue;
+      const cur = await db.prepare('SELECT updated_at FROM dompet_categories WHERE account_id = ? AND id = ?').bind(accountId, id).first();
+      if (cur && Number(cur.updated_at) >= updatedAt) continue;
+      await db.prepare('INSERT OR REPLACE INTO dompet_categories (account_id, id, name, type, color, isDefault, updated_at, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(accountId, id, String(row.name ?? ''), Math.floor(+row.type) || 0, Math.floor(+row.color) || 0, row.isDefault ? 1 : 0, updatedAt, row.deleted ? 1 : 0).run();
+    }
+    const tx = await db.prepare('SELECT id, dateMillis, type, category, method, amount, note, updated_at, deleted FROM dompet_transactions WHERE account_id = ? AND updated_at > ? ORDER BY updated_at ASC').bind(accountId, since).all();
+    const cats = await db.prepare('SELECT id, name, type, color, isDefault, updated_at, deleted FROM dompet_categories WHERE account_id = ? AND updated_at > ? ORDER BY updated_at ASC').bind(accountId, since).all();
+    return taptapJson({ ok: true, server_time: now, transactions: tx.results || [], categories: cats.results || [] });
+  }
+
+  return taptapJson({ error: 'not_found' }, 404);
+}
+
 async function handleFetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -1699,6 +1777,14 @@ async function handleFetch(request, env) {
     // /api/taptap/version sendiri.
     if (path.startsWith('/api/taptap/')) {
       return handleTapTap(request, env, url);
+    }
+
+    // ---- Publik: API Hozin Dompet (aplikasi Android, v1.1) ----
+    // Sinkronisasi + backup — handler handleDompet di atas (D1
+    // stopwatch-db via BACKUP_DB). Tanpa auth (pola TTT); gerbang
+    // versi Cerpen TIDAK berlaku di sini (Dompet punya /version sendiri).
+    if (path.startsWith('/api/dompet/')) {
+      return handleDompet(request, env, url);
     }
 
     // ---- Publik: laporan tamper Hozin FB Manager (aplikasi Android, v1.0.33) ----

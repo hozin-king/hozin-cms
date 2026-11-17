@@ -90,6 +90,10 @@ class MockDB {
     this.tttBanSeq = 0;
     this.tttFlags = []; // {id, account_id, reason, details, created_at, reviewed}
     this.tttFlagSeq = 0;
+    // Hozin Dompet v1.1 (D1 stopwatch-db, binding BACKUP_DB).
+    this.dompetAccounts = new Set(); // account_id
+    this.dompetTransactions = []; // {account_id, id, dateMillis, type, category, method, amount, note, updated_at, deleted}
+    this.dompetCategories = []; // {account_id, id, name, type, color, isDefault, updated_at, deleted}
     // v87: state Sistem Koin Cerpen (cms-db) — dompet, unlock, voucher, VIP,
     // ban, pantauan, ledger, audit + tabel pelacak baca v81 (dipakai papan
     // peringkat/riwayat). BACKUP_DB memakai instance MockDB yang sama,
@@ -1000,6 +1004,16 @@ class MockDB {
     if (s.startsWith('UPDATE ttt_bans SET revoked_at = ? WHERE id = ?')) { const r = this.tttBans.find(x => x.id === a[1]); if (r) r.revoked_at = a[0]; return []; }
     if (s.startsWith('INSERT INTO ttt_flags')) { this.tttFlags.push({ id: ++this.tttFlagSeq, account_id: a[0], reason: a[1], details: a[2], created_at: a[3], reviewed: 0 }); return []; }
     if (s.startsWith('SELECT id, account_id, reason, details, created_at, reviewed FROM ttt_flags WHERE reviewed = 0 ORDER BY id DESC LIMIT 100')) return [...this.tttFlags].filter(x => x.reviewed === 0).sort((x, y) => y.id - x.id).map(x => ({ id: x.id, account_id: x.account_id, reason: x.reason, details: x.details, created_at: x.created_at, reviewed: x.reviewed }));
+    // Hozin Dompet v1.1 (tabel dompet_*).
+    if (s.startsWith('INSERT OR IGNORE INTO dompet_accounts')) { this.dompetAccounts.add(a[0]); return []; }
+    if (s.startsWith('SELECT updated_at FROM dompet_transactions WHERE account_id = ? AND id = ?')) { const r = this.dompetTransactions.find(x => x.account_id === a[0] && x.id === a[1]); return r ? [{ updated_at: r.updated_at }] : []; }
+    if (s.startsWith('INSERT OR REPLACE INTO dompet_transactions')) { const row = { account_id: a[0], id: a[1], dateMillis: a[2], type: a[3], category: a[4], method: a[5], amount: a[6], note: a[7], updated_at: a[8], deleted: a[9] }; const i = this.dompetTransactions.findIndex(x => x.account_id === a[0] && x.id === a[1]); if (i >= 0) this.dompetTransactions[i] = row; else this.dompetTransactions.push(row); return []; }
+    if (s.startsWith('SELECT id, dateMillis, type, category, method, amount, note, updated_at, deleted FROM dompet_transactions WHERE account_id = ? AND updated_at > ?')) return this.dompetTransactions.filter(x => x.account_id === a[0] && x.updated_at > a[1]).sort((x, y) => x.updated_at - y.updated_at).map(({ account_id, ...rest }) => rest);
+    if (s.startsWith('SELECT id, dateMillis, type, category, method, amount, note, updated_at, deleted FROM dompet_transactions WHERE account_id = ? AND deleted = 0')) return this.dompetTransactions.filter(x => x.account_id === a[0] && !x.deleted).sort((x, y) => x.updated_at - y.updated_at).map(({ account_id, ...rest }) => rest);
+    if (s.startsWith('SELECT updated_at FROM dompet_categories WHERE account_id = ? AND id = ?')) { const r = this.dompetCategories.find(x => x.account_id === a[0] && x.id === a[1]); return r ? [{ updated_at: r.updated_at }] : []; }
+    if (s.startsWith('INSERT OR REPLACE INTO dompet_categories')) { const row = { account_id: a[0], id: a[1], name: a[2], type: a[3], color: a[4], isDefault: a[5], updated_at: a[6], deleted: a[7] }; const i = this.dompetCategories.findIndex(x => x.account_id === a[0] && x.id === a[1]); if (i >= 0) this.dompetCategories[i] = row; else this.dompetCategories.push(row); return []; }
+    if (s.startsWith('SELECT id, name, type, color, isDefault, updated_at, deleted FROM dompet_categories WHERE account_id = ? AND updated_at > ?')) return this.dompetCategories.filter(x => x.account_id === a[0] && x.updated_at > a[1]).sort((x, y) => x.updated_at - y.updated_at).map(({ account_id, ...rest }) => rest);
+    if (s.startsWith('SELECT id, name, type, color, isDefault, updated_at, deleted FROM dompet_categories WHERE account_id = ? AND deleted = 0')) return this.dompetCategories.filter(x => x.account_id === a[0] && !x.deleted).sort((x, y) => x.updated_at - y.updated_at).map(({ account_id, ...rest }) => rest);
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -3498,4 +3512,36 @@ r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '22222222', ban
 assert(r.status === 200, 'taptap v1.1.2: ban 22222222 untuk uji tabungan ok');
 r = await tttCall('POST', '/api/taptap/savings/deposit', { account_id: '22222222', amount: 10, score: 5000, total_energy_all_time: 5000, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
 assert(r.status === 403 && JSON.parse(await r.text()).error === 'banned', 'taptap v1.1.2: deposit saat diblokir -> 403 banned');
+// Hozin Dompet v1.1 — API /api/dompet/* (D1 stopwatch-db via BACKUP_DB).
+async function dompetCall(method, path, obj) {
+  const req = new Request(base + path, { method, headers: { 'content-type': 'application/json' }, body: obj === null ? undefined : JSON.stringify(obj) });
+  return worker.fetch(req, env);
+}
+const DOMPET_ACC = 'dompet-uji-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+r = await dompetCall('GET', '/api/dompet/version', null);
+assert(r.status === 200 && JSON.parse(await r.text()).version === '1.1.0', 'dompet: GET /version -> 1.1.0');
+r = await dompetCall('POST', '/api/dompet/sync', { account_id: '', since: 0, transactions: [], categories: [] });
+assert(r.status === 400, 'dompet: sync tanpa account_id -> 400');
+r = await dompetCall('POST', '/api/dompet/sync', { account_id: DOMPET_ACC, since: 0, transactions: [{ id: 1, dateMillis: 1000, type: 0, category: 'Makan', method: 'Cash', amount: 40000, note: 'bensin', updated_at: 1000, deleted: 0 }], categories: [{ id: 1, name: 'Makan', type: 0, color: 16711680, isDefault: 1, updated_at: 1000, deleted: 0 }] });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.transactions.length === 1 && sj.transactions[0].amount === 40000 && sj.categories.length === 1, 'dompet: sync pertama upsert + kembalikan baris');
+r = await dompetCall('POST', '/api/dompet/sync', { account_id: DOMPET_ACC, since: 0, transactions: [{ id: 1, dateMillis: 1000, type: 0, category: 'Makan', method: 'Cash', amount: 99999, note: 'lama', updated_at: 500, deleted: 0 }], categories: [] });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.transactions[0].amount === 40000, 'dompet: kiriman updated_at lebih lama tidak menimpa');
+r = await dompetCall('POST', '/api/dompet/sync', { account_id: DOMPET_ACC, since: 0, transactions: [{ id: 1, dateMillis: 1000, type: 0, category: 'Makan', method: 'Cash', amount: 50000, note: 'baru', updated_at: 2000, deleted: 0 }], categories: [] });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.transactions[0].amount === 50000, 'dompet: kiriman updated_at lebih baru menimpa');
+r = await dompetCall('POST', '/api/dompet/sync', { account_id: DOMPET_ACC, since: 1500, transactions: [], categories: [] });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.transactions.length === 1 && sj.categories.length === 0, 'dompet: sync since=1500 hanya kembalikan baris baru');
+r = await dompetCall('GET', '/api/dompet/backup/' + DOMPET_ACC, null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.transactions.length === 1 && sj.transactions[0].amount === 50000 && sj.categories.length === 1, 'dompet: GET /backup kembalikan dump penuh');
+r = await dompetCall('POST', '/api/dompet/sync', { account_id: DOMPET_ACC, since: 0, transactions: [{ id: 1, dateMillis: 1000, type: 0, category: 'Makan', method: 'Cash', amount: 50000, note: 'hapus', updated_at: 3000, deleted: 1 }], categories: [] });
+assert(r.status === 200, 'dompet: sync soft-delete ok');
+r = await dompetCall('GET', '/api/dompet/backup/' + DOMPET_ACC, null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.transactions.length === 0 && sj.categories.length === 1, 'dompet: backup sembunyikan baris deleted=1');
+r = await dompetCall('GET', '/api/dompet/ngaco', null);
+assert(r.status === 404, 'dompet: segmen tak dikenal -> 404');
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
