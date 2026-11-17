@@ -2845,7 +2845,7 @@ async function handleFetch(request, env) {
       const content = adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot) + welcome + (displayPosts.length
         ? displayPosts.map(p => postCard(p, plugins, admin)).join('')
         : '<div class="card"><p>Belum ada post.</p></div>') + nav + fab;
-      const res = html(await renderPage(env, 'Beranda', content, pageOpts(settingsMap, env)), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
+      const res = html(await renderPage(env, 'Beranda', content, { ...pageOpts(settingsMap, env), pageUrl: url.origin + '/' }), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
       if (isFirstVisit && welcome) {
         const h = new Headers(res.headers);
         h.append('set-cookie', 'cms_fv=1; Path=/; Max-Age=2592000; SameSite=Lax; Secure');
@@ -3344,11 +3344,23 @@ requestAnimationFrame(draw);
           : '';
         const views = Number(post.views) || 0;
         const bodyHtml = post.body_mode === 'html' ? sanitizeHtml(post.body) : para(post.body);
+        // 17 Nov 2026 — Open Graph post: excerpt + gambar pertama body.
+        // Excerpt = teks polos 155 karakter (sudah di-escape untuk atribut).
+        // Gambar pertama <img> (https absolut, atau relatif -> prefix origin).
+        // Tanpa gambar -> logo situs (fallback di themes.js).
+        const postExcerpt = esc(bodyHtml.replace(/<[^>]*>/g, ' ').replace(/&(amp|lt|gt|quot|#39|nbsp);/g, m => ({ '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&nbsp;': ' ' }[m] || m)).replace(/\s+/g, ' ').trim().slice(0, 155));
+        const firstImgMatch = bodyHtml.match(/<img[^>]+src=(?:"([^"]+)"|'([^']+)')/i);
+        let postImage = '';
+        if (firstImgMatch) {
+          const src = firstImgMatch[1] || firstImgMatch[2] || '';
+          if (/^https:\/\//.test(src)) postImage = src;
+          else if (src.startsWith('/')) postImage = url.origin + src;
+        }
         const detailTags = tagLinks(post);
         // Tracker waktu baca (v81): hanya untuk akun komentator yang login.
         const tracker = commenter ? readingTrackerScript(post.id, csrfForComment) : '';
         const content = `${previewBanner}<article class="card"><h2>${esc(post.title)}</h2><p class="meta">${esc(post.category)} · ${esc(String(post.created_at || '').slice(0, 10))} · ${viewEye(views)}${metaHtml}</p>${detailTags ? `<p class="meta">${detailTags}</p>` : ''}${bodyHtml}</article>${adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot)}${footers}<h3>Komentar</h3>${commentHtml}${notice}${commentForm}${tracker}`;
-        const res = html(await renderPage(env, post.title, content, pageOpts(settingsMap, env)), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
+        const res = html(await renderPage(env, post.title, content, { ...pageOpts(settingsMap, env), metaDesc: postExcerpt, metaImage: postImage, pageUrl: url.origin + '/post/' + slug, ogType: 'article' }), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
         if (viewCookie) {
           const h = new Headers(res.headers);
           h.append('set-cookie', viewCookie);

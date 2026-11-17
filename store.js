@@ -315,6 +315,11 @@ export async function renderPage(env, pageTitle, content, opts = {}) {
   // Diambil dari opts (pageOpts) bila ada, kalau tidak baca D1 sekali.
   let adsenseClient = opts.adsenseClient;
   if (adsenseClient === undefined) adsenseClient = await getSetting(env, 'adsense_client', '');
+  // Open Graph (17 Nov 2026): gambar + URL kanonis + tipe, divalidasi bentuk
+  // URL-nya (https tanpa kutip/spasi) supaya tidak bisa membobol atribut.
+  const metaImage = typeof opts.metaImage === 'string' && /^https:\/\/[^"'<\s]+$/.test(opts.metaImage) ? opts.metaImage : '';
+  const pageUrl = typeof opts.pageUrl === 'string' && /^https:\/\/[^"'<\s]+$/.test(opts.pageUrl) ? opts.pageUrl : '';
+  const ogType = opts.ogType === 'article' ? 'article' : 'website';
   const theme = themes[themeId] || themes.terang;
-  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content, siteAvatar, metaDesc: opts.metaDesc || '', navbar: navbarId, adsenseClient });
+  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content, siteAvatar, metaDesc: opts.metaDesc || '', navbar: navbarId, adsenseClient, metaImage, pageUrl, ogType });
 }
