@@ -1930,7 +1930,7 @@ async function handleFetch(request, env) {
         if (!isId(data.id)) return bad('id tidak valid');
         if (!Number.isInteger(data.no) || data.no < 1 || data.no > 9999) return bad('no tidak valid');
         if (typeof data.judul !== 'string' || data.judul.trim().length < 1 || data.judul.length > 200) return bad('judul tidak valid');
-        if (!Array.isArray(data.panels) || data.panels.length !== 5) return bad('panels tidak valid');
+        if (!Array.isArray(data.panels) || data.panels.length !== 15) return bad('panels tidak valid');
         for (const p of data.panels) {
           if (!p || typeof p !== 'object' || typeof p.teks !== 'string' || p.teks.length < 10 || p.teks.length > 500) return bad('teks panel tidak valid');
           if (typeof p.image_prompt !== 'string' || p.image_prompt.length < 10 || p.image_prompt.length > 500) return bad('image_prompt panel tidak valid');
