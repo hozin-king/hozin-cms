@@ -75,7 +75,8 @@ class MockDB {
     // v1.0.33: laporan tamper FB Manager (tabel app_tamper_reports)
     this.tamperReports = [];
     // v86: fixture gambar + versi Cerpen (tabel cerpen_images + cerpen_version, D1 stopwatch-db)
-    this.cerpenImages = [{ path: 'covers/cover_01.jpg.enc', data: 'GAMBAR-ENKRIPSI-UJI', sha256: 'abc123', size: 20 }];
+    // data berupa Array angka — bentuk asli BLOB dari D1 (bukan string).
+    this.cerpenImages = [{ path: 'covers/cover_01.jpg.enc', data: [...new TextEncoder().encode('GAMBAR-ENKRIPSI-UJI')], sha256: 'abc123', size: 20 }];
     this.cerpenVersion = [{ key: 'latest', tag: 'v1.1.29', version: '1.1.29', apk_url: 'https://example.com/cerpen-1.1.29.apk', published_at: '2026-11-13T19:00:00+07:00' }];
     // v1.1.38: jejak percobaan kunci + blok anti-bypass gerbang versi Cerpen
     this.cerpenLockAttempts = [];

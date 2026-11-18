@@ -1754,8 +1754,8 @@ async function handleFetch(request, env) {
       if (!(await checkRateLimit(env, 'cerpen-img:' + clientIp(request), 1000, 3600 * 1000))) return ciJson({ ok: false, error: 'terlalu banyak permintaan' }, 429);
       const row = await env.BACKUP_DB.prepare(`SELECT data FROM cerpen_images WHERE path = ?`).bind(imgPath).first();
       if (!row || row.data == null) return ciJson({ ok: false, error: 'gambar tidak ditemukan' }, 404);
-      // D1 mengembalikan BLOB sebagai ArrayBuffer; mock tes memakai string.
-      const bytes = typeof row.data === 'string' ? new TextEncoder().encode(row.data) : row.data instanceof ArrayBuffer ? new Uint8Array(row.data) : row.data;
+      // D1 mengembalikan BLOB sebagai Array angka JS; mock tes memakai bentuk yang sama.
+      const bytes = typeof row.data === 'string' ? new TextEncoder().encode(row.data) : Array.isArray(row.data) ? new Uint8Array(row.data) : row.data instanceof ArrayBuffer ? new Uint8Array(row.data) : row.data;
       return new Response(bytes, { status: 200, headers: { 'content-type': 'application/octet-stream', 'cache-control': 'public, max-age=3600' } });
     }
 
