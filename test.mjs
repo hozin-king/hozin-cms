@@ -91,6 +91,17 @@ class MockDB {
     this.tttBanSeq = 0;
     this.tttFlags = []; // {id, account_id, reason, details, created_at, reviewed}
     this.tttFlagSeq = 0;
+    // Admin-batch (18 Nov 2026): perangkat + sesi + redeem + perintah + pantau + perilaku.
+    this.tttDevices = new Map(); // guest_id -> row perangkat
+    this.tttSessions = []; // {session_id, guest_id, account_id, started_at, last_seen_at, ended_at, app_version}
+    this.tttRedeemCodes = new Map(); // code -> row kode
+    this.tttRedeemLog = []; // {id, code, account_id, guest_id, benefit_type, benefit_value, status, fail_reason, redeemed_at}
+    this.tttRedeemLogSeq = 0;
+    this.tttCommands = []; // {id, target_type, target_id, command, status, created_by, created_at, delivered_at}
+    this.tttCommandSeq = 0;
+    this.tttWatchlist = []; // {id, target_type, target_id, reason, score, evidence, status, created_at, updated_at}
+    this.tttWatchSeq = 0;
+    this.tttBehavior = new Map(); // target_id -> {target_id, target_type, profile_json, updated_at}
     // Hozin Dompet v1.1 (D1 stopwatch-db, binding BACKUP_DB).
     this.dompetAccounts = new Set(); // account_id
     this.dompetTransactions = []; // {account_id, id, dateMillis, type, category, method, amount, note, updated_at, deleted}
@@ -1005,6 +1016,70 @@ class MockDB {
     if (s.startsWith('UPDATE ttt_bans SET revoked_at = ? WHERE id = ?')) { const r = this.tttBans.find(x => x.id === a[1]); if (r) r.revoked_at = a[0]; return []; }
     if (s.startsWith('INSERT INTO ttt_flags')) { this.tttFlags.push({ id: ++this.tttFlagSeq, account_id: a[0], reason: a[1], details: a[2], created_at: a[3], reviewed: 0 }); return []; }
     if (s.startsWith('SELECT id, account_id, reason, details, created_at, reviewed FROM ttt_flags WHERE reviewed = 0 ORDER BY id DESC LIMIT 100')) return [...this.tttFlags].filter(x => x.reviewed === 0).sort((x, y) => y.id - x.id).map(x => ({ id: x.id, account_id: x.account_id, reason: x.reason, details: x.details, created_at: x.created_at, reviewed: x.reviewed }));
+    // Admin-batch TTT (18 Nov 2026): perangkat + sesi + redeem + perintah + pantau + perilaku.
+    if (s.startsWith('SELECT * FROM ttt_devices WHERE guest_id = ?')) return this.tttDevices.has(a[0]) ? [this.tttDevices.get(a[0])] : [];
+    if (s.startsWith('SELECT * FROM ttt_devices WHERE fingerprint_hash = ?')) return [...this.tttDevices.values()].filter(x => x.fingerprint_hash === a[0]);
+    if (s.startsWith('SELECT * FROM ttt_devices WHERE api_key_hash = ?')) return [...this.tttDevices.values()].filter(x => x.api_key_hash === a[0]);
+    if (s.startsWith('SELECT guest_id, device_model, android_version, app_version, key_status, is_rooted, root_methods, is_emulator, integrity_status, first_seen, last_seen FROM ttt_devices WHERE account_id = ?')) return [...this.tttDevices.values()].filter(x => x.account_id === a[0]).sort((x, y) => String(y.last_seen || '').localeCompare(String(x.last_seen || ''))).slice(0, 20).map(x => ({ guest_id: x.guest_id, device_model: x.device_model, android_version: x.android_version, app_version: x.app_version, key_status: x.key_status, is_rooted: x.is_rooted, root_methods: x.root_methods, is_emulator: x.is_emulator, integrity_status: x.integrity_status, first_seen: x.first_seen, last_seen: x.last_seen }));
+    if (s.startsWith('SELECT d.guest_id, d.account_id, d.device_model, d.app_version, d.is_rooted, d.is_emulator, d.integrity_status, d.last_seen, p.player_name,')) {
+      const rows = [...this.tttDevices.values()].filter(x => String(x.last_seen || '') > a[0]).sort((x, y) => String(y.last_seen || '').localeCompare(String(x.last_seen || ''))).slice(0, s.includes('LIMIT 50') ? 50 : 100);
+      return rows.map(x => { const p = this.tttPlayers.get(x.account_id); return { guest_id: x.guest_id, account_id: x.account_id, device_model: x.device_model, app_version: x.app_version, is_rooted: x.is_rooted, is_emulator: x.is_emulator, integrity_status: x.integrity_status, last_seen: x.last_seen, player_name: p ? p.player_name : '', total_energy_all_time: p ? (p.total_energy_all_time || 0) : 0, ban_type: p ? (p.ban_type || null) : null, ban_until: p ? (p.ban_until || '') : '' }; });
+    }
+    if (s.startsWith('INSERT INTO ttt_devices')) {
+      const ex = this.tttDevices.get(a[0]);
+      if (ex) { ex.account_id = a[1]; ex.fingerprint_hash = a[2]; ex.device_model = a[3]; ex.android_version = a[4]; ex.app_version = a[5]; ex.api_key_hash = a[6]; ex.key_status = 'active'; ex.key_revoked_reason = ''; ex.is_rooted = a[7]; ex.root_methods = a[8]; ex.is_emulator = a[9]; ex.emulator_detail = a[10]; ex.bootloader_locked = a[11]; ex.last_seen = a[15]; }
+      else this.tttDevices.set(a[0], { guest_id: a[0], account_id: a[1], fingerprint_hash: a[2], device_model: a[3], android_version: a[4], app_version: a[5], api_key_hash: a[6], key_status: 'active', key_revoked_reason: '', is_rooted: a[7], root_methods: a[8], is_emulator: a[9], emulator_detail: a[10], bootloader_locked: a[11], integrity_status: a[12], integrity_detail: a[13], first_seen: a[14], last_seen: a[15] });
+      return [];
+    }
+    if (s.startsWith('UPDATE ttt_devices SET last_seen = ?, account_id = ? WHERE guest_id = ?')) { const r = this.tttDevices.get(a[2]); if (r) { r.last_seen = a[0]; r.account_id = a[1]; } return []; }
+    if (s.startsWith("UPDATE ttt_devices SET key_status = 'revoked', key_revoked_reason = ? WHERE account_id = ?")) { for (const r of this.tttDevices.values()) if (r.account_id === a[1]) { r.key_status = 'revoked'; r.key_revoked_reason = a[0]; } return []; }
+    if (s.startsWith("UPDATE ttt_devices SET key_status = 'active', key_revoked_reason = '' WHERE account_id = ?")) { for (const r of this.tttDevices.values()) if (r.account_id === a[0] && r.key_status === 'revoked') { r.key_status = 'active'; r.key_revoked_reason = ''; } return []; }
+    if (s.startsWith("UPDATE ttt_devices SET key_status = 'revoked', key_revoked_reason = ? WHERE guest_id = ?")) { const r = this.tttDevices.get(a[1]); if (r) { r.key_status = 'revoked'; r.key_revoked_reason = a[0]; } return []; }
+    if (s.startsWith("UPDATE ttt_devices SET key_status = 'active', key_revoked_reason = '' WHERE guest_id = ?")) { const r = this.tttDevices.get(a[0]); if (r) { r.key_status = 'active'; r.key_revoked_reason = ''; } return []; }
+    if (s.startsWith('UPDATE ttt_devices SET integrity_status = ?, integrity_detail = ?, last_seen = ? WHERE guest_id = ?')) { const r = this.tttDevices.get(a[3]); if (r) { r.integrity_status = a[0]; r.integrity_detail = a[1]; r.last_seen = a[2]; } return []; }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM ttt_devices WHERE last_seen > ?')) return [{ c: [...this.tttDevices.values()].filter(x => String(x.last_seen || '') > a[0]).length }];
+    if (s === 'SELECT COUNT(*) AS c FROM ttt_players') return [{ c: this.tttPlayers.size }];
+    if (s.startsWith("SELECT COUNT(*) AS c FROM ttt_players WHERE ban_type IN ('temp7', 'temp30', 'permanent')")) return [{ c: [...this.tttPlayers.values()].filter(x => ['temp7', 'temp30', 'permanent'].includes(x.ban_type)).length }];
+    if (s.startsWith("SELECT account_id, ban_type, ban_until FROM ttt_players WHERE ban_type IN ('temp7', 'temp30', 'permanent')")) return [...this.tttPlayers.values()].filter(x => ['temp7', 'temp30', 'permanent'].includes(x.ban_type)).map(x => ({ account_id: x.account_id, ban_type: x.ban_type, ban_until: x.ban_until || '' }));
+    if (s.startsWith('SELECT COUNT(*) AS c FROM ttt_sessions WHERE started_at > ?')) return [{ c: this.tttSessions.filter(x => String(x.started_at || '') > a[0]).length }];
+    if (s.startsWith('SELECT COUNT(*) AS c FROM ttt_redeem_codes WHERE active = 1')) return [{ c: [...this.tttRedeemCodes.values()].filter(x => Number(x.active) === 1).length }];
+    if (s.startsWith("SELECT COUNT(*) AS c FROM ttt_watchlist WHERE status = 'watching'")) return [{ c: this.tttWatchlist.filter(x => x.status === 'watching').length }];
+    if (s.startsWith('SELECT COUNT(*) AS c FROM ttt_flags WHERE reviewed = 0')) return [{ c: this.tttFlags.filter(x => Number(x.reviewed) === 0).length }];
+    if (s.startsWith('INSERT INTO ttt_sessions')) { const ex = this.tttSessions.find(x => x.session_id === a[0]); if (ex) ex.last_seen_at = a[4]; else this.tttSessions.push({ session_id: a[0], guest_id: a[1], account_id: a[2], started_at: a[3], last_seen_at: a[4], ended_at: '', app_version: a[5] }); return []; }
+    if (s.startsWith('UPDATE ttt_sessions SET ended_at = ? WHERE session_id = ? AND guest_id = ?')) { const r = this.tttSessions.find(x => x.session_id === a[1] && x.guest_id === a[2]); if (r) r.ended_at = a[0]; return []; }
+    if (s.startsWith('SELECT COUNT(DISTINCT guest_id) AS c FROM ttt_sessions WHERE account_id = ?')) return [{ c: new Set(this.tttSessions.filter(x => x.account_id === a[0] && String(x.last_seen_at || '') > a[1] && (x.ended_at === a[2] || x.ended_at === a[3])).map(x => x.guest_id)).size }];
+    if (s.startsWith('SELECT session_id, guest_id, started_at, last_seen_at, ended_at, app_version FROM ttt_sessions WHERE account_id = ?')) return [...this.tttSessions].filter(x => x.account_id === a[0]).sort((x, y) => String(y.started_at || '').localeCompare(String(x.started_at || ''))).slice(0, 20).map(x => ({ session_id: x.session_id, guest_id: x.guest_id, started_at: x.started_at, last_seen_at: x.last_seen_at, ended_at: x.ended_at, app_version: x.app_version }));
+    if (s.startsWith('SELECT * FROM ttt_redeem_codes WHERE code = ?')) return this.tttRedeemCodes.has(a[0]) ? [this.tttRedeemCodes.get(a[0])] : [];
+    if (s.startsWith('SELECT code FROM ttt_redeem_codes WHERE code = ?')) return this.tttRedeemCodes.has(a[0]) ? [{ code: a[0] }] : [];
+    if (s.startsWith('INSERT INTO ttt_redeem_codes')) { this.tttRedeemCodes.set(a[0], { code: a[0], benefit_type: a[1], benefit_value: a[2], max_uses: a[3], used_count: 0, expires_at: a[4] || '', active: 1, created_by: a[5], created_at: a[6] }); return []; }
+    if (s.startsWith('UPDATE ttt_redeem_codes SET used_count = used_count + 1 WHERE code = ?')) { const r = this.tttRedeemCodes.get(a[0]); if (r) r.used_count = (Number(r.used_count) || 0) + 1; return []; }
+    if (s.startsWith('UPDATE ttt_redeem_codes SET active = 0 WHERE code = ?')) { const r = this.tttRedeemCodes.get(a[0]); if (r) r.active = 0; return []; }
+    if (s.startsWith('SELECT code, benefit_type, benefit_value, max_uses, used_count, expires_at, active, created_by, created_at FROM ttt_redeem_codes ORDER BY created_at DESC LIMIT 100')) return [...this.tttRedeemCodes.values()].sort((x, y) => String(y.created_at || '').localeCompare(String(x.created_at || ''))).slice(0, 100).map(x => ({ code: x.code, benefit_type: x.benefit_type, benefit_value: x.benefit_value, max_uses: x.max_uses, used_count: x.used_count, expires_at: x.expires_at, active: x.active, created_by: x.created_by, created_at: x.created_at }));
+    if (s.startsWith("SELECT COUNT(*) AS c FROM ttt_redeem_log WHERE guest_id = ? AND status = 'failed' AND redeemed_at > ?")) return [{ c: this.tttRedeemLog.filter(x => x.guest_id === a[0] && x.status === 'failed' && String(x.redeemed_at || '') > a[1]).length }];
+    if (s.startsWith('INSERT INTO ttt_redeem_log')) { if (s.includes("'failed'")) this.tttRedeemLog.push({ id: ++this.tttRedeemLogSeq, code: a[0], account_id: a[1], guest_id: a[2], benefit_type: '', benefit_value: 0, status: 'failed', fail_reason: a[3], redeemed_at: a[4] }); else this.tttRedeemLog.push({ id: ++this.tttRedeemLogSeq, code: a[0], account_id: a[1], guest_id: a[2], benefit_type: a[3], benefit_value: a[4], status: 'ok', fail_reason: '', redeemed_at: a[5] }); return []; }
+    if (s.startsWith("SELECT id FROM ttt_redeem_log WHERE code = ? AND account_id = ? AND status = 'ok' LIMIT 1")) { const r = this.tttRedeemLog.find(x => x.code === a[0] && x.account_id === a[1] && x.status === 'ok'); return r ? [{ id: r.id }] : []; }
+    if (s.startsWith('SELECT code, benefit_type, benefit_value, status, redeemed_at FROM ttt_redeem_log WHERE account_id = ?')) return [...this.tttRedeemLog].filter(x => x.account_id === a[0]).sort((x, y) => y.id - x.id).slice(0, 20).map(x => ({ code: x.code, benefit_type: x.benefit_type, benefit_value: x.benefit_value, status: x.status, redeemed_at: x.redeemed_at }));
+    if (s.startsWith("SELECT id, command, created_by FROM ttt_commands WHERE target_type = ? AND target_id = ? AND status = 'pending'")) return [...this.tttCommands].filter(x => x.target_type === a[0] && x.target_id === a[1] && x.status === 'pending').sort((x, y) => x.id - y.id).slice(0, 10).map(x => ({ id: x.id, command: x.command, created_by: x.created_by }));
+    if (s.startsWith("UPDATE ttt_commands SET status = 'delivered', delivered_at = ? WHERE id = ?")) { const r = this.tttCommands.find(x => x.id === a[1]); if (r) { r.status = 'delivered'; r.delivered_at = a[0]; } return []; }
+    if (s.startsWith('INSERT INTO ttt_commands')) { this.tttCommands.push({ id: ++this.tttCommandSeq, target_type: a[0], target_id: a[1], command: a[2], status: 'pending', created_by: a[3], created_at: a[4], delivered_at: '' }); return []; }
+    if (s.startsWith('SELECT id, target_type, target_id, command, status, created_by, created_at, delivered_at FROM ttt_commands WHERE status = ?')) return [...this.tttCommands].filter(x => x.status === a[0]).sort((x, y) => y.id - x.id).slice(0, 100).map(x => ({ id: x.id, target_type: x.target_type, target_id: x.target_id, command: x.command, status: x.status, created_by: x.created_by, created_at: x.created_at, delivered_at: x.delivered_at }));
+    if (s.startsWith("SELECT id FROM ttt_watchlist WHERE target_type = ? AND target_id = ? AND status = 'watching'")) { const r = this.tttWatchlist.find(x => x.target_type === a[0] && x.target_id === a[1] && x.status === 'watching'); return r ? [{ id: r.id }] : []; }
+    if (s.startsWith('INSERT INTO ttt_watchlist')) { this.tttWatchlist.push({ id: ++this.tttWatchSeq, target_type: a[0], target_id: a[1], reason: a[2], score: a[3], evidence: a[4], status: a[5], created_at: a[6], updated_at: a[7] }); return []; }
+    if (s.startsWith("SELECT id, score FROM ttt_watchlist WHERE target_type = ? AND target_id = ? AND status = 'watching'")) { const r = this.tttWatchlist.find(x => x.target_type === a[0] && x.target_id === a[1] && x.status === 'watching'); return r ? [{ id: r.id, score: r.score }] : []; }
+    if (s.startsWith('UPDATE ttt_watchlist SET score = ?, evidence = ?, updated_at = ? WHERE id = ?')) { const r = this.tttWatchlist.find(x => x.id === a[3]); if (r) { r.score = a[0]; r.evidence = a[1]; r.updated_at = a[2]; } return []; }
+    if (s.startsWith("UPDATE ttt_watchlist SET status = 'confirmed', updated_at = ? WHERE id = ?")) { const r = this.tttWatchlist.find(x => x.id === a[1]); if (r) { r.status = 'confirmed'; r.updated_at = a[0]; } return []; }
+    if (s.startsWith("UPDATE ttt_watchlist SET status = 'cleared', updated_at = ? WHERE id = ?")) { const r = this.tttWatchlist.find(x => x.id === a[1]); if (r) { r.status = 'cleared'; r.updated_at = a[0]; } return []; }
+    if (s.startsWith("SELECT id, target_type, target_id, reason, score, evidence, status, created_at, updated_at FROM ttt_watchlist WHERE status = 'watching'")) return [...this.tttWatchlist].filter(x => x.status === 'watching').sort((x, y) => (Number(y.score) || 0) - (Number(x.score) || 0) || y.id - x.id).slice(0, 100).map(x => ({ id: x.id, target_type: x.target_type, target_id: x.target_id, reason: x.reason, score: x.score, evidence: x.evidence, status: x.status, created_at: x.created_at, updated_at: x.updated_at }));
+    if (s.startsWith('SELECT id, reason, score, evidence, status, created_at, updated_at FROM ttt_watchlist WHERE target_id = ?')) return [...this.tttWatchlist].filter(x => x.target_id === a[0]).sort((x, y) => y.id - x.id).slice(0, 20).map(x => ({ id: x.id, reason: x.reason, score: x.score, evidence: x.evidence, status: x.status, created_at: x.created_at, updated_at: x.updated_at }));
+    if (s.startsWith('SELECT profile_json FROM ttt_behavior WHERE target_id = ?')) { const r = this.tttBehavior.get(a[0]); return r ? [{ profile_json: r.profile_json }] : []; }
+    if (s.startsWith('INSERT INTO ttt_behavior')) { this.tttBehavior.set(a[0], { target_id: a[0], target_type: a[1], profile_json: a[2], updated_at: a[3] }); return []; }
+    if (s.startsWith('SELECT profile_json, updated_at FROM ttt_behavior WHERE target_id = ?')) { const r = this.tttBehavior.get(a[0]); return r ? [{ profile_json: r.profile_json, updated_at: r.updated_at }] : []; }
+    if (s.startsWith('SELECT id FROM ttt_flags WHERE account_id = ? AND reason = ? ORDER BY id DESC LIMIT 1')) { const rows = this.tttFlags.filter(x => x.account_id === a[0] && x.reason === a[1]).sort((x, y) => y.id - x.id); return rows.length ? [{ id: rows[0].id, created_at: rows[0].created_at }] : []; }
+    if (s.startsWith('SELECT id, reason, details, created_at FROM ttt_flags WHERE reviewed = 0 ORDER BY id DESC LIMIT 50')) return [...this.tttFlags].filter(x => Number(x.reviewed) === 0).sort((x, y) => y.id - x.id).slice(0, 50).map(x => ({ id: x.id, reason: x.reason, details: x.details, created_at: x.created_at }));
+    if (s.startsWith('SELECT id, reason, details, created_at, reviewed FROM ttt_flags WHERE account_id = ? ORDER BY id DESC LIMIT 20')) return [...this.tttFlags].filter(x => x.account_id === a[0]).sort((x, y) => y.id - x.id).slice(0, 20).map(x => ({ id: x.id, reason: x.reason, details: x.details, created_at: x.created_at, reviewed: x.reviewed }));
+    if (s.startsWith('SELECT id, ban_type, reason, created_by, created_at, expires_at, revoked_at FROM ttt_bans WHERE account_id = ? ORDER BY id DESC LIMIT 20')) return [...this.tttBans].filter(x => x.account_id === a[0]).sort((x, y) => y.id - x.id).slice(0, 20).map(x => ({ id: x.id, ban_type: x.ban_type, reason: x.reason, created_by: x.created_by, created_at: x.created_at, expires_at: x.expires_at, revoked_at: x.revoked_at }));
+    if (s.startsWith('UPDATE ttt_players SET score = score + ?, total_energy_all_time = total_energy_all_time + ?, updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[3]); if (r) { r.score = (Number(r.score) || 0) + Number(a[0]); r.total_energy_all_time = (Number(r.total_energy_all_time) || 0) + Number(a[1]); r.updated_at = a[2]; } return []; }
+    if (s.startsWith('UPDATE ttt_players SET savings = savings + ?, updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[2]); if (r) { r.savings = (Number(r.savings) || 0) + Number(a[0]); r.updated_at = a[1]; } return []; }
     // Hozin Dompet v1.1 (tabel dompet_*).
     if (s.startsWith('INSERT OR IGNORE INTO dompet_accounts')) { this.dompetAccounts.add(a[0]); return []; }
     if (s.startsWith('SELECT updated_at FROM dompet_transactions WHERE account_id = ? AND id = ?')) { const r = this.dompetTransactions.find(x => x.account_id === a[0] && x.id === a[1]); return r ? [{ updated_at: r.updated_at }] : []; }
@@ -3538,6 +3613,136 @@ r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '22222222', ban
 assert(r.status === 200, 'taptap v1.1.2: ban 22222222 untuk uji tabungan ok');
 r = await tttCall('POST', '/api/taptap/savings/deposit', { account_id: '22222222', amount: 10, score: 5000, total_energy_all_time: 5000, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
 assert(r.status === 403 && JSON.parse(await r.text()).error === 'banned', 'taptap v1.1.2: deposit saat diblokir -> 403 banned');
+// ---- Admin-batch TTT (18 Nov 2026): ID guest + API key + tracking + redeem + ban real-time + perintah + deteksi + perilaku ----
+// Alur aplikasi: register pertama TANPA guest_id -> server yang menetapkan
+// guest_id (16 hex) + API key; register berikut mengirim guest_id itu.
+const FP_A = 'a'.repeat(64);
+const FP_D = 'd'.repeat(64);
+// 1. Register: key diterbitkan, register ulang ROTASI key, key lama ditolak.
+r = await tttCall('POST', '/api/taptap/register', { account_id: '12345678', fingerprint: FP_A, device_model: 'POCO X6 Pro', android_version: '16', app_version: '1.1.2', is_rooted: true, root_methods: ['magisk'], is_emulator: false, bootloader_locked: false });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && typeof sj.api_key === 'string' && /^[0-9a-f]{64}$/.test(sj.api_key) && /^ttt-guest-[0-9a-f]{16}$/.test(sj.guest_id), 'taptap admin: register terbitkan guest_id + API key (hex 64 karakter)');
+const GUEST_A = sj.guest_id;
+const KEY_A1 = sj.api_key;
+r = await tttCall('POST', '/api/taptap/register', { guest_id: GUEST_A, account_id: '12345678', fingerprint: FP_A, device_model: 'POCO X6 Pro', android_version: '16', app_version: '1.1.2', is_rooted: true, root_methods: ['magisk'], is_emulator: false, bootloader_locked: false });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.guest_id === GUEST_A && sj.api_key !== KEY_A1, 'taptap admin: register ulang ROTASI key (key baru != key lama, guest_id sama)');
+const KEY_A2 = sj.api_key;
+r = await tttCall('POST', '/api/taptap/heartbeat', { guest_id: GUEST_A, session_id: 'sess-a1', taps_last_60s: 10, max_taps_per_sec: 2, total_taps: 10, session_started_at: new Date().toISOString(), app_version: '1.1.2' }, { 'x-ttt-api-key': KEY_A1 });
+assert(r.status === 401 && JSON.parse(await r.text()).error === 'invalid_api_key', 'taptap admin: key lama (terotasi) ditolak 401 invalid_api_key');
+// Heartbeat tanpa key -> 401; heartbeat normal -> ok + sesi dimulai.
+r = await tttCall('POST', '/api/taptap/heartbeat', { guest_id: GUEST_A, session_id: 'sess-a1', taps_last_60s: 10, max_taps_per_sec: 2, total_taps: 10, session_started_at: new Date().toISOString(), app_version: '1.1.2' });
+assert(r.status === 401 && JSON.parse(await r.text()).error === 'api_key_required', 'taptap admin: heartbeat tanpa key -> 401');
+r = await tttCall('POST', '/api/taptap/heartbeat', { guest_id: GUEST_A, session_id: 'sess-a1', taps_last_60s: 10, max_taps_per_sec: 2, total_taps: 10, session_started_at: new Date().toISOString(), app_version: '1.1.2', is_rooted: true, root_methods: ['magisk'], is_emulator: false, bootloader_locked: false }, { 'x-ttt-api-key': KEY_A2 });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && Array.isArray(sj.commands) && sj.commands.length === 0 && sj.banned === false, 'taptap admin: heartbeat key baru ok, sesi dimulai, tidak diblokir');
+// 2. Tap mustahil manusia -> flag + daftar pantau (root sendirian TIDAK memicu).
+r = await tttCall('POST', '/api/taptap/heartbeat', { guest_id: GUEST_A, session_id: 'sess-a1', taps_last_60s: 3000, max_taps_per_sec: 25, total_taps: 3010, session_started_at: new Date(Date.now() - 60000).toISOString(), app_version: '1.1.2', is_rooted: true, is_emulator: false }, { 'x-ttt-api-key': KEY_A2 });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && Array.isArray(sj.flagged) && sj.flagged.includes('tap_rate_impossible'), 'taptap admin: tap 3000/60 dtk + 25/dtk -> flag tap_rate_impossible');
+r = await tttCall('GET', '/api/taptap/admin/watchlist', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.watchlist.some(x => x.target_id === GUEST_A && Number(x.score) >= 40), 'taptap admin: guest abuse masuk watchlist skor >= 40');
+// 3. Status + session end + integrity (tanpa service account -> not_configured).
+r = await tttCall('GET', '/api/taptap/status?guest_id=' + GUEST_A, null, { 'x-ttt-api-key': KEY_A2 });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.banned === false && Array.isArray(sj.commands), 'taptap admin: GET /status ok, tidak diblokir, perintah berupa array');
+r = await tttCall('POST', '/api/taptap/session/end', { guest_id: GUEST_A, session_id: 'sess-a1' }, { 'x-ttt-api-key': KEY_A2 });
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap admin: session end ok');
+r = await tttCall('POST', '/api/taptap/integrity', { guest_id: GUEST_A, token: 'x' }, { 'x-ttt-api-key': KEY_A2 });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.verified === false && sj.status === 'not_configured', 'taptap admin: integrity tanpa service account -> not_configured (game tetap jalan)');
+// 4. Redeem: buat akun + guest baru, buat kode, tukar, duplikat ditolak, brute-force dibatasi.
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '66666666', player_name: 'RedeemKu', score: 100, total_energy_all_time: 100, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 200, 'taptap admin: buat akun redeem 66666666 ok');
+r = await tttCall('POST', '/api/taptap/register', { account_id: '66666666', fingerprint: FP_D, device_model: 'POCO X6 Pro', android_version: '16', app_version: '1.1.2' });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && typeof sj.api_key === 'string' && /^ttt-guest-[0-9a-f]{16}$/.test(sj.guest_id), 'taptap admin: register guest redeem ok');
+const GUEST_D = sj.guest_id;
+const KEY_D = sj.api_key;
+r = await tttCall('POST', '/api/taptap/admin/redeem/create', { benefit_type: 'energy', benefit_value: 50000, max_uses: 2 }, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && typeof sj.code === 'string' && sj.code.startsWith('TTT-'), 'taptap admin: buat kode redeem -> TTT-XXXX-XXXX');
+const CODE1 = sj.code;
+r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: CODE1 }, { 'x-ttt-api-key': KEY_D });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.benefit_type === 'energy' && sj.benefit_value === 50000, 'taptap admin: redeem kode energi 50000 ok');
+r = await tttCall('GET', '/api/taptap/profile/66666666', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.score === 50100 && sj.total_energy_all_time === 50100, 'taptap admin: redeem energi masuk skor + total (100 -> 50100)');
+r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: CODE1 }, { 'x-ttt-api-key': KEY_D });
+assert(r.status === 403 && JSON.parse(await r.text()).error === 'already_redeemed', 'taptap admin: redeem kode yang sama kedua kali -> 403 already_redeemed');
+r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: CODE1 });
+assert(r.status === 401 && JSON.parse(await r.text()).error === 'api_key_required', 'taptap admin: redeem tanpa key -> 401');
+// Catatan: percobaan already_redeemed ikut tercatat sebagai gagal (1);
+  // cek ambang berjalan SEBELUM log percobaan ini, jadi 429 baru muncul
+  // di percobaan kode-salah ke-5 (total gagal tercatat sudah 5).
+for (let i = 0; i < 4; i++) {
+  r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: 'TTT-SALAH-0000' }, { 'x-ttt-api-key': KEY_D });
+  assert(r.status === 404 && JSON.parse(await r.text()).error === 'code_not_found', 'taptap admin: redeem kode salah ke-' + (i + 1) + ' -> 404');
+}
+r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: 'TTT-SALAH-0000' }, { 'x-ttt-api-key': KEY_D });
+assert(r.status === 429 && JSON.parse(await r.text()).error === 'too_many_attempts', 'taptap admin: redeem gagal ke-5 dalam 10 menit -> 429 + flag');
+// 5. Perintah paksa: admin kirim kick -> heartbeat terima + tandai delivered.
+r = await tttCall('POST', '/api/taptap/admin/command', { target_type: 'guest', target_id: GUEST_D, command: 'kick' }, TTT_ADMIN_H);
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap admin: perintah kick dibuat');
+r = await tttCall('POST', '/api/taptap/heartbeat', { guest_id: GUEST_D, account_id: '66666666', session_id: 'sess-d1', taps_last_60s: 5, max_taps_per_sec: 1, total_taps: 5, session_started_at: new Date().toISOString(), app_version: '1.1.2' }, { 'x-ttt-api-key': KEY_D });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && Array.isArray(sj.commands) && sj.commands.some(c => c.command === 'kick'), 'taptap admin: heartbeat terima perintah kick');
+r = await tttCall('GET', '/api/taptap/admin/commands?status=delivered', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.commands.some(x => x.target_id === GUEST_D && x.command === 'kick' && x.status === 'delivered'), 'taptap admin: perintah kick tercatat delivered');
+// 6. Ringkasan + live + riwayat pengguna + perilaku + hapus pantauan.
+r = await tttCall('GET', '/api/taptap/admin/summary', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.total_players >= 6 && sj.online_now >= 1, 'taptap admin: summary hitung pemain + online');
+r = await tttCall('GET', '/api/taptap/admin/live', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.online.some(x => x.guest_id === GUEST_D), 'taptap admin: live tampilkan guest online');
+r = await tttCall('GET', '/api/taptap/admin/users/66666666', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.player.account_id === '66666666' && Array.isArray(sj.devices) && sj.devices.length === 1 && Array.isArray(sj.redeems) && sj.redeems.some(x => x.code === CODE1 && x.status === 'ok'), 'taptap admin: riwayat pengguna tampilkan perangkat + log redeem');
+r = await tttCall('GET', '/api/taptap/admin/behavior/66666666', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.profile !== null && Array.isArray(sj.matches), 'taptap admin: behavior tampilkan profil + daftar kemiripan');
+r = await tttCall('GET', '/api/taptap/admin/watchlist', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+const watchA = sj.watchlist.find(x => x.target_id === GUEST_A);
+assert(watchA && Number(watchA.id) > 0, 'taptap admin: watchlist berisi entri guest A');
+r = await tttCall('POST', '/api/taptap/admin/watchlist/clear', { id: watchA.id }, TTT_ADMIN_H);
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap admin: watchlist clear (bukan orang yang sama) ok');
+r = await tttCall('GET', '/api/taptap/admin/watchlist', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && !sj.watchlist.some(x => x.target_id === GUEST_A), 'taptap admin: entri watchlist terhapus setelah clear');
+// 7. Ban anti-bypass: ban akun -> key dicabut + heartbeat ditolak + register fingerprint sama ditolak; unban -> pulih.
+r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '66666666', ban_type: 'temp30', reason: 'uji anti-bypass' }, TTT_ADMIN_H);
+assert(r.status === 200, 'taptap admin: ban 66666666 temp30 ok');
+r = await tttCall('POST', '/api/taptap/heartbeat', { guest_id: GUEST_D, account_id: '66666666', session_id: 'sess-d2', taps_last_60s: 1, max_taps_per_sec: 1, total_taps: 6, session_started_at: new Date().toISOString(), app_version: '1.1.2' }, { 'x-ttt-api-key': KEY_D });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.banned === true && sj.ban_type === 'temp30', 'taptap admin: heartbeat saat diblokir -> 200 banned:true (meski key dicabut)');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '66666666', player_name: 'RedeemKu', score: 50100, total_energy_all_time: 50100, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, { 'x-ttt-api-key': KEY_D });
+sj = JSON.parse(await r.text());
+assert(r.status === 403 && sj.error === 'banned' && sj.ban_type === 'key_revoked', 'taptap admin: endpoint lama dengan key tercabut -> 403 banned/key_revoked');
+r = await tttCall('POST', '/api/taptap/register', { account_id: '66666666', fingerprint: FP_D, device_model: 'POCO X6 Pro', android_version: '16', app_version: '1.1.2' });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.banned === true && sj.ban_type === 'temp30', 'taptap admin: register fingerprint sama saat diblokir -> 200 banned:true');
+r = await tttCall('POST', '/api/taptap/admin/unban', { account_id: '66666666' }, TTT_ADMIN_H);
+assert(r.status === 200, 'taptap admin: unban 66666666 ok');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '66666666', player_name: 'RedeemKu', score: 50100, total_energy_all_time: 50100, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, { 'x-ttt-api-key': KEY_D });
+assert(r.status === 200, 'taptap admin: key dipulihkan setelah unban, endpoint lama jalan lagi');
+r = await tttCall('POST', '/api/taptap/register', { account_id: '66666666', fingerprint: FP_D, device_model: 'POCO X6 Pro', android_version: '16', app_version: '1.1.2' });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.guest_id === GUEST_D && typeof sj.api_key === 'string', 'taptap admin: register fingerprint sama setelah unban -> guest_id lama kembali');
+// 8. Panel admin /kendali/taptap (sesi admin cookie).
+r = await tttCall('GET', '/kendali/taptap', null, { cookie });
+t = await r.text();
+assert(r.status === 200 && t.includes('Tap Tap Tycoon') && t.includes('Ringkasan') && t.includes('Daftar pantau'), 'taptap admin: panel /kendali/taptap tampil (ringkasan + pantau)');
+// 9. Endpoint lama TANPA key tetap jalan (kompatibel v1.1.2) — kecuali key tercabut.
+r = await tttCall('GET', '/api/taptap/leaderboard', null);
+assert(r.status === 200, 'taptap admin: leaderboard tanpa key tetap jalan (kompatibel v1.1.2)');
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '77777777', player_name: 'TanpaKey', score: 50, total_energy_all_time: 50, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 200, 'taptap admin: POST /profile tanpa key tetap jalan (kompatibel v1.1.2)');
+
 // Hozin Dompet v1.1 — API /api/dompet/* (D1 stopwatch-db via BACKUP_DB).
 async function dompetCall(method, path, obj) {
   const req = new Request(base + path, { method, headers: { 'content-type': 'application/json' }, body: obj === null ? undefined : JSON.stringify(obj) });

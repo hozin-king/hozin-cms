@@ -328,7 +328,7 @@ input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/statistik', 'Statistik'], ['/kendali/laporan', 'Laporan'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/statistik', 'Statistik'], ['/kendali/laporan', 'Laporan'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper'], ['/kendali/taptap', 'Tap Tap']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -995,6 +995,451 @@ async function taptapIsAdmin(request, env) {
     (headerToken !== '' && headerToken === env.ADMIN_TOKEN);
 }
 
+// ---- Paket admin Tap Tap Tycoon (admin-batch, 18 Nov 2026) ----
+// ID guest + API key anti-bypass + tracking + redeem + ban real-time +
+// perintah paksa + deteksi abuse + pencocokan pola perilaku + sinyal
+// root/emulator/integritas. Semua data di D1 stopwatch-db (BACKUP_DB),
+// tabel prefix ttt_ (lihat server/taptap_ddl.sql di repo TTT).
+// Prinsip: ban TIDAK PERNAH hanya mengandalkan klien — server yang
+// menolak di tiap request. Root / emulator / integritas gagal
+// SENDIRIAN tidak pernah memicu auto-ban (aturan keras — HP user
+// sendiri root).
+const TTT_ADMIN_MIN_VERSION = '1.0.0';
+const TTT_TAP_RATE_FLAG = 20; // tap/detik maksimum yang masih manusiawi
+const TTT_TAPS_MIN_FLAG = 2000; // tap dalam 60 detik
+const TTT_BEHAVIOR_WATCH = 50; // kemiripan perilaku (%) -> daftar pantau
+const TTT_BEHAVIOR_CONFIRM = 75; // kemiripan naik ke sini -> auto-ban temp30
+const TTT_ONLINE_WINDOW_MS = 3 * 60 * 1000; // "online" = last_seen < 3 mnt
+const TTT_REDEEM_BRUTEFORCE = 5; // gagal tukar dalam 10 menit -> flag
+const TTT_REDEEM_MAX_VALUE = 1000000000; // 1e9 — manfaat maks per kode
+const TTT_REDEEM_TYPES = ['energy', 'savings'];
+
+async function tttSha256Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function tttRandomHex(nBytes) {
+  const arr = new Uint8Array(nBytes);
+  crypto.getRandomValues(arr);
+  return [...arr].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function tttRandomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const arr = new Uint8Array(8);
+  crypto.getRandomValues(arr);
+  const pick = (i) => chars[arr[i] % chars.length];
+  return `TTT-${pick(0)}${pick(1)}${pick(2)}${pick(3)}-${pick(4)}${pick(5)}${pick(6)}${pick(7)}`;
+}
+
+function tttValidGuestId(id) {
+  return typeof id === 'string' && /^ttt-guest-[0-9a-f]{16}$/.test(id);
+}
+
+/** Cari perangkat dari header X-TTT-API-Key. Return device row atau null. */
+async function tttDeviceByKey(db, key) {
+  if (!key) return null;
+  const hash = await tttSha256Hex(key);
+  return await db.prepare('SELECT * FROM ttt_devices WHERE api_key_hash = ?').bind(hash).first();
+}
+
+/**
+ * Gate API key untuk endpoint LAMA (profile/claim/chat/savings/like/
+ * region): key OPSIONAL (kompatibel dengan v1.1.2 yang belum punya key),
+ * tapi bila key dikirim dan statusnya revoked -> 403 banned. Return
+ * Response bila diblokir, null bila lolos.
+ */
+async function tttCheckApiKey(request, db) {
+  const key = (request.headers.get('x-ttt-api-key') || '').trim();
+  if (!key) return null;
+  const dev = await tttDeviceByKey(db, key);
+  if (!dev) return null; // key tak dikenal -> abaikan, jangan putuskan client
+  if (dev.key_status === 'revoked') {
+    return taptapJson({
+      error: 'banned', ban_type: 'key_revoked',
+      ban_reason: dev.key_revoked_reason || 'kunci API dicabut admin', ban_until: '',
+    }, 403);
+  }
+  return null;
+}
+
+/** Wajib key (endpoint admin baru): return {device} atau Response error. */
+async function tttRequireKey(request, db) {
+  const key = (request.headers.get('x-ttt-api-key') || '').trim();
+  if (!key) return taptapJson({ error: 'api_key_required' }, 401);
+  const dev = await tttDeviceByKey(db, key);
+  if (!dev) return taptapJson({ error: 'invalid_api_key' }, 401);
+  if (dev.key_status === 'revoked') {
+    return taptapJson({
+      error: 'banned', ban_type: 'key_revoked',
+      ban_reason: dev.key_revoked_reason || 'kunci API dicabut admin', ban_until: '',
+    }, 403);
+  }
+  return { device: dev };
+}
+
+/** Ban aktif untuk satu perangkat: via akun tertaut ATAU key dicabut karena ban. */
+// Ambil baris ban pemain (dipakai cek banned tanpa API key: akun diblokir
+// harus selalu menerima sinyal banned meski key-nya sudah dicabut).
+async function taptapGetBan(db, accountId) {
+  if (!accountId) return null;
+  const row = await db.prepare(
+    'SELECT ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?'
+  ).bind(accountId).first();
+  return row || null;
+}
+
+async function tttBanForDevice(db, device, nowMs) {
+  if (!device) return null;
+  if (device.account_id) {
+    const row = await db.prepare(
+      'SELECT ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?'
+    ).bind(device.account_id).first();
+    if (row && taptapBanActive(row, nowMs)) {
+      return { type: row.ban_type, reason: row.ban_reason || '', until: row.ban_until || '' };
+    }
+  }
+  if (device.key_status === 'revoked' && (device.key_revoked_reason || '').startsWith('banned')) {
+    return { type: 'key_revoked', reason: device.key_revoked_reason || 'kunci API dicabut', until: '' };
+  }
+  return null;
+}
+
+/** Cabut semua key perangkat milik satu akun (dipanggil saat ban). */
+async function tttRevokeKeysForAccount(db, accountId, reason) {
+  await db.prepare(
+    "UPDATE ttt_devices SET key_status = 'revoked', key_revoked_reason = ? WHERE account_id = ?"
+  ).bind(reason, accountId).run();
+}
+
+/** Pulihkan key perangkat milik satu akun (dipanggil saat unban). */
+async function tttRestoreKeysForAccount(db, accountId) {
+  await db.prepare(
+    "UPDATE ttt_devices SET key_status = 'active', key_revoked_reason = '' WHERE account_id = ? AND key_status = 'revoked'"
+  ).bind(accountId).run();
+}
+
+/** Perintah tertunda untuk satu target (guest ATAU account), belum ditandai terkirim. */
+async function tttPendingCommands(db, targetType, targetId) {
+  const { results } = await db.prepare(
+    "SELECT id, command, created_by FROM ttt_commands WHERE target_type = ? AND target_id = ? AND status = 'pending' ORDER BY id ASC LIMIT 10"
+  ).bind(targetType, targetId).all();
+  return results || [];
+}
+
+/** Ambil + tandai terkirim semua perintah tertunda untuk guest dan akun. */
+async function tttDeliverCommands(db, guestId, accountId, now) {
+  const seen = new Set();
+  const out = [];
+  for (const [type, id] of [['guest', guestId], ['account', accountId]]) {
+    if (!id) continue;
+    const cmds = await tttPendingCommands(db, type, id);
+    for (const c of cmds) {
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
+      out.push({ id: c.id, command: c.command, created_by: c.created_by || '' });
+      await db.prepare(
+        "UPDATE ttt_commands SET status = 'delivered', delivered_at = ? WHERE id = ?"
+      ).bind(now, c.id).run();
+    }
+  }
+  return out;
+}
+
+/** True bila akun ini sudah di-flag alasan yang sama dalam 10 menit terakhir (anti-spam flag). */
+async function tttRecentlyFlagged(db, accountId, reason, nowMs) {
+  const row = await db.prepare(
+    'SELECT id FROM ttt_flags WHERE account_id = ? AND reason = ? ORDER BY id DESC LIMIT 1'
+  ).bind(accountId, reason).first();
+  if (!row) return false;
+  const created = Date.parse(row.created_at || '');
+  return Number.isFinite(created) && nowMs - created < 10 * 60 * 1000;
+}
+
+// ---------- Profil perilaku + pencocokan ----------
+// Fitur per target (account_id bila ada, else guest_id):
+// { sessions, days_active, avg_session_min, avg_taps_per_min,
+//   max_taps_per_sec, peak_hour, sessions_per_day, updated_at }
+function tttBehaviorSimilarity(a, b) {
+  if (!a || !b) return 0;
+  const rel = (x, y) => {
+    const m = Math.max(Math.abs(x), Math.abs(y), 1e-9);
+    return Math.max(0, 1 - Math.abs(x - y) / m);
+  };
+  const hourDiff = Math.min(
+    Math.abs((a.peak_hour || 0) - (b.peak_hour || 0)),
+    24 - Math.abs((a.peak_hour || 0) - (b.peak_hour || 0))
+  );
+  const hourSim = 1 - hourDiff / 12;
+  const score = 0.30 * rel(a.avg_taps_per_min || 0, b.avg_taps_per_min || 0)
+    + 0.25 * rel(a.max_taps_per_sec || 0, b.max_taps_per_sec || 0)
+    + 0.20 * rel(a.avg_session_min || 0, b.avg_session_min || 0)
+    + 0.15 * hourSim
+    + 0.10 * rel(a.sessions_per_day || 0, b.sessions_per_day || 0);
+  return Math.round(score * 100);
+}
+
+function tttBehaviorBreakdown(a, b) {
+  const rel = (x, y) => {
+    const m = Math.max(Math.abs(x), Math.abs(y), 1e-9);
+    return Math.round(Math.max(0, 1 - Math.abs(x - y) / m) * 100);
+  };
+  const hourDiff = Math.min(
+    Math.abs((a.peak_hour || 0) - (b.peak_hour || 0)),
+    24 - Math.abs((a.peak_hour || 0) - (b.peak_hour || 0))
+  );
+  return {
+    taps_per_min: rel(a.avg_taps_per_min || 0, b.avg_taps_per_min || 0),
+    max_taps_per_sec: rel(a.max_taps_per_sec || 0, b.max_taps_per_sec || 0),
+    session_min: rel(a.avg_session_min || 0, b.avg_session_min || 0),
+    peak_hour: Math.round((1 - hourDiff / 12) * 100),
+    sessions_per_day: rel(a.sessions_per_day || 0, b.sessions_per_day || 0),
+  };
+}
+
+/** Update profil perilaku (EMA alpha 0.25) + kembalikan profil baru. */
+async function tttUpdateBehavior(db, targetType, targetId, sample, now, nowMs) {
+  const row = await db.prepare(
+    'SELECT profile_json FROM ttt_behavior WHERE target_id = ?'
+  ).bind(targetId).first();
+  let p = { sessions: 0, days_active: 1, avg_session_min: 0, avg_taps_per_min: 0, max_taps_per_sec: 0, peak_hour: 12, sessions_per_day: 0, first_seen: now };
+  if (row && row.profile_json) {
+    try { p = { ...p, ...JSON.parse(row.profile_json) }; } catch (e) { /* profil rusak -> mulai baru */ }
+  }
+  const alpha = 0.25;
+  const ema = (old, v) => (p.sessions === 0 ? v : old + alpha * (v - old));
+  p.sessions += 1;
+  const firstSeenMs = Date.parse(p.first_seen || now);
+  const days = Number.isFinite(firstSeenMs) ? Math.max(1, Math.ceil((nowMs - firstSeenMs) / 86400000)) : 1;
+  p.days_active = days;
+  p.avg_session_min = ema(p.avg_session_min, sample.session_min);
+  p.avg_taps_per_min = ema(p.avg_taps_per_min, sample.taps_per_min);
+  p.max_taps_per_sec = Math.max(p.max_taps_per_sec * 0.9, sample.max_taps_per_sec);
+  p.peak_hour = sample.peak_hour;
+  p.sessions_per_day = p.sessions / days;
+  p.updated_at = now;
+  await db.prepare(
+    'INSERT INTO ttt_behavior (target_id, target_type, profile_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(target_id) DO UPDATE SET profile_json = excluded.profile_json, updated_at = excluded.updated_at'
+  ).bind(targetId, targetType, JSON.stringify(p), now).run();
+  return p;
+}
+
+/** Profil banned (akun yang sedang diblokir aktif) untuk pencocokan. */
+async function tttBannedProfiles(db, nowMs) {
+  const { results } = await db.prepare(
+    'SELECT account_id, ban_type, ban_until FROM ttt_players WHERE ban_type IN (\'temp7\', \'temp30\', \'permanent\')'
+  ).all();
+  const out = [];
+  for (const r of (results || [])) {
+    if (!taptapBanActive(r, nowMs)) continue;
+    const brow = await db.prepare(
+      'SELECT profile_json FROM ttt_behavior WHERE target_id = ?'
+    ).bind(r.account_id).first();
+    if (!brow || !brow.profile_json) continue;
+    try { out.push({ target_id: r.account_id, profile: JSON.parse(brow.profile_json) }); } catch (e) { /* lewati */ }
+  }
+  return out;
+}
+
+// ---------- Play Integrity (verifikasi token sisi server) ----------
+// Butuh secret env PLAY_INTEGRITY_SA_JSON (isi file JSON service account
+// Google Cloud — JANGAN pernah ditulis di repo/chat). Bila secret belum
+// ada -> { verified: false, reason: 'not_configured' } dan sinyal
+// disimpan sebagai "not_configured" (bukan gagal). Setup: aktifkan Play
+// Integrity API di Google Cloud -> buat service account -> beri peran
+// yang bisa memanggil playintegrity.googleapis.com -> simpan JSON-nya
+// sebagai secret PLAY_INTEGRITY_SA_JSON di Cloudflare.
+async function tttVerifyPlayIntegrity(env, token) {
+  const saJson = env.PLAY_INTEGRITY_SA_JSON || '';
+  if (!saJson) return { verified: false, reason: 'not_configured' };
+  try {
+    const sa = JSON.parse(saJson);
+    const nowS = Math.floor(Date.now() / 1000);
+    const b64 = (o) => btoa(JSON.stringify(o)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const header = { alg: 'RS256', typ: 'JWT' };
+    const claims = {
+      iss: sa.client_email,
+      scope: 'https://www.googleapis.com/auth/playintegrity',
+      aud: 'https://oauth2.googleapis.com/token',
+      exp: nowS + 3600, iat: nowS,
+    };
+    const unsigned = b64(header) + '.' + b64(claims);
+    const pem = String(sa.private_key || '').replace(/-----BEGIN PRIVATE KEY-----/g, '').replace(/-----END PRIVATE KEY-----/g, '').replace(/\s+/g, '');
+    const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
+    const key = await crypto.subtle.importKey('pkcs8', der, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(unsigned));
+    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const tokRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=' + encodeURIComponent(unsigned + '.' + sigB64),
+    });
+    const tok = await tokRes.json().catch(() => null);
+    if (!tok || !tok.access_token) return { verified: false, reason: 'token_exchange_failed' };
+    const pkg = 'com.hozinking.gameTTT.TapTapTycoon';
+    const decRes = await fetch(`https://playintegrity.googleapis.com/v1/${pkg}:decodeIntegrityToken`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + tok.access_token },
+      body: JSON.stringify({ integrityToken: token }),
+    });
+    const dec = await decRes.json().catch(() => null);
+    const payload = dec && dec.tokenPayloadExternal;
+    if (!payload) return { verified: false, reason: 'decode_failed' };
+    const deviceVerdicts = (payload.deviceIntegrity && payload.deviceIntegrity.deviceRecognitionVerdict) || [];
+    const appVerdict = (payload.appIntegrity && payload.appIntegrity.appRecognitionVerdict) || '';
+    const status = deviceVerdicts.includes('MEETS_STRONG_INTEGRITY') ? 'strong'
+      : deviceVerdicts.includes('MEETS_DEVICE_INTEGRITY') ? 'device'
+      : deviceVerdicts.includes('MEETS_BASIC_INTEGRITY') ? 'basic' : 'failed';
+    return {
+      verified: true, status,
+      detail: JSON.stringify({ device: deviceVerdicts, app: appVerdict }).slice(0, 500),
+    };
+  } catch (e) {
+    return { verified: false, reason: 'error' };
+  }
+}
+
+
+// ---- Panel admin Tap Tap Tycoon (admin-batch, 18 Nov 2026) ----
+// Halaman /kendali/taptap: ringkasan + live + daftar pantau + redeem +
+// flag + riwayat per pengguna. Aksi lewat fetch ke /api/taptap/admin/*
+// (sesi admin cookie — pola yang sama dengan panel Cerpen API).
+async function renderTttAdminPanel(env, nav, notice) {
+  const db = env.BACKUP_DB;
+  if (!db) {
+    return `<h2>Tap Tap Tycoon</h2>${nav}<div class="card"><p>Database (stopwatch-db) tidak tersedia — panel tidak bisa dimuat.</p></div>`;
+  }
+  const wib = (v) => {
+    const n = Number(v || 0);
+    const ms = (n > 0 && n < 1e12) ? n * 1000 : n;
+    if (!ms) return '—';
+    return new Date(ms + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16);
+  };
+  const nowMs = Date.now();
+  const since = new Date(nowMs - TTT_ONLINE_WINDOW_MS).toISOString();
+  const dayAgo = new Date(nowMs - 24 * 3600 * 1000).toISOString();
+  const one = async (sql, ...args) => {
+    const r = await db.prepare(sql).bind(...args).first();
+    return Number(r && r.c) || 0;
+  };
+  const total = await one('SELECT COUNT(*) AS c FROM ttt_players');
+  const online = await one('SELECT COUNT(*) AS c FROM ttt_devices WHERE last_seen > ?', since);
+  const sessions = await one('SELECT COUNT(*) AS c FROM ttt_sessions WHERE started_at > ?', dayAgo);
+  const bans = await one("SELECT COUNT(*) AS c FROM ttt_players WHERE ban_type IN ('temp7', 'temp30', 'permanent')");
+  const watching = await one("SELECT COUNT(*) AS c FROM ttt_watchlist WHERE status = 'watching'");
+  const codes = await one('SELECT COUNT(*) AS c FROM ttt_redeem_codes WHERE active = 1');
+  const flags = await one('SELECT COUNT(*) AS c FROM ttt_flags WHERE reviewed = 0');
+  const live = await db.prepare(
+    'SELECT d.guest_id, d.account_id, d.device_model, d.app_version, d.is_rooted, d.is_emulator, d.integrity_status, d.last_seen, p.player_name, p.ban_type, p.ban_until FROM ttt_devices d LEFT JOIN ttt_players p ON p.account_id = d.account_id WHERE d.last_seen > ? ORDER BY d.last_seen DESC LIMIT 50'
+  ).bind(since).all();
+  const watch = await db.prepare(
+    "SELECT id, target_type, target_id, reason, score, evidence, status, created_at, updated_at FROM ttt_watchlist WHERE status = 'watching' ORDER BY score DESC, id DESC LIMIT 50"
+  ).all();
+  const codeRows = await db.prepare(
+    'SELECT code, benefit_type, benefit_value, max_uses, used_count, expires_at, active, created_by, created_at FROM ttt_redeem_codes ORDER BY created_at DESC LIMIT 100'
+  ).all();
+  const flagRows = await db.prepare(
+    'SELECT id, account_id, reason, details, created_at, reviewed FROM ttt_flags WHERE reviewed = 0 ORDER BY id DESC LIMIT 100'
+  ).all();
+  const liveHtml = (live.results || []).map((r) => {
+    const banned = taptapBanActive(r, nowMs);
+    const sig = [
+      Number(r.is_rooted) === 1 ? 'ROOT' : '',
+      Number(r.is_emulator) === 1 ? 'EMU' : '',
+      (r.integrity_status || 'unknown') !== 'unknown' ? 'INT:' + r.integrity_status : '',
+    ].filter(Boolean).join(' ');
+    return `<tr><td><a href="/kendali/taptap?user=${esc(r.account_id || '')}">${esc(r.player_name || '(tanpa nama)')}</a><br><span style="opacity:.6">${esc(r.account_id || '')}</span></td><td>${esc(r.device_model || '')}<br><span style="opacity:.6">${esc(r.app_version || '')}</span></td><td>${esc(sig) || '—'}</td><td>${banned ? '<b style="color:#dc2626">DIBLOKIR</b>' : 'aktif'}</td><td>${esc(r.last_seen || '')}</td></tr>`;
+  }).join('') || '<tr><td colspan="5">Tidak ada yang online.</td></tr>';
+  const watchHtml = (watch.results || []).map((r) => {
+    let ev = '';
+    try { const j = JSON.parse(r.evidence || '{}'); ev = j.similarity != null ? `mirip ${j.similarity}% vs ${esc(j.matches_banned || '')}` : esc(r.evidence || ''); } catch (e) { ev = esc(r.evidence || ''); }
+    return `<tr><td>${esc(r.target_type)}<br><b>${esc(r.target_id)}</b></td><td>${esc(r.reason)}</td><td>${Number(r.score) || 0}%</td><td style="font-size:12px">${ev}</td><td><button type="button" data-ttt="watchlist-clear" data-id="${r.id}">Bukan orang yang sama</button></td></tr>`;
+  }).join('') || '<tr><td colspan="5">Daftar pantau kosong.</td></tr>';
+  const codeHtml = (codeRows.results || []).map((r) => {
+    return `<tr><td><b>${esc(r.code)}</b></td><td>${esc(r.benefit_type)} +${Number(r.benefit_value).toLocaleString('id-ID')}</td><td>${Number(r.used_count)}/${Number(r.max_uses)}</td><td>${esc(r.expires_at || '—')}</td><td>${Number(r.active) === 1 ? 'aktif' : 'nonaktif'}</td><td>${Number(r.active) === 1 ? `<button type="button" data-ttt="redeem-deactivate" data-code="${esc(r.code)}">Nonaktifkan</button>` : ''}</td></tr>`;
+  }).join('') || '<tr><td colspan="6">Belum ada kode.</td></tr>';
+  const flagHtml = (flagRows.results || []).map((r) => {
+    return `<tr><td><a href="/kendali/taptap?user=${esc(r.account_id)}">${esc(r.account_id)}</a></td><td>${esc(r.reason)}</td><td style="font-size:12px">${esc((r.details || '').slice(0, 200))}</td><td>${esc(r.created_at || '')}</td></tr>`;
+  }).join('') || '<tr><td colspan="4">Tidak ada flag belum direview.</td></tr>';
+  return `<h2>Tap Tap Tycoon</h2>${nav}${notice}
+  <div class="card"><h3>Ringkasan</h3><p>
+  Pemain: <b>${total}</b> · Online sekarang: <b>${online}</b> · Sesi 24 jam: <b>${sessions}</b> ·
+  Ban aktif: <b>${bans}</b> · Dipantau: <b>${watching}</b> · Kode redeem aktif: <b>${codes}</b> ·
+  Flag belum direview: <b>${flags}</b></p>
+  <p style="font-size:13px;opacity:.7">Root / emulator / integritas gagal sendirian TIDAK PERNAH memicu auto-ban — hanya sinyal. Ban otomatis hanya dari skor perilaku ≥ ${TTT_BEHAVIOR_CONFIRM}% (naik dari pantauan ≥ ${TTT_BEHAVIOR_WATCH}%) atau pelanggaran skor/tap.</p></div>
+  <div class="card"><h3>Online sekarang (&lt; 3 menit)</h3><table><thead><tr><th>Pemain</th><th>Perangkat</th><th>Sinyal</th><th>Status</th><th>Terakhir terlihat</th></tr></thead><tbody>${liveHtml}</tbody></table></div>
+  <div class="card"><h3>Daftar pantau (perilaku / abuse)</h3><table><thead><tr><th>Target</th><th>Alasan</th><th>Skor</th><th>Bukti</th><th>Aksi</th></tr></thead><tbody>${watchHtml}</tbody></table></div>
+  <div class="card"><h3>Ban / Unban / Perintah paksa</h3>
+  <form id="ttt-ban-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">ID akun<input name="account_id" required pattern="[1-9][0-9]{7}" maxlength="8" placeholder="12345678"></label><label style="margin:0">Tipe<select name="ban_type"><option value="warning">warning</option><option value="temp7">temp7 (7 hari)</option><option value="temp30">temp30 (30 hari)</option><option value="permanent">permanent</option></select></label><label style="margin:0">Alasan<input name="reason" maxlength="200" placeholder="alasan ban"></label><button type="submit">Ban</button> <button type="button" id="ttt-unban-btn">Unban</button></form>
+  <form id="ttt-command-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-top:12px"><label style="margin:0">Target<select name="target_type"><option value="account">akun</option><option value="guest">guest</option></select></label><label style="margin:0">ID target<input name="target_id" required maxlength="40" placeholder="12345678 / ttt-guest-..."></label><label style="margin:0">Perintah<select name="command"><option value="kick">kick paksa</option><option value="crash">crash paksa</option></select></label><button type="submit">Kirim perintah</button></form>
+  <p style="font-size:13px;opacity:.7">Ban akun otomatis mencabut semua API key perangkatnya (anti-bypass); unban memulihkan key-nya. Perintah kick/crash dieksekusi aplikasi saat heartbeat/register berikutnya.</p></div>
+  <div class="card"><h3>Buat kode redeem</h3>
+  <form id="ttt-redeem-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">Manfaat<select name="benefit_type"><option value="energy">Energi</option><option value="savings">Tabungan</option></select></label><label style="margin:0">Nilai<input name="benefit_value" type="number" min="1" max="1000000000" value="100000" required></label><label style="margin:0">Maks pakai<input name="max_uses" type="number" min="1" max="10000" value="10" required></label><label style="margin:0">Kedaluarsa (opsional)<input name="expires_at" type="datetime-local"></label><label style="margin:0">Kode khusus (opsional)<input name="code" maxlength="20" placeholder="kosong = acak"></label><button type="submit">Buat kode</button></form>
+  <table style="margin-top:12px"><thead><tr><th>Kode</th><th>Manfaat</th><th>Terpakai</th><th>Kedaluarsa</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${codeHtml}</tbody></table></div>
+  <div class="card"><h3>Flag belum direview</h3><table><thead><tr><th>Akun</th><th>Alasan</th><th>Detail</th><th>Waktu</th></tr></thead><tbody>${flagHtml}</tbody></table></div>
+  <div class="card"><h3>Cari pengguna</h3>
+  <form method="get" action="/kendali/taptap" style="display:flex;gap:8px"><input name="user" pattern="[1-9][0-9]{7}" maxlength="8" placeholder="ID akun 8 digit" required><button type="submit">Lihat riwayat</button></form>
+  <p style="font-size:13px;opacity:.7">Riwayat lengkap (perangkat, sesi, ban, flag, redeem, pantauan, profil perilaku) juga tersedia lewat API: GET /api/taptap/admin/users/:id — dan kemiripan perilaku lewat GET /api/taptap/admin/behavior/:id.</p></div>
+  <script>
+  (function(){
+    async function post(path, body){
+      const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(body) });
+      const j = await r.json().catch(function(){ return {}; });
+      if (!r.ok) { alert('Gagal: ' + (j.error || r.status)); return null; }
+      return j;
+    }
+    function bindForm(id, fn){
+      const f = document.getElementById(id);
+      if (!f) return;
+      f.addEventListener('submit', async function(e){
+        e.preventDefault();
+        const d = {};
+        new FormData(f).forEach(function(v, k){ d[k] = v; });
+        const ok = await fn(d);
+        if (ok !== false) location.reload();
+      });
+    }
+    bindForm('ttt-ban-form', async function(d){
+      return post('/api/taptap/admin/ban', { account_id: d.account_id, ban_type: d.ban_type, reason: d.reason || '' });
+    });
+    bindForm('ttt-command-form', async function(d){
+      return post('/api/taptap/admin/command', { target_type: d.target_type, target_id: d.target_id, command: d.command });
+    });
+    bindForm('ttt-redeem-form', async function(d){
+      const body = { benefit_type: d.benefit_type, benefit_value: Number(d.benefit_value), max_uses: Number(d.max_uses) };
+      if (d.expires_at) body.expires_at = new Date(d.expires_at).toISOString();
+      if (d.code) body.code = d.code.toUpperCase();
+      const j = await post('/api/taptap/admin/redeem/create', body);
+      if (j) alert('Kode dibuat: ' + j.code);
+      return j;
+    });
+    const unbanBtn = document.getElementById('ttt-unban-btn');
+    if (unbanBtn) unbanBtn.addEventListener('click', async function(){
+      const id = document.querySelector('#ttt-ban-form input[name="account_id"]').value.trim();
+      if (!id) { alert('Isi ID akun dulu.'); return; }
+      const j = await post('/api/taptap/admin/unban', { account_id: id });
+      if (j) location.reload();
+    });
+    document.addEventListener('click', async function(e){
+      const b = e.target.closest('[data-ttt]');
+      if (!b) return;
+      const action = b.getAttribute('data-ttt');
+      if (action === 'watchlist-clear') {
+        if (!confirm('Tandai entri ini sebagai BUKAN orang yang sama (dihapus dari pantauan)?')) return;
+        const j = await post('/api/taptap/admin/watchlist/clear', { id: Number(b.getAttribute('data-id')) });
+        if (j) location.reload();
+      }
+      if (action === 'redeem-deactivate') {
+        if (!confirm('Nonaktifkan kode ' + b.getAttribute('data-code') + '?')) return;
+        const j = await post('/api/taptap/admin/redeem/deactivate', { code: b.getAttribute('data-code') });
+        if (j) location.reload();
+      }
+    });
+  })();
+  <\/script>`;
+}
+
 async function handleTapTap(request, env, url) {
   // BACKUP_DB -> stopwatch-db. TIDAK ada fallback ke env.DB (cms-db):
   // data TTT wajib tinggal di database yang sama dengan Cerpen.
@@ -1114,6 +1559,7 @@ async function handleTapTap(request, env, url) {
   // 1 SELECT (PK) + 1 UPDATE. Tanpa ticking per pemain, tanpa polling.
   if (request.method === 'POST' && seg === 'claim') {
     if (!(await checkRateLimit(env, 'taptap-claim:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const __kb = await tttCheckApiKey(request, db); if (__kb) return __kb;
     const b = await request.json().catch(() => null);
     if (!b || !taptapValidAccountId(b.account_id)) {
       return taptapJson({ error: 'bad_account_id' }, 400);
@@ -1174,6 +1620,7 @@ async function handleTapTap(request, env, url) {
   // periode blokir tetap tidak masuk — klaim-lah yang membayar AFK).
   if (request.method === 'POST' && seg === 'profile' && !parts[3]) {
     if (!(await checkRateLimit(env, 'taptap-profile:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const __kb = await tttCheckApiKey(request, db); if (__kb) return __kb;
     const b = await request.json().catch(() => null);
     if (!b || !taptapValidAccountId(b.account_id)) {
       return taptapJson({ error: 'bad_account_id' }, 400);
@@ -1221,6 +1668,7 @@ async function handleTapTap(request, env, url) {
   // boleh; <30 hari -> 403 region_change_cooldown + next_change_at).
   if (request.method === 'POST' && seg === 'profile' && parts[3] === 'region') {
     if (!(await checkRateLimit(env, 'taptap-region:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const __kb = await tttCheckApiKey(request, db); if (__kb) return __kb;
     const b = await request.json().catch(() => null);
     if (!b || !taptapValidAccountId(b.account_id)) {
       return taptapJson({ error: 'bad_account_id' }, 400);
@@ -1260,6 +1708,7 @@ async function handleTapTap(request, env, url) {
   // PATCH /api/taptap/profile/:id/like
   if (request.method === 'PATCH' && seg === 'profile' && parts[3] && parts[4] === 'like') {
     if (!(await checkRateLimit(env, 'taptap-like:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const __kb = await tttCheckApiKey(request, db); if (__kb) return __kb;
     const row = await db.prepare(
       'UPDATE ttt_players SET likes = likes + 1, updated_at = ? WHERE account_id = ? RETURNING likes'
     ).bind(now, parts[3]).first();
@@ -1291,6 +1740,7 @@ async function handleTapTap(request, env, url) {
   // v1.1.0: pengirim yang sedang diblokir aktif -> 403 banned.
   if (request.method === 'POST' && seg === 'chat') {
     if (!(await checkRateLimit(env, 'taptap-chat:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const __kb = await tttCheckApiKey(request, db); if (__kb) return __kb;
     const b = await request.json().catch(() => null);
     if (!b || !taptapValidAccountId(b.sender_id) ||
         typeof b.message !== 'string' || b.message.trim().length === 0) {
@@ -1333,6 +1783,12 @@ async function handleTapTap(request, env, url) {
       await db.prepare(
         'INSERT INTO ttt_bans (account_id, ban_type, reason, created_by, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
       ).bind(b.account_id, b.ban_type, reason, 'admin', now, until, '').run();
+      // Paket admin: ban aktif -> semua API key perangkat akun ini
+      // dicabut (anti-bypass: aplikasi mod / install ulang dari
+      // perangkat yang sama tidak bisa dapat key baru selama banned).
+      if (TAPTAP_BAN_BLOCKING.includes(b.ban_type)) {
+        await tttRevokeKeysForAccount(db, b.account_id, 'banned:' + b.ban_type);
+      }
       return taptapJson({ ok: true, ban: { type: b.ban_type, reason, until } });
     }
     // POST /api/taptap/admin/unban {account_id} — bersihkan field ban +
@@ -1349,6 +1805,8 @@ async function handleTapTap(request, env, url) {
       ).bind(b.account_id).first();
       if (!row) return taptapJson({ error: 'not_found' }, 404);
       await taptapClearBan(db, b.account_id);
+      // Paket admin: unban -> pulihkan key perangkat akun ini.
+      await tttRestoreKeysForAccount(db, b.account_id);
       const latest = await db.prepare(
         'SELECT id FROM ttt_bans WHERE account_id = ? AND revoked_at = ? ORDER BY id DESC LIMIT 1'
       ).bind(b.account_id, '').first();
@@ -1368,6 +1826,257 @@ async function handleTapTap(request, env, url) {
       ).all();
       return taptapJson({ flags: results || [] });
     }
+
+    // ---- Paket admin: redeem codes (admin-batch) ----
+    // POST /api/taptap/admin/redeem/create {benefit_type, benefit_value, max_uses, expires_at?, code?}
+    if (request.method === 'POST' && sub === 'redeem' && parts[4] === 'create') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const b = await request.json().catch(() => null);
+      if (!b || !TTT_REDEEM_TYPES.includes(b.benefit_type)) {
+        return taptapJson({ error: 'bad_request' }, 400);
+      }
+      const value = Number(b.benefit_value);
+      if (!Number.isFinite(value) || value <= 0 || value > TTT_REDEEM_MAX_VALUE) {
+        return taptapJson({ error: 'bad_benefit_value' }, 400);
+      }
+      const maxUses = Math.floor(Number(b.max_uses) || 1);
+      if (maxUses < 1 || maxUses > 10000) return taptapJson({ error: 'bad_max_uses' }, 400);
+      let code = String(b.code || '').trim().toUpperCase();
+      if (code && !/^[A-Z0-9-]{4,20}$/.test(code)) return taptapJson({ error: 'bad_code' }, 400);
+      if (!code) code = tttRandomCode();
+      const exists = await db.prepare('SELECT code FROM ttt_redeem_codes WHERE code = ?').bind(code).first();
+      if (exists) return taptapJson({ error: 'code_exists' }, 409);
+      const expiresAt = String(b.expires_at || '');
+      if (expiresAt && !Number.isFinite(Date.parse(expiresAt))) {
+        return taptapJson({ error: 'bad_expires_at' }, 400);
+      }
+      await db.prepare(
+        'INSERT INTO ttt_redeem_codes (code, benefit_type, benefit_value, max_uses, used_count, expires_at, active, created_by, created_at) VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?)'
+      ).bind(code, b.benefit_type, value, maxUses, expiresAt, 'admin', now).run();
+      return taptapJson({ ok: true, code, benefit_type: b.benefit_type, benefit_value: value, max_uses: maxUses, expires_at: expiresAt });
+    }
+    // GET /api/taptap/admin/redeem/list — semua kode + pemakaian.
+    if (request.method === 'GET' && sub === 'redeem' && parts[4] === 'list') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const { results } = await db.prepare(
+        'SELECT code, benefit_type, benefit_value, max_uses, used_count, expires_at, active, created_by, created_at FROM ttt_redeem_codes ORDER BY created_at DESC LIMIT 100'
+      ).all();
+      return taptapJson({ codes: results || [] });
+    }
+    // POST /api/taptap/admin/redeem/deactivate {code}
+    if (request.method === 'POST' && sub === 'redeem' && parts[4] === 'deactivate') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const b = await request.json().catch(() => null);
+      if (!b || !b.code) return taptapJson({ error: 'bad_request' }, 400);
+      await db.prepare(
+        'UPDATE ttt_redeem_codes SET active = 0 WHERE code = ?'
+      ).bind(String(b.code).trim().toUpperCase()).run();
+      return taptapJson({ ok: true });
+    }
+    // ---- Paket admin: perintah paksa (admin-batch) ----
+    // POST /api/taptap/admin/command {target_type: guest|account, target_id, command: kick|crash}
+    // Dieksekusi aplikasi saat register/heartbeat/status berikutnya.
+    if (request.method === 'POST' && sub === 'command') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const b = await request.json().catch(() => null);
+      if (!b || !['guest', 'account'].includes(b.target_type) || !b.target_id || !['kick', 'crash'].includes(b.command)) {
+        return taptapJson({ error: 'bad_request' }, 400);
+      }
+      const targetId = String(b.target_id);
+      if (b.target_type === 'account' && !taptapValidAccountId(targetId)) {
+        return taptapJson({ error: 'bad_account_id' }, 400);
+      }
+      if (b.target_type === 'guest' && !tttValidGuestId(targetId)) {
+        return taptapJson({ error: 'bad_guest_id' }, 400);
+      }
+      const res = await db.prepare(
+        "INSERT INTO ttt_commands (target_type, target_id, command, status, created_by, created_at, delivered_at) VALUES (?, ?, ?, 'pending', ?, ?, '')"
+      ).bind(b.target_type, targetId, b.command, 'admin', now).run();
+      return taptapJson({ ok: true, id: (res.meta && res.meta.last_row_id) || 0 });
+    }
+    // GET /api/taptap/admin/commands?status=pending|delivered
+    if (request.method === 'GET' && sub === 'commands') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const status = url.searchParams.get('status') || 'pending';
+      if (!['pending', 'delivered'].includes(status)) return taptapJson({ error: 'bad_status' }, 400);
+      const { results } = await db.prepare(
+        'SELECT id, target_type, target_id, command, status, created_by, created_at, delivered_at FROM ttt_commands WHERE status = ? ORDER BY id DESC LIMIT 100'
+      ).bind(status).all();
+      return taptapJson({ commands: results || [] });
+    }
+    // ---- Paket admin: panel live + ringkasan (admin-batch) ----
+    // GET /api/taptap/admin/live — perangkat online (< 3 menit) + sesi aktif.
+    if (request.method === 'GET' && sub === 'live') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const since = new Date(Date.now() - TTT_ONLINE_WINDOW_MS).toISOString();
+      const { results } = await db.prepare(
+        'SELECT d.guest_id, d.account_id, d.device_model, d.app_version, d.is_rooted, d.is_emulator, d.integrity_status, d.last_seen, p.player_name, p.total_energy_all_time, p.ban_type, p.ban_until FROM ttt_devices d LEFT JOIN ttt_players p ON p.account_id = d.account_id WHERE d.last_seen > ? ORDER BY d.last_seen DESC LIMIT 100'
+      ).bind(since).all();
+      const nowMs = Date.now();
+      return taptapJson({
+        online: (results || []).map((r) => ({
+          guest_id: r.guest_id, account_id: r.account_id || '',
+          player_name: r.player_name || '', device_model: r.device_model || '',
+          app_version: r.app_version || '', is_rooted: Number(r.is_rooted) === 1,
+          is_emulator: Number(r.is_emulator) === 1,
+          integrity_status: r.integrity_status || 'unknown',
+          last_seen: r.last_seen || '',
+          total_energy_all_time: Number(r.total_energy_all_time) || 0,
+          banned: taptapBanActive(r, nowMs),
+        })),
+      });
+    }
+    // GET /api/taptap/admin/summary — angka ringkas panel.
+    if (request.method === 'GET' && sub === 'summary') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const since = new Date(Date.now() - TTT_ONLINE_WINDOW_MS).toISOString();
+      const dayAgo = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+      const total = await db.prepare('SELECT COUNT(*) AS c FROM ttt_players').first();
+      const online = await db.prepare('SELECT COUNT(*) AS c FROM ttt_devices WHERE last_seen > ?').bind(since).first();
+      const sessions = await db.prepare('SELECT COUNT(*) AS c FROM ttt_sessions WHERE started_at > ?').bind(dayAgo).first();
+      const bans = await db.prepare("SELECT COUNT(*) AS c FROM ttt_players WHERE ban_type IN ('temp7', 'temp30', 'permanent')").first();
+      const watch = await db.prepare("SELECT COUNT(*) AS c FROM ttt_watchlist WHERE status = 'watching'").first();
+      const codes = await db.prepare('SELECT COUNT(*) AS c FROM ttt_redeem_codes WHERE active = 1').first();
+      const flags = await db.prepare('SELECT COUNT(*) AS c FROM ttt_flags WHERE reviewed = 0').first();
+      return taptapJson({
+        total_players: Number(total && total.c) || 0,
+        online_now: Number(online && online.c) || 0,
+        sessions_24h: Number(sessions && sessions.c) || 0,
+        active_bans: Number(bans && bans.c) || 0,
+        watching: Number(watch && watch.c) || 0,
+        active_codes: Number(codes && codes.c) || 0,
+        unreviewed_flags: Number(flags && flags.c) || 0,
+      });
+    }
+    // GET /api/taptap/admin/users/:id — riwayat lengkap satu pengguna.
+    if (request.method === 'GET' && sub === 'users' && parts[4]) {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const id = parts[4];
+      const player = await db.prepare('SELECT * FROM ttt_players WHERE account_id = ?').bind(id).first();
+      if (!player) return taptapJson({ error: 'not_found' }, 404);
+      const devices = await db.prepare(
+        'SELECT guest_id, device_model, android_version, app_version, key_status, is_rooted, root_methods, is_emulator, integrity_status, first_seen, last_seen FROM ttt_devices WHERE account_id = ? ORDER BY last_seen DESC LIMIT 20'
+      ).bind(id).all();
+      const sessions = await db.prepare(
+        'SELECT session_id, guest_id, started_at, last_seen_at, ended_at, app_version FROM ttt_sessions WHERE account_id = ? ORDER BY started_at DESC LIMIT 20'
+      ).bind(id).all();
+      const bans = await db.prepare(
+        'SELECT id, ban_type, reason, created_by, created_at, expires_at, revoked_at FROM ttt_bans WHERE account_id = ? ORDER BY id DESC LIMIT 20'
+      ).bind(id).all();
+      const flags = await db.prepare(
+        'SELECT id, reason, details, created_at, reviewed FROM ttt_flags WHERE account_id = ? ORDER BY id DESC LIMIT 20'
+      ).bind(id).all();
+      const redeems = await db.prepare(
+        'SELECT code, benefit_type, benefit_value, status, redeemed_at FROM ttt_redeem_log WHERE account_id = ? ORDER BY id DESC LIMIT 20'
+      ).bind(id).all();
+      const watch = await db.prepare(
+        "SELECT id, reason, score, evidence, status, created_at, updated_at FROM ttt_watchlist WHERE target_id = ? ORDER BY id DESC LIMIT 20"
+      ).bind(id).all();
+      const behavior = await db.prepare(
+        'SELECT profile_json, updated_at FROM ttt_behavior WHERE target_id = ?'
+      ).bind(id).first();
+      return taptapJson({
+        ok: true,
+        player: {
+          account_id: player.account_id, player_name: player.player_name,
+          score: player.score, total_energy_all_time: player.total_energy_all_time,
+          levels: player.levels, likes: player.likes,
+          province_code: player.province_code || '', regency_code: player.regency_code || '',
+          district_code: player.district_code || '',
+          ban: taptapBanInfo(player), ban_warning: player.ban_type === 'warning',
+          savings: Number(player.savings) || 0, last_seen_at: player.last_seen_at || '',
+          updated_at: player.updated_at || '',
+        },
+        devices: (devices.results || []),
+        sessions: (sessions.results || []),
+        bans: (bans.results || []),
+        flags: (flags.results || []),
+        redeems: (redeems.results || []),
+        watchlist: (watch.results || []),
+        behavior: behavior && behavior.profile_json ? JSON.parse(behavior.profile_json) : null,
+      });
+    }
+    // ---- Paket admin: daftar pantau (admin-batch) ----
+    // GET /api/taptap/admin/watchlist — entri status 'watching'.
+    if (request.method === 'GET' && sub === 'watchlist') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const { results } = await db.prepare(
+        "SELECT id, target_type, target_id, reason, score, evidence, status, created_at, updated_at FROM ttt_watchlist WHERE status = 'watching' ORDER BY score DESC, id DESC LIMIT 100"
+      ).all();
+      return taptapJson({ watchlist: results || [] });
+    }
+    // POST /api/taptap/admin/watchlist/clear {id, note?} — "bukan orang yang sama".
+    if (request.method === 'POST' && sub === 'watchlist' && parts[4] === 'clear') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const b = await request.json().catch(() => null);
+      if (!b || !b.id) return taptapJson({ error: 'bad_request' }, 400);
+      await db.prepare(
+        "UPDATE ttt_watchlist SET status = 'cleared', updated_at = ? WHERE id = ?"
+      ).bind(now, Number(b.id)).run();
+      return taptapJson({ ok: true });
+    }
+    // ---- Paket admin: cabut / pulihkan API key (admin-batch) ----
+    // POST /api/taptap/admin/revoke-key {guest_id, reason} — perangkat
+    // tidak bisa lagi memakai key lama DAN tidak bisa register ulang
+    // (register mengembalikan 403 key_revoked) sampai di-unrevoke.
+    if (request.method === 'POST' && sub === 'revoke-key') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const b = await request.json().catch(() => null);
+      if (!b || !tttValidGuestId(b.guest_id)) return taptapJson({ error: 'bad_request' }, 400);
+      await db.prepare(
+        "UPDATE ttt_devices SET key_status = 'revoked', key_revoked_reason = ? WHERE guest_id = ?"
+      ).bind(String(b.reason || 'dicabut admin').slice(0, 200), b.guest_id).run();
+      return taptapJson({ ok: true });
+    }
+    // POST /api/taptap/admin/unrevoke-key {guest_id}
+    if (request.method === 'POST' && sub === 'unrevoke-key') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const b = await request.json().catch(() => null);
+      if (!b || !tttValidGuestId(b.guest_id)) return taptapJson({ error: 'bad_request' }, 400);
+      await db.prepare(
+        "UPDATE ttt_devices SET key_status = 'active', key_revoked_reason = '' WHERE guest_id = ?"
+      ).bind(b.guest_id).run();
+      return taptapJson({ ok: true });
+    }
+    // GET /api/taptap/admin/behavior/:id — profil perilaku + kemiripan vs banned.
+    if (request.method === 'GET' && sub === 'behavior' && parts[4]) {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const id = parts[4];
+      const row = await db.prepare(
+        'SELECT profile_json, updated_at FROM ttt_behavior WHERE target_id = ?'
+      ).bind(id).first();
+      if (!row || !row.profile_json) return taptapJson({ error: 'not_found' }, 404);
+      let profile = null;
+      try { profile = JSON.parse(row.profile_json); } catch (e) { return taptapJson({ error: 'bad_profile' }, 500); }
+      const bannedProfiles = await tttBannedProfiles(db, Date.now());
+      const matches = bannedProfiles
+        .filter((bp) => bp.target_id !== id)
+        .map((bp) => ({
+          target_id: bp.target_id,
+          similarity: tttBehaviorSimilarity(profile, bp.profile),
+          breakdown: tttBehaviorBreakdown(profile, bp.profile),
+        }))
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, 5);
+      const watch = await db.prepare(
+        'SELECT id, reason, score, evidence, status, created_at, updated_at FROM ttt_watchlist WHERE target_id = ? ORDER BY id DESC LIMIT 20'
+      ).bind(id).all();
+      return taptapJson({ ok: true, target_id: id, profile, updated_at: row.updated_at || '', matches, watchlist: (watch.results || []) });
+    }
+
     return taptapJson({ error: 'not_found' }, 404);
   }
 
@@ -1400,6 +2109,7 @@ async function handleTapTap(request, env, url) {
   // setor tidak boleh melebihi skor + bunga terakru. Banned aktif -> 403.
   if (request.method === 'POST' && seg === 'savings' && parts[3] === 'deposit') {
     if (!(await checkRateLimit(env, 'taptap-savings:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const __kb = await tttCheckApiKey(request, db); if (__kb) return __kb;
     const b = await request.json().catch(() => null);
     if (!b || !taptapValidAccountId(b.account_id)) {
       return taptapJson({ error: 'bad_account_id' }, 400);
@@ -1444,6 +2154,7 @@ async function handleTapTap(request, env, url) {
   // (otoritatif). Bunga terakru ikut di-settle ke skor.
   if (request.method === 'POST' && seg === 'savings' && parts[3] === 'withdraw') {
     if (!(await checkRateLimit(env, 'taptap-savings:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const __kb = await tttCheckApiKey(request, db); if (__kb) return __kb;
     const b = await request.json().catch(() => null);
     if (!b || !taptapValidAccountId(b.account_id)) {
       return taptapJson({ error: 'bad_account_id' }, 400);
@@ -1482,6 +2193,388 @@ async function handleTapTap(request, env, url) {
       ok: true, savings: newSavings, savings_updated_at: now,
       score: newScore, total_energy_all_time: newTotal, interest_earned: sv.interest,
     });
+  }
+
+
+  // ---- Paket admin: register guest + API key (admin-batch) ----
+  // POST /api/taptap/register — buat/kenali perangkat, rotasi API key.
+  // Key disimpan HANYA hash-nya (SHA-256); key mentah dikembalikan
+  // SEKALI ke aplikasi. Bila fingerprint cocok perangkat banned ->
+  // banned (tanpa key baru). Bila key perangkat dicabut admin -> 403.
+  if (request.method === 'POST' && seg === 'register') {
+    if (!(await checkRateLimit(env, 'taptap-register:' + clientIp(request), 30, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const b = await request.json().catch(() => null);
+    if (!b) return taptapJson({ error: 'bad_request' }, 400);
+    const accountId = String(b.account_id || '');
+    if (accountId && !taptapValidAccountId(accountId)) {
+      return taptapJson({ error: 'bad_account_id' }, 400);
+    }
+    const fingerprint = String(b.fingerprint || '').slice(0, 128);
+    if (!fingerprint) return taptapJson({ error: 'bad_fingerprint' }, 400);
+    const nowMs = Date.now();
+    let device = null;
+    if (b.guest_id && tttValidGuestId(b.guest_id)) {
+      device = await db.prepare('SELECT * FROM ttt_devices WHERE guest_id = ?').bind(b.guest_id).first();
+    }
+    if (!device) {
+      device = await db.prepare('SELECT * FROM ttt_devices WHERE fingerprint_hash = ?').bind(fingerprint).first();
+    }
+    if (device) {
+      const ban = await tttBanForDevice(db, device, nowMs);
+      if (ban) {
+        return taptapJson({
+          ok: true, guest_id: device.guest_id, banned: true,
+          ban_type: ban.type, reason: ban.reason,
+          expires_at: ban.until || null, commands: [],
+        });
+      }
+      if (device.key_status === 'revoked') {
+        return taptapJson({ error: 'key_revoked', reason: device.key_revoked_reason || '' }, 403);
+      }
+    }
+    // Rotasi key: kunci baru tiap register; kunci lama langsung mati.
+    const apiKey = tttRandomHex(32);
+    const keyHash = await tttSha256Hex(apiKey);
+    const guestId = device ? device.guest_id : 'ttt-guest-' + tttRandomHex(8);
+    const firstSeen = device ? (device.first_seen || now) : now;
+    const rootMethods = Array.isArray(b.root_methods) ? b.root_methods.slice(0, 5).join(',') : '';
+    await db.prepare(
+      `INSERT INTO ttt_devices
+         (guest_id, account_id, fingerprint_hash, device_model, android_version, app_version, api_key_hash, key_status, key_revoked_reason, is_rooted, root_methods, is_emulator, emulator_detail, bootloader_locked, integrity_status, integrity_detail, first_seen, last_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(guest_id) DO UPDATE SET
+         account_id = excluded.account_id, fingerprint_hash = excluded.fingerprint_hash,
+         device_model = excluded.device_model, android_version = excluded.android_version,
+         app_version = excluded.app_version, api_key_hash = excluded.api_key_hash,
+         key_status = 'active', key_revoked_reason = '',
+         is_rooted = excluded.is_rooted, root_methods = excluded.root_methods,
+         is_emulator = excluded.is_emulator, emulator_detail = excluded.emulator_detail,
+         bootloader_locked = excluded.bootloader_locked, last_seen = excluded.last_seen`
+    ).bind(
+      guestId, accountId, fingerprint,
+      String(b.device_model || '').slice(0, 80),
+      String(b.android_version || '').slice(0, 40),
+      String(b.app_version || '').slice(0, 40),
+      keyHash, b.is_rooted ? 1 : 0, rootMethods,
+      b.is_emulator ? 1 : 0, String(b.emulator_detail || '').slice(0, 120),
+      b.bootloader_locked ? 1 : 0,
+      device ? (device.integrity_status || 'unknown') : 'unknown',
+      device ? (device.integrity_detail || '') : '',
+      firstSeen, now
+    ).run();
+    // Akun yang baru ditautkan mungkin ternyata sedang diblokir.
+    let banAfter = null;
+    if (accountId) {
+      const row = await db.prepare(
+        'SELECT ban_type, ban_reason, ban_until FROM ttt_players WHERE account_id = ?'
+      ).bind(accountId).first();
+      if (row && taptapBanActive(row, nowMs)) {
+        banAfter = { type: row.ban_type, reason: row.ban_reason || '', until: row.ban_until || '' };
+      }
+    }
+    const commands = await tttDeliverCommands(db, guestId, accountId, now);
+    return taptapJson({
+      ok: true, guest_id: guestId, api_key: apiKey,
+      banned: !!banAfter,
+      ban_type: banAfter ? banAfter.type : '',
+      reason: banAfter ? banAfter.reason : '',
+      expires_at: banAfter ? (banAfter.until || null) : null,
+      commands,
+    });
+  }
+
+  // ---- Paket admin: heartbeat (admin-batch) ----
+  // POST /api/taptap/heartbeat — presence + statistik tap + sesi.
+  // WAJIB API key. Menjalankan: cek banned, deteksi abuse (laju tap /
+  // sesi bersamaan), update profil perilaku + pencocokan vs banned,
+  // antar perintah tertunda.
+  if (request.method === 'POST' && seg === 'heartbeat') {
+    if (!(await checkRateLimit(env, 'taptap-heartbeat:' + clientIp(request), 120, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const b = await request.json().catch(() => null);
+    if (!b) return taptapJson({ error: 'bad_request' }, 400);
+    const accountId = String(b.account_id || '');
+    if (accountId && !taptapValidAccountId(accountId)) {
+      return taptapJson({ error: 'bad_account_id' }, 400);
+    }
+    // Cek banned DULU tanpa key: akun diblokir harus selalu menerima
+    // sinyal banned (agar aplikasi tampilkan layar banned) meski key-nya
+    // sudah dicabut server saat ban.
+    const preGuestId = String(b.guest_id || '').trim();
+    if (preGuestId) {
+      const preDev = await db.prepare('SELECT * FROM ttt_devices WHERE guest_id = ?').bind(preGuestId).first();
+      const preAcc = accountId || (preDev && preDev.account_id) || '';
+      if (preAcc) {
+        const preBan = await taptapGetBan(db, preAcc);
+        if (preBan && taptapBanActive(preBan, Date.now())) {
+          return taptapJson({
+            ok: true, banned: true, ban_type: preBan.ban_type, reason: preBan.ban_reason || '',
+            expires_at: preBan.ban_until || null, commands: [],
+          });
+        }
+      }
+    }
+    const keyed = await tttRequireKey(request, db);
+    if (!keyed.device) return keyed;
+    const device = keyed.device;
+    if (b.guest_id && b.guest_id !== device.guest_id) {
+      return taptapJson({ error: 'guest_mismatch' }, 403);
+    }
+    const nowMs = Date.now();
+    const ban = await tttBanForDevice(db, device, nowMs);
+    if (ban) {
+      return taptapJson({
+        ok: true, banned: true, ban_type: ban.type, reason: ban.reason,
+        expires_at: ban.until || null, commands: [],
+      });
+    }
+    // Presence + sesi.
+    const sessionId = String(b.session_id || '').slice(0, 64);
+    const sessionStartedAt = Number(b.session_started_at) || nowMs;
+    await db.prepare(
+      'UPDATE ttt_devices SET last_seen = ?, account_id = ? WHERE guest_id = ?'
+    ).bind(now, accountId || device.account_id || '', device.guest_id).run();
+    if (sessionId) {
+      await db.prepare(
+        `INSERT INTO ttt_sessions (session_id, guest_id, account_id, started_at, last_seen_at, ended_at, app_version)
+         VALUES (?, ?, ?, ?, ?, '', ?) ON CONFLICT(session_id) DO UPDATE SET last_seen_at = excluded.last_seen_at`
+      ).bind(
+        sessionId, device.guest_id, accountId || device.account_id || '',
+        new Date(sessionStartedAt).toISOString(), now,
+        String(b.app_version || device.app_version || '').slice(0, 40)
+      ).run();
+    }
+    // Deteksi abuse: laju tap mustahil manusia + sesi bersamaan.
+    // Alasan yang terpicu dikembalikan di `flagged` (diagnosis; aplikasi
+    // tidak perlu bereaksi — flag hanya jejak untuk panel admin).
+    const flagged = [];
+    const maxTps = Number(b.max_taps_per_sec) || 0;
+    const taps60 = Number(b.taps_last_60s) || 0;
+    const targetId = accountId || device.guest_id;
+    const targetType = accountId ? 'account' : 'guest';
+    if (maxTps > TTT_TAP_RATE_FLAG || taps60 > TTT_TAPS_MIN_FLAG) {
+      const reason = maxTps > TTT_TAP_RATE_FLAG ? 'tap_rate_impossible' : 'tap_volume_impossible';
+      flagged.push(reason);
+      const details = JSON.stringify({ max_taps_per_sec: maxTps, taps_last_60s: taps60, guest_id: device.guest_id });
+      if (accountId && !(await tttRecentlyFlagged(db, accountId, reason, nowMs))) {
+        await taptapInsertFlag(db, accountId, reason, details, now);
+      }
+      const w = await db.prepare(
+        "SELECT id FROM ttt_watchlist WHERE target_type = ? AND target_id = ? AND status = 'watching'"
+      ).bind(targetType, targetId).first();
+      if (!w) {
+        await db.prepare(
+          'INSERT INTO ttt_watchlist (target_type, target_id, reason, score, evidence, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(targetType, targetId, reason, 40, details, 'watching', now, now).run();
+      }
+    }
+    if (accountId) {
+      const conc = await db.prepare(
+        'SELECT COUNT(DISTINCT guest_id) AS c FROM ttt_sessions WHERE account_id = ? AND last_seen_at > ? AND (ended_at = ? OR ended_at = ?)'
+      ).bind(accountId, new Date(nowMs - TTT_ONLINE_WINDOW_MS).toISOString(), '', null).first();
+      if (conc && Number(conc.c) > 1) {
+        flagged.push('concurrent_sessions');
+        if (!(await tttRecentlyFlagged(db, accountId, 'concurrent_sessions', nowMs))) {
+          await taptapInsertFlag(db, accountId, 'concurrent_sessions', JSON.stringify({ guests: Number(conc.c) }), now);
+        }
+      }
+    }
+    // Profil perilaku + pencocokan vs profil banned.
+    const wibHour = new Date(nowMs + 7 * 3600 * 1000).getUTCHours();
+    const sessionMin = Math.max(0, (nowMs - sessionStartedAt) / 60000);
+    const profile = await tttUpdateBehavior(db, targetType, targetId, {
+      session_min: Math.min(sessionMin, 600),
+      taps_per_min: taps60,
+      max_taps_per_sec: maxTps,
+      peak_hour: wibHour,
+    }, now, nowMs);
+    let autoBanned = null;
+    const bannedProfiles = await tttBannedProfiles(db, nowMs);
+    let best = { score: 0, target: null, breakdown: null };
+    for (const bp of bannedProfiles) {
+      if (bp.target_id === targetId) continue;
+      const s = tttBehaviorSimilarity(profile, bp.profile);
+      if (s > best.score) best = { score: s, target: bp.target_id, breakdown: tttBehaviorBreakdown(profile, bp.profile) };
+    }
+    if (best.score >= TTT_BEHAVIOR_WATCH) {
+      const w = await db.prepare(
+        "SELECT id, score FROM ttt_watchlist WHERE target_type = ? AND target_id = ? AND status = 'watching'"
+      ).bind(targetType, targetId).first();
+      const evidence = JSON.stringify({
+        similarity: best.score, matches_banned: best.target,
+        breakdown: best.breakdown, at: now,
+      });
+      if (!w) {
+        await db.prepare(
+          'INSERT INTO ttt_watchlist (target_type, target_id, reason, score, evidence, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(targetType, targetId, 'behavior_match', best.score, evidence, 'watching', now, now).run();
+      } else {
+        await db.prepare(
+          'UPDATE ttt_watchlist SET score = ?, evidence = ?, updated_at = ? WHERE id = ?'
+        ).bind(best.score, evidence, now, w.id).run();
+        // Skor terus naik sampai ambang konfirmasi -> itu orang yang sama.
+        if (best.score >= TTT_BEHAVIOR_CONFIRM && accountId) {
+          const row = await db.prepare('SELECT * FROM ttt_players WHERE account_id = ?').bind(accountId).first();
+          if (row && !taptapBanActive(row, nowMs)) {
+            const until = new Date(nowMs + 30 * 24 * 3600 * 1000).toISOString();
+            await db.prepare(
+              'UPDATE ttt_players SET ban_type = ?, ban_reason = ?, ban_until = ?, ban_created_at = ?, updated_at = ? WHERE account_id = ?'
+            ).bind('temp30', 'pola perilaku cocok dengan akun banned (' + best.score + '%)', until, now, now, accountId).run();
+            await db.prepare(
+              'INSERT INTO ttt_bans (account_id, ban_type, reason, created_by, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+            ).bind(accountId, 'temp30', 'behavior_match_confirmed ' + best.score + '%', 'system', now, until, '').run();
+            await tttRevokeKeysForAccount(db, accountId, 'banned:temp30');
+            await db.prepare(
+              "UPDATE ttt_watchlist SET status = 'confirmed', updated_at = ? WHERE id = ?"
+            ).bind(now, w.id).run();
+            autoBanned = { type: 'temp30', reason: 'pola perilaku cocok dengan akun banned (' + best.score + '%)', until };
+          }
+        }
+      }
+    }
+    if (best.score >= TTT_BEHAVIOR_WATCH) flagged.push('behavior_match');
+    if (autoBanned) {
+      return taptapJson({
+        ok: true, banned: true, ban_type: autoBanned.type, reason: autoBanned.reason,
+        expires_at: autoBanned.until, commands: [], flagged,
+      });
+    }
+    const commands = await tttDeliverCommands(db, device.guest_id, accountId, now);
+    return taptapJson({ ok: true, banned: false, reason: '', expires_at: null, commands, flagged });
+  }
+
+  // ---- Paket admin: akhiri sesi (admin-batch) ----
+  if (request.method === 'POST' && seg === 'session' && parts[3] === 'end') {
+    const keyed = await tttRequireKey(request, db);
+    if (!keyed.device) return keyed;
+    const b = await request.json().catch(() => null);
+    if (!b || !b.session_id) return taptapJson({ error: 'bad_request' }, 400);
+    await db.prepare(
+      'UPDATE ttt_sessions SET ended_at = ? WHERE session_id = ? AND guest_id = ?'
+    ).bind(now, String(b.session_id).slice(0, 64), keyed.device.guest_id).run();
+    return taptapJson({ ok: true });
+  }
+
+  // ---- Paket admin: status ringan (admin-batch) ----
+  // GET /api/taptap/status?guest_id=... — cek banned + perintah tertunda.
+  // WAJIB API key milik guest itu sendiri.
+  if (request.method === 'GET' && seg === 'status') {
+    const guestId = (url.searchParams.get('guest_id') || '').trim();
+    if (!guestId) return taptapJson({ error: 'guest_id wajib diisi' }, 400);
+    // Cek banned dulu tanpa key (alasan sama seperti heartbeat).
+    const preDev = await db.prepare('SELECT * FROM ttt_devices WHERE guest_id = ?').bind(guestId).first();
+    if (preDev && preDev.account_id) {
+      const preBan = await taptapGetBan(db, preDev.account_id);
+      if (preBan && taptapBanActive(preBan, Date.now())) {
+        return taptapJson({
+          ok: true, guest_id: guestId, banned: true, ban_type: preBan.ban_type,
+          reason: preBan.ban_reason || '', expires_at: preBan.ban_until || null, commands: [],
+        });
+      }
+    }
+    const keyed = await tttRequireKey(request, db);
+    if (!keyed.device) return keyed;
+    if (keyed.device.guest_id !== guestId) {
+      return taptapJson({ error: 'guest_mismatch' }, 403);
+    }
+    const nowMs = Date.now();
+    const ban = await tttBanForDevice(db, keyed.device, nowMs);
+    const accountId = keyed.device.account_id || '';
+    const commands = await tttDeliverCommands(db, guestId, accountId, now);
+    return taptapJson({
+      ok: true, guest_id: guestId,
+      banned: !!ban, ban_type: ban ? ban.type : '',
+      reason: ban ? ban.reason : '',
+      expires_at: ban ? (ban.until || null) : null,
+      commands,
+    });
+  }
+
+  // ---- Paket admin: tukar kode redeem (admin-batch) ----
+  if (request.method === 'POST' && seg === 'redeem') {
+    if (!(await checkRateLimit(env, 'taptap-redeem:' + clientIp(request), 10, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+    const b = await request.json().catch(() => null);
+    if (!b || !taptapValidAccountId(b.account_id)) {
+      return taptapJson({ error: 'bad_account_id' }, 400);
+    }
+    // Cek banned dulu tanpa key (alasan sama seperti heartbeat).
+    const preBan = await taptapGetBan(db, String(b.account_id));
+    if (preBan && taptapBanActive(preBan, Date.now())) {
+      return taptapJson({ error: 'banned', ban_type: preBan.ban_type, ban_reason: preBan.ban_reason || '', ban_until: preBan.ban_until || '' }, 403);
+    }
+    const keyed = await tttRequireKey(request, db);
+    if (!keyed.device) return keyed;
+    const device = keyed.device;
+    const code = String(b.code || '').trim().toUpperCase();
+    if (!code) return taptapJson({ error: 'bad_code' }, 400);
+    const nowMs = Date.now();
+    const ban = await tttBanForDevice(db, device, nowMs);
+    if (ban) {
+      return taptapJson({ error: 'banned', ban_type: ban.type, ban_reason: ban.reason, ban_until: ban.until || '' }, 403);
+    }
+    const failLog = async (status, reason) => {
+      await db.prepare(
+        "INSERT INTO ttt_redeem_log (code, account_id, guest_id, benefit_type, benefit_value, status, fail_reason, redeemed_at) VALUES (?, ?, ?, '', 0, 'failed', ?, ?)"
+      ).bind(code, b.account_id, device.guest_id, reason, now).run();
+    };
+    // Brute force: >= 5 gagal dalam 10 menit -> flag + tolak.
+    const fails = await db.prepare(
+      "SELECT COUNT(*) AS c FROM ttt_redeem_log WHERE guest_id = ? AND status = 'failed' AND redeemed_at > ?"
+    ).bind(device.guest_id, new Date(nowMs - 10 * 60 * 1000).toISOString()).first();
+    if (fails && Number(fails.c) >= TTT_REDEEM_BRUTEFORCE) {
+      if (!(await tttRecentlyFlagged(db, b.account_id, 'redeem_bruteforce', nowMs))) {
+        await taptapInsertFlag(db, b.account_id, 'redeem_bruteforce', JSON.stringify({ fails: Number(fails.c) }), now);
+      }
+      return taptapJson({ error: 'too_many_attempts' }, 429);
+    }
+    const row = await db.prepare('SELECT * FROM ttt_redeem_codes WHERE code = ?').bind(code).first();
+    if (!row) { await failLog('failed', 'code_not_found'); return taptapJson({ error: 'code_not_found' }, 404); }
+    if (Number(row.active) !== 1) { await failLog('failed', 'code_inactive'); return taptapJson({ error: 'code_inactive' }, 403); }
+    if (row.expires_at && Date.parse(row.expires_at) <= nowMs) { await failLog('failed', 'code_expired'); return taptapJson({ error: 'code_expired' }, 403); }
+    if (Number(row.used_count) >= Number(row.max_uses)) { await failLog('failed', 'code_used_up'); return taptapJson({ error: 'code_used_up' }, 403); }
+    const already = await db.prepare(
+      "SELECT id FROM ttt_redeem_log WHERE code = ? AND account_id = ? AND status = 'ok' LIMIT 1"
+    ).bind(code, b.account_id).first();
+    if (already) { await failLog('failed', 'already_redeemed'); return taptapJson({ error: 'already_redeemed' }, 403); }
+    const player = await db.prepare('SELECT * FROM ttt_players WHERE account_id = ?').bind(b.account_id).first();
+    if (!player) return taptapJson({ error: 'not_found' }, 404);
+    // Manfaat diterapkan SERVER (bukan angka kiriman klien).
+    const value = Number(row.benefit_value) || 0;
+    if (row.benefit_type === 'energy') {
+      await db.prepare(
+        'UPDATE ttt_players SET score = score + ?, total_energy_all_time = total_energy_all_time + ?, updated_at = ? WHERE account_id = ?'
+      ).bind(value, value, now, b.account_id).run();
+    } else if (row.benefit_type === 'savings') {
+      await db.prepare(
+        'UPDATE ttt_players SET savings = savings + ?, updated_at = ? WHERE account_id = ?'
+      ).bind(value, now, b.account_id).run();
+    } else {
+      return taptapJson({ error: 'bad_benefit' }, 400);
+    }
+    await db.prepare(
+      'UPDATE ttt_redeem_codes SET used_count = used_count + 1 WHERE code = ?'
+    ).bind(code).run();
+    await db.prepare(
+      "INSERT INTO ttt_redeem_log (code, account_id, guest_id, benefit_type, benefit_value, status, fail_reason, redeemed_at) VALUES (?, ?, ?, ?, ?, 'ok', '', ?)"
+    ).bind(code, b.account_id, device.guest_id, row.benefit_type, value, now).run();
+    return taptapJson({ ok: true, code, benefit_type: row.benefit_type, benefit_value: value });
+  }
+
+  // ---- Paket admin: kirim token Play Integrity (admin-batch) ----
+  // Token diverifikasi SISI SERVER (bila secret PLAY_INTEGRITY_SA_JSON
+  // ada). Bila belum ada -> status 'not_configured', BUKAN error.
+  if (request.method === 'POST' && seg === 'integrity') {
+    const keyed = await tttRequireKey(request, db);
+    if (!keyed.device) return keyed;
+    const b = await request.json().catch(() => null);
+    if (!b || typeof b.token !== 'string' || !b.token) {
+      return taptapJson({ error: 'bad_request' }, 400);
+    }
+    const v = await tttVerifyPlayIntegrity(env, b.token);
+    const status = v.verified ? v.status : (v.reason === 'not_configured' ? 'not_configured' : 'failed');
+    await db.prepare(
+      'UPDATE ttt_devices SET integrity_status = ?, integrity_detail = ?, last_seen = ? WHERE guest_id = ?'
+    ).bind(status, (v.detail || v.reason || '').slice(0, 500), now, keyed.device.guest_id).run();
+    return taptapJson({ ok: true, verified: v.verified, status, reason: v.reason || '' });
   }
 
   // GET /api/taptap/version
@@ -3720,7 +4813,7 @@ requestAnimationFrame(draw);
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/statistik' || path === '/kendali/laporan' || path === '/kendali/md-backup' || path === '/kendali/tamper')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/statistik' || path === '/kendali/laporan' || path === '/kendali/md-backup' || path === '/kendali/tamper' || path === '/kendali/taptap')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
@@ -3738,6 +4831,11 @@ requestAnimationFrame(draw);
       if (path === '/kendali/laporan') {
         const content = await renderSocialReportsPanel(env, csrf, nav, noticeHtml(url), url);
         return html(await renderPage(env, 'Laporan Konten', content));
+      }
+      // ---- Admin: panel Tap Tap Tycoon (admin-batch) ----
+      if (path === '/kendali/taptap') {
+        const content = await renderTttAdminPanel(env, nav, noticeHtml(url));
+        return html(await renderPage(env, 'Tap Tap Tycoon', content));
       }
       // ---- Admin: panel kontrol API Cerpen (v66) ----
       // Statistik + keys + submissions + audit, semua dari D1 stopwatch-db
