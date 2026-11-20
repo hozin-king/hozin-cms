@@ -26,7 +26,11 @@ function baseCss(def) {
     `@media (min-width:641px) and (max-width:900px){main,footer{max-width:680px;padding:16px 18px}}` +
     `@media (min-width:901px){main,footer{max-width:${maxWidth + 40}px;padding:24px 20px}}` +
     `footer{width:100%;max-width:${maxWidth}px;margin:0 auto;padding:20px 14px;color:${muted};font-size:13px;margin-top:auto;border-top:1px solid ${border}}` +
-    `.view-eye{display:inline-block;width:22px;height:20px;vertical-align:-5px}.view-eye svg{width:22px;height:20px;display:block}`;
+    `.view-eye{display:inline-block;width:22px;height:20px;vertical-align:-5px}.view-eye svg{width:22px;height:20px;display:block}` +
+    // Hero beranda + pil tag + hover kartu (18 Nov 2026 — poles homepage).
+    `.hero{padding:28px 22px 22px}.hero .hero-eyebrow{margin:0 0 6px;color:${accent};font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}.hero h1{margin:0 0 8px;font-size:clamp(28px,6vw,40px);line-height:1.15;letter-spacing:-.01em}.hero .tagline{color:${muted};font-size:clamp(15px,3.4vw,17.5px);margin:0 0 14px;max-width:56ch}.hero-chips{display:flex;flex-wrap:wrap;gap:8px}.hero-chips span{display:inline-flex;align-items:center;padding:7px 13px;border:1px solid ${border};border-radius:999px;font-size:13.5px;font-weight:600;background:${bg}}` +
+    `.meta a{display:inline-block;padding:2px 9px;border:1px solid ${border};border-radius:999px;text-decoration:none;font-size:12.5px}` +
+    `@media (min-width:901px){.card{transition:transform .15s ease,box-shadow .15s ease}.card:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(0,0,0,.08)}}`;
 }
 // 11 Nov 2026 — Navbar modern: Floating Pill + Bottom Tab Bar + Command Palette.
 // 'klasik' = header statis lama (tidak berubah). 'modern' = ketiganya sekaligus:
@@ -96,13 +100,23 @@ export function adsenseHead(client) {
 // Facebook/WhatsApp/Telegram butuh URL absolut PNG/JPG untuk og:image.
 const SITE_FAVICON_16 = 'https://i.ibb.co/LyL3Tt3/favicon-16.png';
 const SITE_FAVICON_32 = 'https://i.ibb.co/Mxj5MjDD/favicon-32.png';
-const SITE_APPLE_TOUCH_ICON = 'https://i.ibb.co/JRbnBgKK/apple-touch-icon.png';
+const SITE_APPLE_TOUCH_ICON = 'https://raw.githubusercontent.com/hozin-king/hozin-cms/main/public/logo/apple-touch-180.png';
 const SITE_OG_LOGO = 'https://i.ibb.co/PsWLn47z/og-logo-1200x630.png';
+// Logo baru (18 Nov 2026) — isi URL PNG hasil upload ke ImgBB setelah
+// varian logo dipilih. Kosong = tag ukuran itu tidak dirender (fallback
+// ke 16/32 lama). 48px adalah ukuran rekomendasi Google Search.
+const SITE_FAVICON_48 = 'https://raw.githubusercontent.com/hozin-king/hozin-cms/main/public/logo/icon-48.png';
+const SITE_FAVICON_96 = 'https://raw.githubusercontent.com/hozin-king/hozin-cms/main/public/logo/icon-96.png';
+const SITE_FAVICON_144 = '';
+const SITE_FAVICON_192 = 'https://raw.githubusercontent.com/hozin-king/hozin-cms/main/public/logo/icon-192.png';
+// Mark SVG logo baru untuk header — tempel isi file logo-*-icon.svg
+// varian terpilih (satu baris). Kosong = kembali ke huruf pertama judul.
+const SITE_LOGO_MARK_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240"><defs><linearGradient id="aGreen" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="208"><stop offset="0" stop-color="#2BFF8F"/><stop offset="1" stop-color="#00A651"/></linearGradient><linearGradient id="aGold" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="208"><stop offset="0" stop-color="#FFD34D"/><stop offset="1" stop-color="#F59E0B"/></linearGradient><radialGradient id="aGlow"><stop offset="0" stop-color="#00E676" stop-opacity="0.55"/><stop offset="1" stop-color="#00E676" stop-opacity="0"/></radialGradient><linearGradient id="aShine" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset="0.5" stop-color="#fff" stop-opacity="0.55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs><defs><linearGradient id="bGreen" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="208"><stop offset="0" stop-color="#2BFF8F"/><stop offset="1" stop-color="#00A651"/></linearGradient><linearGradient id="bGold" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="208"><stop offset="0" stop-color="#FFD34D"/><stop offset="1" stop-color="#F59E0B"/></linearGradient><radialGradient id="bGlow"><stop offset="0" stop-color="#F5B301" stop-opacity="0.55"/><stop offset="1" stop-color="#F5B301" stop-opacity="0"/></radialGradient><linearGradient id="bShine" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset="0.5" stop-color="#fff" stop-opacity="0.55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs><clipPath id="abClip"><path d="M120,16 L198,44 L198,126 C198,176 164,210 120,228 C76,210 44,176 44,126 L44,44 Z"/></clipPath><path d="M120,16 L198,44 L198,126 C198,176 164,210 120,228 C76,210 44,176 44,126 L44,44 Z" fill="#141a22" stroke="url(#bGold)" stroke-width="7"  stroke-linejoin="round"/><path d="M120,30 L186,54 L186,126 C186,168 158,196 120,212 C82,196 56,168 56,126 L56,54 Z" fill="none" stroke="#2A3442" stroke-width="2"/><g transform="translate(33.6 38.9) scale(0.72)"><g transform="translate(0 0)"><polygon points="80,58 90,30 103,55" fill="url(#aGold)"/><polygon points="106,58 120,24 134,58" fill="url(#aGold)"/><polygon points="137,55 150,30 160,58" fill="url(#aGold)"/><polygon points="80,58 160,58 156,72 84,72" fill="url(#aGold)"/><polygon points="96,61 100,65 96,69 92,65" fill="#B45309"/><polygon points="120,61 124,65 120,69 116,65" fill="#B45309"/><polygon points="144,61 148,65 144,69 140,65" fill="#B45309"/></g><polygon points="52,76 94,76 86,88 86,192 94,204 52,204 60,192 60,88" fill="url(#aGreen)"/><polygon points="146,76 188,76 180,88 180,192 188,204 146,204 154,192 154,88" fill="url(#aGreen)"/><rect x="86" y="128" width="68" height="22" fill="url(#aGreen)"/></g><g clip-path="url(#abClip)"><rect x="-140" y="10" width="70" height="220" fill="url(#aShine)"></rect></g></svg>';
 function shell(css, def, siteTitle, pageTitle, content, siteAvatar, metaDesc = '', navbar = 'klasik', adsenseClient = '', metaImage = '', pageUrl = '', ogType = 'website') {
   const mark = String(siteTitle || 'W').trim().charAt(0).toUpperCase() || 'W';
   const avatarHtml = siteAvatar ? `<img src="${siteAvatar}" alt="" style="width:26px;height:26px;flex:0 0 26px;margin-right:9px;border-radius:50%;object-fit:cover">` : '';
   const accent = def.accent;
-  const markSvg = `<svg viewBox="0 0 48 48" aria-hidden="true"><rect width="48" height="48" rx="11" fill="${accent}"/><text x="24" y="33" text-anchor="middle" font-size="26" font-weight="700" fill="#fff" font-family="Inter,system-ui,sans-serif">${mark}</text></svg>`;
+  const markSvg = SITE_LOGO_MARK_SVG || `<svg viewBox="0 0 48 48" aria-hidden="true"><rect width="48" height="48" rx="11" fill="${accent}"/><text x="24" y="33" text-anchor="middle" font-size="26" font-weight="700" fill="#fff" font-family="Inter,system-ui,sans-serif">${mark}</text></svg>`;
   const desc = metaDesc ? String(metaDesc).slice(0, 155) : '';
   // og:image: gambar yang diteruskan caller, kalau tidak ada -> logo situs.
   // URL sudah divalidasi di renderPage (store.js); di sini dicek sekali lagi
@@ -110,7 +124,12 @@ function shell(css, def, siteTitle, pageTitle, content, siteAvatar, metaDesc = '
   const ogImage = /^https:\/\/[^"'<\s]+$/.test(String(metaImage || '')) ? String(metaImage) : SITE_OG_LOGO;
   const canonical = /^https:\/\/[^"'<\s]+$/.test(String(pageUrl || '')) ? String(pageUrl) : '';
   const metaTags = `<meta property="og:title" content="${pageTitle} — ${siteTitle}"><meta property="og:type" content="${ogType === 'article' ? 'article' : 'website'}">${canonical ? `<meta property="og:url" content="${canonical}">` : ''}${desc ? `<meta name="description" content="${desc}"><meta property="og:description" content="${desc}">` : ''}<meta property="og:image" content="${ogImage}"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${pageTitle} — ${siteTitle}">${desc ? `<meta name="twitter:description" content="${desc}">` : ''}<meta name="twitter:image" content="${ogImage}">`;
-  const faviconTags = `<link rel="icon" type="image/png" sizes="16x16" href="${SITE_FAVICON_16}"><link rel="icon" type="image/png" sizes="32x32" href="${SITE_FAVICON_32}"><link rel="apple-touch-icon" href="${SITE_APPLE_TOUCH_ICON}">`;
+  const faviconTags = `<link rel="icon" type="image/png" sizes="16x16" href="${SITE_FAVICON_16}"><link rel="icon" type="image/png" sizes="32x32" href="${SITE_FAVICON_32}">` +
+    (SITE_FAVICON_48 ? `<link rel="icon" type="image/png" sizes="48x48" href="${SITE_FAVICON_48}">` : '') +
+    (SITE_FAVICON_96 ? `<link rel="icon" type="image/png" sizes="96x96" href="${SITE_FAVICON_96}">` : '') +
+    (SITE_FAVICON_144 ? `<link rel="icon" type="image/png" sizes="144x144" href="${SITE_FAVICON_144}">` : '') +
+    (SITE_FAVICON_192 ? `<link rel="icon" type="image/png" sizes="192x192" href="${SITE_FAVICON_192}">` : '') +
+    `<link rel="apple-touch-icon" href="${SITE_APPLE_TOUCH_ICON}">`;
   const modern = navbar === 'modern';
   const brandHtml = `<a class="brand" href="/">${avatarHtml || `<span class="mark">${markSvg}</span>`}${siteTitle}</a>`;
   const headerHtml = modern ? navPillHtml(brandHtml) : `<header>${brandHtml}<nav><a href="/">Beranda</a><a href="/akun">Akun</a></nav></header>`;

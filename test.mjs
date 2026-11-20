@@ -1405,13 +1405,13 @@ r = await call('POST', '/post/post-uji/comment/delete', { csrf, comment_id: Stri
 assert(!env.DB.comments.some(c => c.id === adminCid), 'hapus dari post: admin bisa hapus komentar siapa pun');
 // 14. Branding instance: logo SVG animasi + SITE_TITLE menang atas D1
 const brandHtml = themes.terang.render({ siteTitle: 'Hozin King', pageTitle: 'X', content: '' });
-assert(brandHtml.includes('<svg') && brandHtml.includes('animateTransform') && brandHtml.includes('>H</text>') && brandHtml.includes('Hozin King'), 'logo SVG: animasi kilau + mark H untuk Hozin King');
+assert(brandHtml.includes('<svg') && brandHtml.includes('viewBox="0 0 240 240"') && brandHtml.includes('#141a22') && brandHtml.includes('Hozin King'), 'logo SVG: mark AB Hozin King (perisai gelap + H hijau + mahkota emas)');
 assert(envSiteTitle({ SITE_TITLE: '  Hozin King  ' }) === 'Hozin King' && envSiteTitle({}) === '' && envSiteTitle({ SITE_TITLE: '   ' }) === '', 'envSiteTitle: trim, kosong bila tidak ada');
 r = await renderPage({ DB: env.DB, SITE_TITLE: 'Hozin King' }, 'Beranda', '<p>uji</p>'); t = r;
-assert(t.includes('Hozin King') && !t.includes('>WorkerCMS<') && t.includes('>H</text>'), 'renderPage: SITE_TITLE menang atas site_title D1 (WorkerCMS)');
+assert(t.includes('Hozin King') && !t.includes('>WorkerCMS<') && t.includes('viewBox="0 0 240 240"'), 'renderPage: SITE_TITLE menang atas site_title D1 (WorkerCMS)');
 const downEnvTitle = { ...downEnv, SITE_TITLE: 'Hozin King' };
 r = await worker.fetch(new Request(base + '/', { method: 'GET' }), downEnvTitle); t = await r.text();
-assert(r.status === 503 && t.includes('Hozin King') && t.includes('>H</text>') && !t.includes('WorkerCMS'), 'maintenance: SITE_TITLE tampil, bukan WorkerCMS, saat D1 mati');
+assert(r.status === 503 && t.includes('Hozin King') && t.includes('viewBox="0 0 240 240"') && !t.includes('WorkerCMS'), 'maintenance: SITE_TITLE tampil, bukan WorkerCMS, saat D1 mati');
 // 15. Redesign beranda + edit post (perintah pemilik 30 Okt 2026 12:12)
 // Buat post bergambar, cek kartu: sampul, Selengkapnya, FAB hanya admin, Edit hanya admin
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post Sampul Uji', category: 'Tekno', body: '<p>Isi bergambar.</p><img src="https://x.test/cover.png" alt="sampul">', body_mode: 'html' }, cookie);

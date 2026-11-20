@@ -48,6 +48,9 @@ import { hasLink, hasDirtyWord, hasJudol } from './plugins.js';
 // Kunci WAJIB secret Worker DAHONO_API_KEY — jangan pernah ditulis di kode/repo
 // (repo ini publik). Toggle di Pengaturan: auto_reply_enabled ('1' = aktif).
 const AUTO_REPLY_BOT_NAME = 'Balasan Otomatis';
+// /favicon.ico (18 Nov 2026): isi dengan URL PNG 48px logo baru setelah
+// di-upload ke ImgBB. Kosong = route jawab 404 seperti sekarang.
+const FAVICON_ICO_TARGET = 'https://raw.githubusercontent.com/hozin-king/hozin-cms/main/public/logo/icon-48.png';
 // ---- Halaman Link Bio (/bio) ----
 // HTML statis hasil export artifact "link-bio-hozin-king" (7 Nov 2026,
 // diverifikasi: tanpa tagline "satu pintu untuk semua karya Hozin King",
@@ -3893,6 +3896,13 @@ async function handleFetch(request, env) {
       return d.res;
     }
 
+    // /favicon.ico: browser lama + Google kadang meminta path ini
+    // langsung. Bila target diisi, redirect permanen ke PNG 48px logo baru.
+    if (request.method === 'GET' && path === '/favicon.ico') {
+      if (!FAVICON_ICO_TARGET) return new Response('Not found', { status: 404 });
+      return new Response(null, { status: 301, headers: { location: FAVICON_ICO_TARGET } });
+    }
+
     // ---- Publik: beranda (hanya post publik yang sudah terbit) ----
     if (request.method === 'GET' && path === '/') {
       // Anti overload: 10 post per halaman, ambil 11 untuk tahu ada halaman
@@ -3932,7 +3942,7 @@ async function handleFetch(request, env) {
         const mix = pickFirstVisit([...allPosts, ...(popularRows.results || [])], wibParts(Date.now()).date);
         if (mix.ordered.length >= 4) {
           displayPosts = mix.ordered;
-          welcome = `<div class="card"><h2>Selamat datang!</h2><p>Baru pertama ke sini? Ini campuran untukmu: <b>terbaru</b>, <b>paling banyak dibaca</b>, dan <b>pilihan hari ini</b> — berubah tiap hari.</p></div>`;
+          welcome = `<section class="card hero"><p class="hero-eyebrow">Selamat datang!</p><h1>Hozin King</h1><p class="tagline">Teknologi, root Android, dan cerita — terbaru, paling banyak dibaca, dan pilihan hari ini, berubah tiap hari.</p><div class="hero-chips"><span>Terbaru</span><span>Terpopuler</span><span>Pilihan hari ini</span></div></section>`;
         }
       }
       const content = adBanner(adImage, adLink, adText, adsenseClient, adsenseSlot) + welcome + (displayPosts.length
