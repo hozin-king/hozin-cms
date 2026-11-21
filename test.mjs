@@ -130,6 +130,15 @@ class MockDB {
     this.socialReports = []; // {id, kind, ref, reporter_key, device_id, user_id, category, note, status, day, created_at, updated_at}
     // v87.5: bookmark ikut akun (cms-db).
     this.bookmarks = []; // {user_id, kind, content_id, created_at}
+    // v1.1.40+: state paket admin/keamanan Cerpen (cerpen-admin.js).
+    this.trackUsers = new Map(); // owner_key -> row cerpen_track_users
+    this.trackKeys = []; // {key_id, key_hash, owner_key, device_id, fingerprint_hash, status, created_at, revoked_at, revoke_reason, last_used_at}
+    this.trackSessions = []; // {id, owner_key, user_id, device_id, kind, target_id, season, no, started_at, ended_at, seconds, app_version, updated_at}
+    this.trackCommands = []; // {id, owner_key, user_id, device_id, kind, payload, status, created_at, created_by, delivered_at, executed_at, note}
+    this.trackWatchlist = []; // {id, subject_type, subject_id, owner_key, reason, evidence, score, status, created_at, updated_at, reviewed_by, reviewed_at, review_note}
+    this.trackDetections = []; // {id, kind, owner_key, device_id, user_id, detail, score, created_at}
+    this.trackProfiles = new Map(); // owner_key -> row cerpen_behavior_profiles
+    this.cerpenAdmins = new Map(); // user_id -> row cerpen_admins (god-mode, 21 Nov 2026)
     // v81: agregat waktu baca (sudah ada array-nya di constructor; isi di
     // sini hanya penegas — handler upsert ada di bawah).
     this.readingSessions = this.readingSessions || [];
@@ -738,8 +747,17 @@ class MockDB {
     }
     if (s.startsWith("SELECT id, reason, expires_at FROM cerpen_bans WHERE target_type = 'user' AND target_id = ? AND active = 1")) return this.coinBans.filter(b => b.target_type === 'user' && b.target_id === a[0] && b.active === 1).map(b => ({ id: b.id, reason: b.reason, expires_at: b.expires_at }));
     if (s.startsWith('INSERT INTO cerpen_bans')) {
-      if (this.coinBans.some(b => b.target_type === 'user' && b.target_id === a[1] && b.active === 1)) throw new Error('UNIQUE constraint failed: cerpen_bans');
-      this.coinBans.push({ id: a[0], target_type: 'user', target_id: a[1], reason: a[2], banned_by: 'admin', created_at: a[3], expires_at: a[4], active: 1, unbanned_at: null, unbanned_by: null, unban_note: '' });
+      // Dua bentuk: coins.js (5 arg, target 'user' literal, banned_by
+      // 'admin' literal) dan cerpen-admin.js applyCerpenBan (6 arg,
+      // target literal di SQL, banned_by di-bind). Bedakan dari jumlah arg.
+      const lit = (s.match(/VALUES \(\?, '(\w+)'/) || [])[1] || 'user';
+      if (a.length === 5) {
+        if (this.coinBans.some(b => b.target_type === 'user' && b.target_id === a[1] && b.active === 1)) throw new Error('UNIQUE constraint failed: cerpen_bans');
+        this.coinBans.push({ id: a[0], target_type: 'user', target_id: a[1], reason: a[2], banned_by: 'admin', created_at: a[3], expires_at: a[4], active: 1, unbanned_at: null, unbanned_by: null, unban_note: '' });
+      } else {
+        if (this.coinBans.some(b => b.target_type === lit && b.target_id === a[1] && b.active === 1)) throw new Error('UNIQUE constraint failed: cerpen_bans');
+        this.coinBans.push({ id: a[0], target_type: lit, target_id: a[1], reason: a[2], banned_by: a[3], created_at: a[4], expires_at: a[5], active: 1, unbanned_at: null, unbanned_by: null, unban_note: '' });
+      }
       return [];
     }
     if (s.startsWith("SELECT id, target_id, reason, banned_by, created_at, expires_at, active FROM cerpen_bans WHERE target_type = 'user' AND active = 1 ORDER BY created_at DESC LIMIT 100")) return [...this.coinBans].filter(b => b.target_type === 'user' && b.active === 1).sort((x, y) => y.created_at - x.created_at).slice(0, 100);
@@ -1090,6 +1108,340 @@ class MockDB {
     if (s.startsWith('INSERT OR REPLACE INTO dompet_categories')) { const row = { account_id: a[0], id: a[1], name: a[2], type: a[3], color: a[4], isDefault: a[5], updated_at: a[6], deleted: a[7] }; const i = this.dompetCategories.findIndex(x => x.account_id === a[0] && x.id === a[1]); if (i >= 0) this.dompetCategories[i] = row; else this.dompetCategories.push(row); return []; }
     if (s.startsWith('SELECT id, name, type, color, isDefault, updated_at, deleted FROM dompet_categories WHERE account_id = ? AND updated_at > ?')) return this.dompetCategories.filter(x => x.account_id === a[0] && x.updated_at > a[1]).sort((x, y) => x.updated_at - y.updated_at).map(({ account_id, ...rest }) => rest);
     if (s.startsWith('SELECT id, name, type, color, isDefault, updated_at, deleted FROM dompet_categories WHERE account_id = ? AND deleted = 0')) return this.dompetCategories.filter(x => x.account_id === a[0] && !x.deleted).sort((x, y) => x.updated_at - y.updated_at).map(({ account_id, ...rest }) => rest);
+    // --- Paket Admin/Keamanan Cerpen (v1.1.40+, cerpen-admin.js) ---
+    // -- cerpen_track_users --
+    if (s.startsWith('SELECT owner_key, user_id, device_id, android_id, device_model, android_version, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, fingerprint_hash, is_rooted, root_methods, is_emulator, emulator_signals, bootloader_locked, verified_boot, custom_rom, integrity_status, integrity_verified, integrity_checked_at, last_eval_at FROM cerpen_track_users WHERE owner_key = ?')) {
+      const u = this.trackUsers.get(a[0]);
+      return u ? [{ ...u }] : [];
+    }
+    if (s.startsWith('SELECT owner_key, user_id, device_id, android_id, device_model, android_version, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, fingerprint_hash, is_rooted, root_methods, is_emulator, emulator_signals, bootloader_locked, verified_boot, custom_rom, integrity_status, integrity_verified, integrity_checked_at, last_eval_at FROM cerpen_track_users WHERE device_id = ?')) {
+      const u = [...this.trackUsers.values()].find(x => x.device_id === a[0]);
+      return u ? [{ ...u }] : [];
+    }
+    if (s.startsWith('SELECT owner_key, user_id, device_id FROM cerpen_track_users WHERE owner_key = ?')) {
+      const u = this.trackUsers.get(a[0]);
+      return u ? [{ owner_key: u.owner_key, user_id: u.user_id, device_id: u.device_id }] : [];
+    }
+    if (s.startsWith('SELECT fingerprint_hash, is_emulator FROM cerpen_track_users WHERE device_id = ?')) {
+      const u = [...this.trackUsers.values()].find(x => x.device_id === a[0]);
+      return u ? [{ fingerprint_hash: u.fingerprint_hash, is_emulator: u.is_emulator }] : [];
+    }
+    if (s.startsWith('SELECT owner_key, user_id, device_id, device_model, last_seen, current_kind, current_target, current_season, current_no, reading_since FROM cerpen_track_users WHERE last_seen >= ? ORDER BY last_seen DESC LIMIT ?')) {
+      return [...this.trackUsers.values()].filter(u => u.last_seen >= a[0]).sort((x, y) => y.last_seen - x.last_seen).slice(0, a[1]).map(u => ({ owner_key: u.owner_key, user_id: u.user_id, device_id: u.device_id, device_model: u.device_model, last_seen: u.last_seen, current_kind: u.current_kind, current_target: u.current_target, current_season: u.current_season, current_no: u.current_no, reading_since: u.reading_since }));
+    }
+    if (s.startsWith('SELECT owner_key, user_id, device_id, device_model, last_seen, current_kind, current_target, current_season, current_no, reading_since FROM cerpen_track_users WHERE last_seen >= ? ORDER BY last_seen DESC LIMIT 20')) {
+      return [...this.trackUsers.values()].filter(u => u.last_seen >= a[0]).sort((x, y) => y.last_seen - x.last_seen).slice(0, 20).map(u => ({ owner_key: u.owner_key, user_id: u.user_id, device_id: u.device_id, device_model: u.device_model, last_seen: u.last_seen, current_kind: u.current_kind, current_target: u.current_target, current_season: u.current_season, current_no: u.current_no, reading_since: u.reading_since }));
+    }
+    if (s.startsWith('SELECT owner_key, user_id, device_id, device_model, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, is_rooted, is_emulator, integrity_status FROM cerpen_track_users WHERE owner_key LIKE ? OR device_id LIKE ? OR user_id LIKE ? ORDER BY last_seen DESC LIMIT ?')) {
+      const term = String(a[0] || '').replace(/%/g, '');
+      return [...this.trackUsers.values()].filter(u => !term || (u.owner_key || '').includes(term) || (u.device_id || '').includes(term) || (u.user_id || '').includes(term)).sort((x, y) => y.last_seen - x.last_seen).slice(0, a[3]).map(u => ({ owner_key: u.owner_key, user_id: u.user_id, device_id: u.device_id, device_model: u.device_model, app_version: u.app_version, first_seen: u.first_seen, last_seen: u.last_seen, current_kind: u.current_kind, current_target: u.current_target, current_season: u.current_season, current_no: u.current_no, reading_since: u.reading_since, is_rooted: u.is_rooted, is_emulator: u.is_emulator, integrity_status: u.integrity_status }));
+    }
+    if (s.startsWith('SELECT owner_key, user_id, device_id, device_model, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, is_rooted, is_emulator, integrity_status FROM cerpen_track_users ORDER BY last_seen DESC LIMIT ?')) {
+      return [...this.trackUsers.values()].sort((x, y) => y.last_seen - x.last_seen).slice(0, a[0]).map(u => ({ owner_key: u.owner_key, user_id: u.user_id, device_id: u.device_id, device_model: u.device_model, app_version: u.app_version, first_seen: u.first_seen, last_seen: u.last_seen, current_kind: u.current_kind, current_target: u.current_target, current_season: u.current_season, current_no: u.current_no, reading_since: u.reading_since, is_rooted: u.is_rooted, is_emulator: u.is_emulator, integrity_status: u.integrity_status }));
+    }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_track_users WHERE last_seen >= ?')) return [{ c: [...this.trackUsers.values()].filter(u => u.last_seen >= a[0]).length }];
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_track_users WHERE user_id = ? AND last_seen >= ?')) return [{ c: [...this.trackUsers.values()].filter(u => u.user_id === a[0] && u.last_seen >= a[1]).length }];
+    if (s === 'SELECT COUNT(*) AS c FROM cerpen_track_users') return [{ c: this.trackUsers.size }];
+    if (s.startsWith('INSERT INTO cerpen_track_users')) {
+      // (owner_key, user_id, device_id, android_id, device_model, android_version, app_version, first_seen, last_seen, fingerprint_hash, is_rooted, root_methods, is_emulator, emulator_signals, bootloader_locked, verified_boot, custom_rom, integrity_status, integrity_verified, integrity_checked_at) + last_eval_at literal 0
+      this.trackUsers.set(a[0], { owner_key: a[0], user_id: a[1], device_id: a[2], android_id: a[3], device_model: a[4], android_version: a[5], app_version: a[6], first_seen: a[7], last_seen: a[8], fingerprint_hash: a[9], is_rooted: a[10], root_methods: a[11], is_emulator: a[12], emulator_signals: a[13], bootloader_locked: a[14], verified_boot: a[15], custom_rom: a[16], integrity_status: a[17], integrity_verified: a[18], integrity_checked_at: a[19], integrity_token_hash: '', last_eval_at: 0, current_kind: '', current_target: '', current_season: 0, current_no: 0, reading_since: 0 });
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_track_users SET last_seen = ?, device_model = ?, android_version = ?, app_version = ?, fingerprint_hash = ?, is_rooted = ?, root_methods = ?, is_emulator = ?, emulator_signals = ?, bootloader_locked = ?, verified_boot = ?, custom_rom = ?, integrity_status = ?, integrity_verified = ?, integrity_checked_at = ? WHERE owner_key = ?')) {
+      const u = this.trackUsers.get(a[15]);
+      if (u) { u.last_seen = a[0]; u.device_model = a[1]; u.android_version = a[2]; u.app_version = a[3]; u.fingerprint_hash = a[4]; u.is_rooted = a[5]; u.root_methods = a[6]; u.is_emulator = a[7]; u.emulator_signals = a[8]; u.bootloader_locked = a[9]; u.verified_boot = a[10]; u.custom_rom = a[11]; u.integrity_status = a[12]; u.integrity_verified = a[13]; u.integrity_checked_at = a[14]; }
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_track_users SET last_seen = ?, app_version = ?, current_kind = ?, current_target = ?, current_season = ?, current_no = ?, reading_since = ?, is_rooted = ?, root_methods = ?, is_emulator = ?, emulator_signals = ?, bootloader_locked = ?, verified_boot = ?, custom_rom = ?, integrity_status = ?, integrity_verified = ?, integrity_checked_at = ? WHERE owner_key = ?')) {
+      const u = this.trackUsers.get(a[17]);
+      if (u) { u.last_seen = a[0]; u.app_version = a[1]; u.current_kind = a[2]; u.current_target = a[3]; u.current_season = a[4]; u.current_no = a[5]; u.reading_since = a[6]; u.is_rooted = a[7]; u.root_methods = a[8]; u.is_emulator = a[9]; u.emulator_signals = a[10]; u.bootloader_locked = a[11]; u.verified_boot = a[12]; u.custom_rom = a[13]; u.integrity_status = a[14]; u.integrity_verified = a[15]; u.integrity_checked_at = a[16]; }
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_track_users SET last_eval_at = ? WHERE owner_key = ?')) {
+      const u = this.trackUsers.get(a[1]);
+      if (u) u.last_eval_at = a[0];
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_track_users SET integrity_token_hash = ? WHERE owner_key = ?')) {
+      const u = this.trackUsers.get(a[1]);
+      if (u) u.integrity_token_hash = a[0];
+      return [];
+    }
+    if (s.startsWith("UPDATE cerpen_track_users SET current_kind = '', current_target = '', current_season = 0, current_no = 0, reading_since = 0 WHERE owner_key = ?")) {
+      const u = this.trackUsers.get(a[0]);
+      if (u) { u.current_kind = ''; u.current_target = ''; u.current_season = 0; u.current_no = 0; u.reading_since = 0; }
+      return [];
+    }
+    // -- cerpen_track_api_keys --
+    if (s.startsWith('INSERT INTO cerpen_track_api_keys')) {
+      // (key_id, key_hash, owner_key, device_id, fingerprint_hash, created_at) — status 'active' literal
+      this.trackKeys.push({ key_id: a[0], key_hash: a[1], owner_key: a[2], device_id: a[3], fingerprint_hash: a[4], status: 'active', created_at: a[5], revoked_at: null, revoke_reason: '', last_used_at: null });
+      return [];
+    }
+    if (s.startsWith('SELECT key_id, key_hash, owner_key, device_id, fingerprint_hash, status, created_at, revoked_at, revoke_reason, last_used_at FROM cerpen_track_api_keys WHERE key_hash = ?')) {
+      const k = this.trackKeys.find(x => x.key_hash === a[0]);
+      return k ? [{ ...k }] : [];
+    }
+    if (s.startsWith("SELECT key_id, key_hash, owner_key, device_id, fingerprint_hash, status, created_at, revoked_at, revoke_reason, last_used_at FROM cerpen_track_api_keys WHERE owner_key = ? AND status = 'active'")) {
+      const k = this.trackKeys.find(x => x.owner_key === a[0] && x.status === 'active');
+      return k ? [{ ...k }] : [];
+    }
+    if (s.startsWith('SELECT key_id, owner_key, device_id, fingerprint_hash, status, created_at, revoked_at, revoke_reason FROM cerpen_track_api_keys WHERE owner_key = ? ORDER BY created_at DESC LIMIT 10')) {
+      return this.trackKeys.filter(x => x.owner_key === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 10).map(k => ({ key_id: k.key_id, owner_key: k.owner_key, device_id: k.device_id, fingerprint_hash: k.fingerprint_hash, status: k.status, created_at: k.created_at, revoked_at: k.revoked_at, revoke_reason: k.revoke_reason }));
+    }
+    if (s.startsWith("SELECT key_id, owner_key, device_id, fingerprint_hash, status, created_at, revoked_at, revoke_reason FROM cerpen_track_api_keys WHERE status = 'revoked' ORDER BY revoked_at DESC LIMIT ?")) {
+      return this.trackKeys.filter(x => x.status === 'revoked').sort((x, y) => (y.revoked_at || 0) - (x.revoked_at || 0)).slice(0, a[0]).map(k => ({ key_id: k.key_id, owner_key: k.owner_key, device_id: k.device_id, fingerprint_hash: k.fingerprint_hash, status: k.status, created_at: k.created_at, revoked_at: k.revoked_at, revoke_reason: k.revoke_reason }));
+    }
+    if (s.startsWith("SELECT COUNT(*) AS c FROM cerpen_track_api_keys WHERE status = 'revoked'")) return [{ c: this.trackKeys.filter(x => x.status === 'revoked').length }];
+    if (s.startsWith("SELECT COUNT(*) AS c FROM cerpen_track_api_keys WHERE owner_key = ? AND status = 'revoked'")) return [{ c: this.trackKeys.filter(x => x.owner_key === a[0] && x.status === 'revoked').length }];
+    if (s.startsWith("UPDATE cerpen_track_api_keys SET status = 'revoked', revoked_at = ?, revoke_reason = ? WHERE owner_key = ? AND status = 'active'")) {
+      for (const k of this.trackKeys) if (k.owner_key === a[2] && k.status === 'active') { k.status = 'revoked'; k.revoked_at = a[0]; k.revoke_reason = a[1]; }
+      return [];
+    }
+    if (s.startsWith("UPDATE cerpen_track_api_keys SET status = 'revoked', revoked_at = ?, revoke_reason = ? WHERE fingerprint_hash = ? AND status = 'active'")) {
+      for (const k of this.trackKeys) if (k.fingerprint_hash === a[2] && k.status === 'active') { k.status = 'revoked'; k.revoked_at = a[0]; k.revoke_reason = a[1]; }
+      return [];
+    }
+    if (s.startsWith("UPDATE cerpen_track_api_keys SET status = 'revoked', revoked_at = ?, revoke_reason = ? WHERE key_id = ? AND status = 'active'")) {
+      const k = this.trackKeys.find(x => x.key_id === a[2] && x.status === 'active');
+      if (k) { k.status = 'revoked'; k.revoked_at = a[0]; k.revoke_reason = a[1]; return { changes: 1 }; }
+      return { changes: 0 };
+    }
+    if (s.startsWith("UPDATE cerpen_track_api_keys SET status = 'active', revoked_at = NULL, revoke_reason = '' WHERE revoke_reason = ? AND status = 'revoked'")) {
+      for (const k of this.trackKeys) if (k.revoke_reason === a[0] && k.status === 'revoked') { k.status = 'active'; k.revoked_at = null; k.revoke_reason = ''; }
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_track_api_keys SET last_used_at = ? WHERE key_hash = ?')) {
+      const k = this.trackKeys.find(x => x.key_hash === a[1]);
+      if (k) k.last_used_at = a[0];
+      return [];
+    }
+    // -- cerpen_read_sessions --
+    if (s.startsWith('SELECT id, owner_key, user_id, device_id, kind, target_id, season, no, started_at, ended_at, seconds, app_version FROM cerpen_read_sessions WHERE owner_key = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1')) {
+      const open = this.trackSessions.filter(x => x.owner_key === a[0] && x.ended_at == null).sort((x, y) => y.started_at - x.started_at)[0];
+      return open ? [{ ...open }] : [];
+    }
+    if (s.startsWith('INSERT INTO cerpen_read_sessions')) {
+      // (id, owner_key, user_id, device_id, kind, target_id, season, no, started_at, app_version, updated_at) — ended_at NULL, seconds 0
+      this.trackSessions.push({ id: a[0], owner_key: a[1], user_id: a[2], device_id: a[3], kind: a[4], target_id: a[5], season: a[6], no: a[7], started_at: a[8], ended_at: null, seconds: 0, app_version: a[9], updated_at: a[10] });
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_read_sessions SET seconds = seconds + ?, updated_at = ? WHERE id = ?')) {
+      const r = this.trackSessions.find(x => x.id === a[2]);
+      if (r) { r.seconds = (Number(r.seconds) || 0) + a[0]; r.updated_at = a[1]; }
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_read_sessions SET ended_at = ?, updated_at = ? WHERE id = ? AND ended_at IS NULL')) {
+      const r = this.trackSessions.find(x => x.id === a[2] && x.ended_at == null);
+      if (r) { r.ended_at = a[0]; r.updated_at = a[1]; return { changes: 1 }; }
+      return { changes: 0 };
+    }
+    if (s.startsWith('SELECT target_id FROM cerpen_read_sessions WHERE owner_key = ? AND started_at >= ?')) {
+      return this.trackSessions.filter(x => x.owner_key === a[0] && x.started_at >= a[1]).map(x => ({ target_id: x.target_id }));
+    }
+    if (s.startsWith('SELECT device_id FROM cerpen_read_sessions WHERE user_id = ? AND ended_at IS NULL')) {
+      return this.trackSessions.filter(x => x.user_id === a[0] && x.ended_at == null).map(x => ({ device_id: x.device_id }));
+    }
+    if (s.startsWith('SELECT id, kind, target_id, season, no, started_at, ended_at, seconds FROM cerpen_read_sessions WHERE owner_key = ? ORDER BY started_at DESC LIMIT 50')) {
+      return this.trackSessions.filter(x => x.owner_key === a[0]).sort((x, y) => y.started_at - x.started_at).slice(0, 50).map(x => ({ id: x.id, kind: x.kind, target_id: x.target_id, season: x.season, no: x.no, started_at: x.started_at, ended_at: x.ended_at, seconds: x.seconds }));
+    }
+    if (s.startsWith("SELECT target_id, SUM(seconds) AS total FROM cerpen_read_sessions WHERE kind = 'cerpen' AND started_at >= ? GROUP BY target_id ORDER BY total DESC LIMIT 10")) {
+      const m = new Map();
+      for (const x of this.trackSessions) if (x.kind === 'cerpen' && x.started_at >= a[0]) m.set(x.target_id, (m.get(x.target_id) || 0) + (Number(x.seconds) || 0));
+      return [...m.entries()].sort((p, q) => q[1] - p[1]).slice(0, 10).map(([target_id, total]) => ({ target_id, total }));
+    }
+    if (s.startsWith('SELECT owner_key, SUM(seconds) AS total FROM cerpen_read_sessions WHERE started_at >= ? GROUP BY owner_key ORDER BY total DESC LIMIT 10')) {
+      const m = new Map();
+      for (const x of this.trackSessions) if (x.started_at >= a[0]) m.set(x.owner_key, (m.get(x.owner_key) || 0) + (Number(x.seconds) || 0));
+      return [...m.entries()].sort((p, q) => q[1] - p[1]).slice(0, 10).map(([owner_key, total]) => ({ owner_key, total }));
+    }
+    if (s.startsWith('SELECT COALESCE(SUM(seconds), 0) AS s FROM cerpen_read_sessions WHERE started_at >= ?')) return [{ s: this.trackSessions.filter(x => x.started_at >= a[0]).reduce((t, x) => t + (Number(x.seconds) || 0), 0) }];
+    // -- cerpen_commands --
+    if (s.startsWith('SELECT id, owner_key, kind, payload, created_at FROM cerpen_commands WHERE owner_key IN (')) {
+      // a = daftar owner_key (jumlah dinamis: owner + device)
+      return this.trackCommands.filter(x => a.includes(x.owner_key) && x.status === 'pending').sort((x, y) => x.created_at - y.created_at).map(x => ({ id: x.id, owner_key: x.owner_key, kind: x.kind, payload: x.payload, created_at: x.created_at }));
+    }
+    if (s.startsWith('INSERT INTO cerpen_commands')) {
+      // (id, owner_key, user_id, device_id, kind, payload, created_at, note) — status 'pending', created_by 'admin'
+      this.trackCommands.push({ id: a[0], owner_key: a[1], user_id: a[2], device_id: a[3], kind: a[4], payload: a[5], status: 'pending', created_at: a[6], created_by: 'admin', delivered_at: null, executed_at: null, note: a[7] });
+      return [];
+    }
+    if (s.startsWith("UPDATE cerpen_commands SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'pending'")) {
+      const c = this.trackCommands.find(x => x.id === a[1] && x.status === 'pending');
+      if (c) { c.status = 'delivered'; c.delivered_at = a[0]; return { changes: 1 }; }
+      return { changes: 0 };
+    }
+    if (s.startsWith("UPDATE cerpen_commands SET status = 'executed', executed_at = ? WHERE id = ? AND status IN ('pending', 'delivered')")) {
+      const c = this.trackCommands.find(x => x.id === a[1] && (x.status === 'pending' || x.status === 'delivered'));
+      if (c) { c.status = 'executed'; c.executed_at = a[0]; return { changes: 1 }; }
+      return { changes: 0 };
+    }
+    if (s.startsWith("UPDATE cerpen_commands SET status = 'expired' WHERE id = ? AND status = 'pending'")) {
+      const c = this.trackCommands.find(x => x.id === a[0] && x.status === 'pending');
+      if (c) { c.status = 'expired'; return { changes: 1 }; }
+      return { changes: 0 };
+    }
+    if (s.startsWith('SELECT id, owner_key, user_id, device_id, kind, payload, status, created_at, created_by, delivered_at, executed_at, note FROM cerpen_commands WHERE owner_key = ? ORDER BY created_at DESC LIMIT 20')) {
+      return this.trackCommands.filter(x => x.owner_key === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 20).map(x => ({ ...x }));
+    }
+    if (s.startsWith('SELECT id, owner_key, user_id, device_id, kind, payload, status, created_at, created_by, delivered_at, executed_at, note FROM cerpen_commands WHERE status = ? ORDER BY created_at DESC LIMIT ?')) {
+      return this.trackCommands.filter(x => x.status === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, a[1]).map(x => ({ ...x }));
+    }
+    if (s.startsWith('SELECT id, owner_key, user_id, device_id, kind, payload, status, created_at, created_by, delivered_at, executed_at, note FROM cerpen_commands ORDER BY created_at DESC LIMIT ?')) {
+      return [...this.trackCommands].sort((x, y) => y.created_at - x.created_at).slice(0, a[0]).map(x => ({ ...x }));
+    }
+    if (s.startsWith("SELECT COUNT(*) AS c FROM cerpen_commands WHERE status = 'pending'")) return [{ c: this.trackCommands.filter(x => x.status === 'pending').length }];
+    // -- cerpen_watchlist --
+    if (s.startsWith('INSERT INTO cerpen_watchlist')) {
+      // (id, subject_type, subject_id, owner_key, reason, evidence, score, created_at, updated_at) — status 'watching'
+      this.trackWatchlist.push({ id: a[0], subject_type: a[1], subject_id: a[2], owner_key: a[3], reason: a[4], evidence: a[5], score: a[6], status: 'watching', created_at: a[7], updated_at: a[8], reviewed_by: null, reviewed_at: null, review_note: '' });
+      return [];
+    }
+    if (s.startsWith("SELECT id, subject_type, subject_id, owner_key, reason, evidence, score, status, created_at, updated_at FROM cerpen_watchlist WHERE subject_type = ? AND subject_id = ? AND status = 'watching'")) {
+      const w = this.trackWatchlist.find(x => x.subject_type === a[0] && x.subject_id === a[1] && x.status === 'watching');
+      return w ? [{ ...w }] : [];
+    }
+    if (s.startsWith("SELECT id FROM cerpen_watchlist WHERE subject_type = ? AND subject_id = ? AND status = 'not_same_person'")) {
+      const w = this.trackWatchlist.find(x => x.subject_type === a[0] && x.subject_id === a[1] && x.status === 'not_same_person');
+      return w ? [{ id: w.id }] : [];
+    }
+    if (s.startsWith('SELECT id, subject_type, subject_id, owner_key, reason, evidence, score, status, created_at, updated_at FROM cerpen_watchlist WHERE owner_key = ? ORDER BY updated_at DESC LIMIT 10')) {
+      return this.trackWatchlist.filter(x => x.owner_key === a[0]).sort((x, y) => y.updated_at - x.updated_at).slice(0, 10).map(x => ({ ...x }));
+    }
+    if (s.startsWith('SELECT id, subject_type, subject_id, owner_key, reason, evidence, score, status, created_at, updated_at FROM cerpen_watchlist WHERE status = ? ORDER BY updated_at DESC LIMIT ?')) {
+      return this.trackWatchlist.filter(x => x.status === a[0]).sort((x, y) => y.updated_at - x.updated_at).slice(0, a[1]).map(x => ({ ...x }));
+    }
+    if (s.startsWith("SELECT id, subject_type, subject_id, owner_key, reason, evidence, score, status, created_at, updated_at FROM cerpen_watchlist WHERE status = 'watching' ORDER BY updated_at DESC LIMIT 20")) {
+      return this.trackWatchlist.filter(x => x.status === 'watching').sort((x, y) => y.updated_at - x.updated_at).slice(0, 20).map(x => ({ ...x }));
+    }
+    if (s.startsWith('SELECT id, subject_type, subject_id, owner_key, reason, evidence, score, status, created_at, updated_at FROM cerpen_watchlist ORDER BY updated_at DESC LIMIT ?')) {
+      return [...this.trackWatchlist].sort((x, y) => y.updated_at - x.updated_at).slice(0, a[0]).map(x => ({ ...x }));
+    }
+    if (s.startsWith('SELECT id, subject_type, subject_id, owner_key, reason, evidence, score, status, created_at, updated_at FROM cerpen_watchlist WHERE id = ?')) {
+      const w = this.trackWatchlist.find(x => x.id === a[0]);
+      return w ? [{ ...w }] : [];
+    }
+    if (s.startsWith('UPDATE cerpen_watchlist SET score = ?, evidence = ?, updated_at = ? WHERE id = ?')) {
+      const w = this.trackWatchlist.find(x => x.id === a[3]);
+      if (w) { w.score = a[0]; w.evidence = a[1]; w.updated_at = a[2]; }
+      return [];
+    }
+    if (s.startsWith("UPDATE cerpen_watchlist SET status = 'banned', updated_at = ? WHERE id = ?")) {
+      const w = this.trackWatchlist.find(x => x.id === a[1]);
+      if (w) { w.status = 'banned'; w.updated_at = a[0]; }
+      return [];
+    }
+    if (s.startsWith("UPDATE cerpen_watchlist SET status = 'banned', reviewed_by = 'admin', reviewed_at = ?, review_note = ?, updated_at = ? WHERE id = ?")) {
+      const w = this.trackWatchlist.find(x => x.id === a[3]);
+      if (w) { w.status = 'banned'; w.reviewed_by = 'admin'; w.reviewed_at = a[0]; w.review_note = a[1]; w.updated_at = a[2]; }
+      return [];
+    }
+    if (s.startsWith('UPDATE cerpen_watchlist SET status = ?, reviewed_by = ?, reviewed_at = ?, review_note = ?, updated_at = ? WHERE id = ?')) {
+      const w = this.trackWatchlist.find(x => x.id === a[5]);
+      if (w) { w.status = a[0]; w.reviewed_by = a[1]; w.reviewed_at = a[2]; w.review_note = a[3]; w.updated_at = a[4]; }
+      return [];
+    }
+    if (s.startsWith("SELECT COUNT(*) AS c FROM cerpen_watchlist WHERE status = 'watching'")) return [{ c: this.trackWatchlist.filter(x => x.status === 'watching').length }];
+    // -- cerpen_detection_events --
+    if (s.startsWith('INSERT INTO cerpen_detection_events')) {
+      // (id, kind, owner_key, device_id, user_id, detail, score, created_at)
+      this.trackDetections.push({ id: a[0], kind: a[1], owner_key: a[2], device_id: a[3], user_id: a[4], detail: a[5], score: a[6], created_at: a[7] });
+      return [];
+    }
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_detection_events WHERE kind = ? AND owner_key = ? AND created_at >= ?')) return [{ c: this.trackDetections.filter(x => x.kind === a[0] && x.owner_key === a[1] && x.created_at >= a[2]).length }];
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_detection_events WHERE created_at >= ?')) return [{ c: this.trackDetections.filter(x => x.created_at >= a[0]).length }];
+    if (s.startsWith('SELECT id, kind, owner_key, device_id, user_id, detail, score, created_at FROM cerpen_detection_events WHERE kind = ? ORDER BY created_at DESC LIMIT ?')) {
+      return this.trackDetections.filter(x => x.kind === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, a[1]).map(x => ({ ...x }));
+    }
+    if (s.startsWith('SELECT id, kind, detail, score, created_at FROM cerpen_detection_events WHERE owner_key = ? ORDER BY created_at DESC LIMIT 20')) {
+      return this.trackDetections.filter(x => x.owner_key === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 20).map(x => ({ id: x.id, kind: x.kind, detail: x.detail, score: x.score, created_at: x.created_at }));
+    }
+    if (s.startsWith('SELECT id, kind, owner_key, device_id, user_id, detail, score, created_at FROM cerpen_detection_events ORDER BY created_at DESC LIMIT ?')) {
+      return [...this.trackDetections].sort((x, y) => y.created_at - x.created_at).slice(0, a[0]).map(x => ({ ...x }));
+    }
+    if (s.startsWith('SELECT id, kind, owner_key, device_id, user_id, detail, score, created_at FROM cerpen_detection_events ORDER BY created_at DESC LIMIT 20')) {
+      return [...this.trackDetections].sort((x, y) => y.created_at - x.created_at).slice(0, 20).map(x => ({ ...x }));
+    }
+    // -- cerpen_behavior_profiles --
+    if (s.startsWith('SELECT owner_key, fingerprint_hash, series_json, hours_json, avg_session_seconds, total_sessions, redeem_attempts, redeem_failed, updated_at FROM cerpen_behavior_profiles WHERE owner_key = ?')) {
+      const p = this.trackProfiles.get(a[0]);
+      return p ? [{ ...p }] : [];
+    }
+    if (s.startsWith('SELECT owner_key, fingerprint_hash, series_json, hours_json, avg_session_seconds, total_sessions, redeem_attempts, redeem_failed, updated_at FROM cerpen_behavior_profiles ORDER BY updated_at DESC LIMIT 200')) {
+      return [...this.trackProfiles.values()].sort((x, y) => y.updated_at - x.updated_at).slice(0, 200).map(p => ({ ...p }));
+    }
+    if (s.startsWith('INSERT OR REPLACE INTO cerpen_behavior_profiles')) {
+      // (owner_key, fingerprint_hash, series_json, hours_json, avg_session_seconds, total_sessions, updated_at) — redeem_* literal 0
+      this.trackProfiles.set(a[0], { owner_key: a[0], fingerprint_hash: a[1], series_json: a[2], hours_json: a[3], avg_session_seconds: a[4], total_sessions: a[5], redeem_attempts: 0, redeem_failed: 0, updated_at: a[6] });
+      return [];
+    }
+    // -- cerpen_admins (god-mode admin, 21 Nov 2026) --
+    if (s.startsWith('INSERT OR IGNORE INTO cerpen_admins')) {
+      // Seed literal di store.js: VALUES ('u-mwf1z8n0', '', NULL, '...').
+      const m = s.match(/VALUES \('([^']+)', '([^']*)',/);
+      const uid = m ? m[1] : 'u-mwf1z8n0';
+      if (!this.cerpenAdmins.has(uid)) this.cerpenAdmins.set(uid, { user_id: uid, fingerprint_hash: m ? m[2] : '', bound_at: null, note: 'hozinking — god-mode admin' });
+      return [];
+    }
+    if (s.startsWith('SELECT user_id, fingerprint_hash, bound_at, note FROM cerpen_admins WHERE user_id = ?')) {
+      const row = this.cerpenAdmins.get(a[0]);
+      return row ? [{ ...row }] : [];
+    }
+    if (s.startsWith('SELECT user_id FROM cerpen_admins WHERE fingerprint_hash = ?')) {
+      const row = [...this.cerpenAdmins.values()].find(x => x.fingerprint_hash === a[0] && x.fingerprint_hash);
+      return row ? [{ user_id: row.user_id }] : [];
+    }
+    if (s.startsWith('UPDATE cerpen_admins SET fingerprint_hash = ?, bound_at = ? WHERE user_id = ?')) {
+      const row = this.cerpenAdmins.get(a[2]);
+      if (row) { row.fingerprint_hash = a[0]; row.bound_at = a[1]; }
+      return [];
+    }
+    if (s.startsWith('SELECT device_id, fingerprint_hash FROM cerpen_track_users WHERE owner_key = ?')) {
+      const u = this.trackUsers.get(a[0]);
+      return u ? [{ device_id: u.device_id, fingerprint_hash: u.fingerprint_hash }] : [];
+    }
+    if (s.startsWith('SELECT user_id FROM cerpen_track_users WHERE device_id = ?')) {
+      const u = [...this.trackUsers.values()].find(x => x.device_id === a[0]);
+      return u ? [{ user_id: u.user_id }] : [];
+    }
+    // -- cerpen_bans (varian baru modul track) --
+    if (s.startsWith("SELECT id, reason, expires_at FROM cerpen_bans WHERE target_type = 'device' AND target_id = ? AND active = 1")) return this.coinBans.filter(b => b.target_type === 'device' && b.target_id === a[0] && b.active === 1).map(b => ({ id: b.id, reason: b.reason, expires_at: b.expires_at }));
+    if (s.startsWith("SELECT id, reason, expires_at FROM cerpen_bans WHERE target_type = 'fingerprint' AND target_id = ? AND active = 1")) return this.coinBans.filter(b => b.target_type === 'fingerprint' && b.target_id === a[0] && b.active === 1).map(b => ({ id: b.id, reason: b.reason, expires_at: b.expires_at }));
+    if (s.startsWith('SELECT id, target_type, target_id, reason, expires_at, active FROM cerpen_bans WHERE target_type = ? AND target_id = ? AND active = 1')) return this.coinBans.filter(b => b.target_type === a[0] && b.target_id === a[1] && b.active === 1).map(b => ({ id: b.id, target_type: b.target_type, target_id: b.target_id, reason: b.reason, expires_at: b.expires_at, active: b.active }));
+    if (s.startsWith('SELECT target_type, target_id FROM cerpen_bans WHERE active = 1')) return this.coinBans.filter(b => b.active === 1).map(b => ({ target_type: b.target_type, target_id: b.target_id }));
+    if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_bans WHERE active = 1')) return [{ c: this.coinBans.filter(b => b.active === 1).length }];
+    if (s.startsWith('SELECT id, target_type, target_id, reason, banned_by, created_at, expires_at, active FROM cerpen_bans WHERE active = 1 ORDER BY created_at DESC LIMIT ?')) {
+      return [...this.coinBans].filter(b => b.active === 1).sort((x, y) => y.created_at - x.created_at).slice(0, a[0]).map(b => ({ id: b.id, target_type: b.target_type, target_id: b.target_id, reason: b.reason, banned_by: b.banned_by, created_at: b.created_at, expires_at: b.expires_at, active: b.active }));
+    }
+    if (s.startsWith('SELECT id, target_type, target_id, reason, banned_by, created_at, expires_at, active FROM cerpen_bans WHERE active = 1 ORDER BY created_at DESC LIMIT 20')) {
+      return [...this.coinBans].filter(b => b.active === 1).sort((x, y) => y.created_at - x.created_at).slice(0, 20).map(b => ({ id: b.id, target_type: b.target_type, target_id: b.target_id, reason: b.reason, banned_by: b.banned_by, created_at: b.created_at, expires_at: b.expires_at, active: b.active }));
+    }
+    if (s.startsWith('SELECT id, target_type, target_id, reason, banned_by, created_at, expires_at, active, unbanned_at, unban_note FROM cerpen_bans ORDER BY created_at DESC LIMIT ?')) {
+      return [...this.coinBans].sort((x, y) => y.created_at - x.created_at).slice(0, a[0]).map(b => ({ ...b }));
+    }
+    if (s.startsWith("SELECT id, target_type, target_id, reason, banned_by, created_at, expires_at, active, unbanned_at, unban_note FROM cerpen_bans WHERE (target_type = 'user' AND target_id = ?) OR (target_type = 'device' AND target_id = ?) ORDER BY created_at DESC LIMIT 10")) {
+      return [...this.coinBans].filter(b => (b.target_type === 'user' && b.target_id === a[0]) || (b.target_type === 'device' && b.target_id === a[1])).sort((x, y) => y.created_at - x.created_at).slice(0, 10).map(b => ({ ...b }));
+    }
+    // -- cerpen_coin_events (sinyal redeem_failed untuk deteksi) --
+    if (s.startsWith("SELECT COUNT(*) AS c FROM cerpen_coin_events WHERE kind = 'redeem_failed' AND device_id = ? AND created_at >= ?")) return [{ c: this.coinEvents.filter(x => x.kind === 'redeem_failed' && x.device_id === a[0] && x.created_at >= a[1]).length }];
+    if (s.startsWith("SELECT COUNT(*) AS c FROM cerpen_coin_events WHERE kind = 'redeem_failed' AND user_id = ? AND created_at >= ?")) return [{ c: this.coinEvents.filter(x => x.kind === 'redeem_failed' && x.user_id === a[0] && x.created_at >= a[1]).length }];
+    // -- voucher: log penukaran (varian track) --
+    if (s.startsWith('SELECT id, code_hash, owner_key, device_id, user_id, created_at FROM cerpen_voucher_redemptions WHERE owner_key = ? ORDER BY created_at DESC LIMIT 20')) {
+      return this.coinRedemptions.filter(x => x.owner_key === a[0]).sort((x, y) => y.created_at - x.created_at).slice(0, 20).map(x => ({ ...x }));
+    }
+    if (s.startsWith('SELECT id, code_hash, owner_key, device_id, user_id, created_at FROM cerpen_voucher_redemptions ORDER BY created_at DESC LIMIT ?')) {
+      return [...this.coinRedemptions].sort((x, y) => y.created_at - x.created_at).slice(0, a[0]).map(x => ({ ...x }));
+    }
+    if (s.startsWith('SELECT code_hash, batch_id FROM cerpen_vouchers')) return [...this.coinVouchers.values()].map(v => ({ code_hash: v.code_hash, batch_id: v.batch_id }));
+    if (s.startsWith('SELECT batch_id, reward_type, reward_coins, reward_value, reward_target_kind, reward_target_id, reward_season, reward_no FROM cerpen_voucher_batches')) {
+      return [...this.coinBatches.values()].map(b => ({ batch_id: b.batch_id, reward_type: b.reward_type, reward_coins: b.reward_coins, reward_value: b.reward_value, reward_target_kind: b.reward_target_kind, reward_target_id: b.reward_target_id, reward_season: b.reward_season, reward_no: b.reward_no }));
+    }
+    // -- cms_users (nama untuk detail pengguna) --
+    if (s.startsWith('SELECT username FROM cms_users WHERE id = ?')) {
+      const u = this.users.get(a[0]);
+      return u ? [{ username: u.username }] : [];
+    }
+
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
 }
@@ -3775,4 +4127,319 @@ sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.transactions.length === 0 && sj.categories.length === 1, 'dompet: backup sembunyikan baris deleted=1');
 r = await dompetCall('GET', '/api/dompet/ngaco', null);
 assert(r.status === 404, 'dompet: segmen tak dikenal -> 404');
+// v1.1.40+: Paket Admin/Keamanan Cerpen — tracking + API key + perintah
+// paksa + deteksi + watchlist + ban anti-bypass + pola perilaku.
+// Semua lewat gerbang versi (coinCall membawa CERPEN_APP_H).
+const TRK_A = 'aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa';
+const TRK_B = 'bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb';
+const TRK_C = 'cccccccc-3333-4ccc-8ccc-cccccccccccc';
+const TRK_D = 'dddddddd-4444-4ddd-8ddd-dddddddddddd';
+const TRK_E = 'eeeeeeee-5555-4eee-8eee-eeeeeeeeeeee';
+// Panel + token CSRF (dipakai semua panggilan admin track).
+r = await call('GET', '/kendali/cerpen-pantau', null, cookie);
+t = await r.text();
+assert(r.status === 200 && t.includes('Pantau Cerpen') && t.includes('Live') && t.includes('Watchlist') && t.includes('Ambang deteksi'), 'track panel: /kendali/cerpen-pantau tampil + kartu ringkasan/watchlist/ambang');
+const trackCsrf = (t.match(/TRACK_CSRF = "([^"]+)"/) || [])[1] || '';
+assert(trackCsrf.length > 10, 'track panel: token CSRF terbaca dari panel');
+async function trackAdmin(path, method, obj) {
+  return coinCall(method, path, obj, { 'x-csrf': trackCsrf, cookie });
+}
+// Admin tanpa sesi / CSRF salah.
+r = await coinCall('GET', '/api/admin/cerpen-track/overview', null);
+assert(r.status === 401, 'track admin: tanpa sesi admin -> 401');
+r = await coinCall('GET', '/api/admin/cerpen-track/overview', null, { 'x-csrf': 'salah', cookie });
+assert(r.status === 403, 'track admin: CSRF salah -> 403');
+// Validasi register.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: 'bukan-uuid', fingerprint: 'fp-track-a-12345678' });
+assert(r.status === 400, 'track register: device_id bukan UUID -> 400');
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: TRK_A, fingerprint: 'pendek' });
+assert(r.status === 400, 'track register: fingerprint terlalu pendek -> 400');
+// Register guest -> kunci ck-... diterbitkan sekali.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: TRK_A, fingerprint: 'fp-track-a-12345678', device_model: 'POCO X6 Pro', app_version: '1.1.39' });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.ok === true && /^ck-[0-9a-f]{32}$/.test(rj.api_key || '') && rj.key_id && rj.user_id === 'device:' + TRK_A, 'track register: guest dapat kunci ck-... (201)');
+const KEY_A = rj.api_key;
+const KEY_A_ID = rj.key_id;
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: TRK_A, fingerprint: 'fp-track-a-12345678' });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.key_exists === true && !rj.api_key, 'track register: kunci aktif sudah ada -> key_exists, tanpa plaintext lagi');
+// Heartbeat: tanpa kunci / kunci salah / kunci benar + sesi baca.
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { reading_seconds: 30 });
+assert(r.status === 401, 'track heartbeat: tanpa kunci -> 401');
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: 'ck-' + '0'.repeat(32), reading_seconds: 30 });
+assert(r.status === 401, 'track heartbeat: kunci tidak dikenal -> 401');
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_A, reading: { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 1 }, reading_seconds: 60 }, { 'x-cerpen-api-key': KEY_A });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.banned === false && Array.isArray(rj.commands), 'track heartbeat: kunci valid -> 200 + sesi dibuka');
+assert(env.DB.trackSessions.some(s => s.owner_key === 'device:' + TRK_A && s.target_id === 'cerpen-01' && s.seconds === 60 && s.ended_at == null), 'track heartbeat: sesi baca terbuka, detik terakumulasi 60');
+// Tutup sesi eksplisit: 60 + 30 = 90 detik.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/session/end', { api_key: KEY_A, reading_seconds: 30 }, { 'x-cerpen-api-key': KEY_A });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.closed === true && rj.seconds === 90, 'track session/end: sesi ditutup, detik terakumulasi 60+30');
+// Status: wajib kunci, kunci valid -> 200.
+r = await coinCall('GET', '/api/cerpen-track/status', null);
+assert(r.status === 401, 'track status: tanpa kunci -> 401');
+r = await coinCall('GET', '/api/cerpen-track/status?api_key=' + encodeURIComponent(KEY_A), null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.banned === false, 'track status: kunci valid -> 200');
+// Rotate: kunci lama dicabut, kunci baru jalan.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/key/rotate', {}, { 'x-cerpen-api-key': KEY_A });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && /^ck-[0-9a-f]{32}$/.test(rj.api_key || '') && rj.api_key !== KEY_A, 'track rotate: kunci lama -> kunci baru diterbitkan');
+const KEY_T2 = rj.api_key;
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_A, reading_seconds: 10 }, { 'x-cerpen-api-key': KEY_A });
+assert(r.status === 403, 'track rotate: kunci lama sudah dicabut -> 403');
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_T2 }, { 'x-cerpen-api-key': KEY_T2 });
+assert(r.status === 200, 'track rotate: kunci baru jalan');
+// Perintah paksa: kick diantrekan -> diterima heartbeat -> ack -> executed.
+env.DB.rateLimits = new Map();
+r = await trackAdmin('/api/admin/cerpen-track/commands', 'POST', { owner_key: 'device:' + TRK_A, kind: 'kick', note: 'uji kick' });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.ok === true && rj.kind === 'kick', 'track command: kick diantrekan admin (201)');
+const CMD_ID = rj.id;
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_T2 }, { 'x-cerpen-api-key': KEY_T2 });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.commands.length === 1 && rj.commands[0].kind === 'kick', 'track command: heartbeat menerima perintah kick');
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_T2, acked: [CMD_ID] }, { 'x-cerpen-api-key': KEY_T2 });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.commands.length === 0, 'track command: ack -> perintah tidak dikirim lagi');
+r = await trackAdmin('/api/admin/cerpen-track/commands?status=executed&limit=10', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.commands.some(c => c.id === CMD_ID && c.status === 'executed'), 'track command: status executed tercatat di panel admin');
+// Perintah bisa dibatalkan sebelum dikirim.
+env.DB.rateLimits = new Map();
+r = await trackAdmin('/api/admin/cerpen-track/commands', 'POST', { owner_key: 'device:' + TRK_A, kind: 'crash', note: 'uji batal' });
+const CMD2 = JSON.parse(await r.text()).id;
+r = await trackAdmin('/api/admin/cerpen-track/commands/' + CMD2 + '/cancel', 'POST', {});
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'track command: perintah pending bisa dibatalkan');
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_T2 }, { 'x-cerpen-api-key': KEY_T2 });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && !rj.commands.some(c => c.id === CMD2), 'track command: perintah yang dibatalkan tidak dikirim');
+// Overview / live / daftar pengguna / detail / ringkasan.
+env.DB.rateLimits = new Map();
+r = await trackAdmin('/api/admin/cerpen-track/overview', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.users >= 1 && rj.online >= 1 && rj.pending_commands === 0, 'track overview: pengguna + online tercatat');
+r = await trackAdmin('/api/admin/cerpen-track/live', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && Array.isArray(rj.live) && rj.live.length >= 1, 'track live: ada pengguna online');
+r = await trackAdmin('/api/admin/cerpen-track/users?q=' + TRK_A.slice(0, 8), 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.users.some(u => u.device_id === TRK_A), 'track users: pencarian device_id menemukan pengguna');
+r = await trackAdmin('/api/admin/cerpen-track/users/' + encodeURIComponent('device:' + TRK_A), 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.user.owner_key === 'device:' + TRK_A && Array.isArray(rj.sessions) && rj.sessions.length >= 1 && rj.profile.total_sessions >= 1, 'track user detail: sesi + profil perilaku tampil');
+r = await trackAdmin('/api/admin/cerpen-track/summary', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.top_series.some(s => s.target_id === 'cerpen-01' && s.seconds >= 90) && rj.total_seconds_7d >= 90, 'track summary: cerpen-01 terpopuler + total jam baca');
+// Ambang deteksi: default, ubah, kembalikan.
+r = await trackAdmin('/api/admin/cerpen-track/settings', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.settings.enabled === 1 && rj.settings.watchScore === 40 && rj.settings.autoBanScore === 100 && rj.settings.behaviorMatch === 50 && rj.settings.behaviorBan === 80 && rj.integrity_configured === false, 'track settings: ambang default + Play Integrity belum diset');
+r = await trackAdmin('/api/admin/cerpen-track/settings', 'POST', { watch_score: 50 });
+assert(r.status === 200 && JSON.parse(await r.text()).settings.watchScore === 50, 'track settings: ambang watch diubah ke 50');
+r = await trackAdmin('/api/admin/cerpen-track/settings', 'POST', { watch_score: 40 });
+assert(r.status === 200 && JSON.parse(await r.text()).settings.watchScore === 40, 'track settings: ambang watch dikembalikan ke 40');
+// Root SENDIRIAN: tetap bisa daftar + heartbeat, tanpa skor, tanpa watchlist (aturan keras).
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: TRK_B, fingerprint: 'fp-track-b-12345678', is_rooted: true, root_methods: ['su'], device_model: 'POCO X6 Pro (root)' });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.api_key, 'track root: perangkat root tetap bisa register');
+const KEY_B = rj.api_key;
+const KEY_B_ID = rj.key_id;
+assert(env.DB.trackUsers.get('device:' + TRK_B).is_rooted === 1, 'track root: flag root tersimpan sebagai flag (bukan hukuman)');
+const detBeforeRoot = env.DB.trackDetections.length;
+const wlBeforeRoot = env.DB.trackWatchlist.length;
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_B, is_rooted: true, root_methods: ['su'] }, { 'x-cerpen-api-key': KEY_B });
+assert(r.status === 200, 'track root: heartbeat perangkat root jalan');
+assert(env.DB.trackDetections.length === detBeforeRoot && env.DB.trackWatchlist.length === wlBeforeRoot, 'track root: root SENDIRIAN tidak menaikkan skor / tidak masuk watchlist');
+// Brute force redeem: 5x gagal dalam 1 jam -> +40 -> watchlist.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: TRK_C, fingerprint: 'fp-track-c-12345678' });
+const KEY_C = JSON.parse(await r.text()).api_key;
+for (let i = 0; i < 5; i++) env.DB.coinEvents.push({ id: 'ce-trk-' + i, kind: 'redeem_failed', device_id: TRK_C, android_id: '', user_id: null, detail: 'kode salah', created_at: Date.now() - i * 60000 });
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_C }, { 'x-cerpen-api-key': KEY_C });
+assert(r.status === 200, 'track deteksi: heartbeat setelah 5x redeem gagal tetap 200 (watchlist, bukan blokir)');
+assert(env.DB.trackDetections.some(d => d.kind === 'redeem_bruteforce' && d.owner_key === 'device:' + TRK_C && d.score === 40), 'track deteksi: brute force redeem tercatat (+40)');
+assert(env.DB.trackWatchlist.some(w => w.owner_key === 'device:' + TRK_C && w.status === 'watching'), 'track deteksi: skor 40 >= watch -> masuk watchlist');
+const wlC = env.DB.trackWatchlist.find(w => w.owner_key === 'device:' + TRK_C && w.status === 'watching');
+r = await trackAdmin('/api/admin/cerpen-track/watchlist/' + wlC.id + '/review', 'POST', { status: 'not_same_person', note: 'uji tinjauan' });
+assert(r.status === 200 && JSON.parse(await r.text()).status === 'not_same_person', 'track watchlist: tinjauan "bukan orang yang sama" diterima');
+// Baca super cepat: 8 episode berbeda dalam 10 menit -> +40 -> watchlist.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: TRK_D, fingerprint: 'fp-track-d-12345678' });
+const KEY_TD = JSON.parse(await r.text()).api_key;
+const nowD = Date.now();
+for (let i = 0; i < 8; i++) env.DB.trackSessions.push({ id: 'rs-seed-' + i, owner_key: 'device:' + TRK_D, user_id: null, device_id: TRK_D, kind: 'cerpen', target_id: 'cerpen-0' + (i + 1), season: 1, no: 1, started_at: nowD - i * 30000, ended_at: nowD - i * 30000 + 10000, seconds: 10, app_version: '1.1.39', updated_at: nowD });
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_TD }, { 'x-cerpen-api-key': KEY_TD });
+assert(r.status === 200, 'track deteksi: baca super cepat -> heartbeat tetap 200');
+assert(env.DB.trackDetections.some(d => d.kind === 'reading_too_fast' && d.owner_key === 'device:' + TRK_D), 'track deteksi: 8 episode/10 menit tercatat (+40) + masuk watchlist');
+// Pencocokan pola perilaku: akun dibanned + profilnya di-seed; pengguna
+// baru dengan pola baca sama (3 series sama, jam mirip) -> >=50% -> pantau.
+env.DB.rateLimits = new Map();
+r = await trackAdmin('/api/admin/cerpen-track/bans', 'POST', { target_type: 'user', target_id: 'u-banneduji', reason: 'uji pola perilaku' });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.ok === true, 'track behavior: ban akun uji dibuat');
+const BANNED_OWNER = 'user:u-banneduji';
+const hourNow = new Date(Date.now() + 7 * 3600 * 1000).getUTCHours();
+const bannedHours = new Array(24).fill(0);
+bannedHours[hourNow] = 6; bannedHours[(hourNow + 5) % 24] = 6;
+env.DB.trackProfiles.set(BANNED_OWNER, { owner_key: BANNED_OWNER, fingerprint_hash: 'x'.repeat(64), series_json: JSON.stringify({ 'cerpen:cerpen-01': 5, 'cerpen:cerpen-02': 4, 'cerpen:cerpen-03': 3 }), hours_json: JSON.stringify(bannedHours), avg_session_seconds: 60, total_sessions: 5, redeem_attempts: 0, redeem_failed: 0, updated_at: Date.now() });
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: TRK_E, fingerprint: 'fp-track-e-12345678' });
+const KEY_E = JSON.parse(await r.text()).api_key;
+async function hbE(target, secs) {
+  env.DB.rateLimits = new Map();
+  return coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_E, reading: { kind: 'cerpen', target_id: target, season: 1, no: 1 }, reading_seconds: secs }, { 'x-cerpen-api-key': KEY_E });
+}
+await hbE('cerpen-01', 30);
+await hbE('cerpen-02', 30);
+await hbE('cerpen-03', 30);
+await hbE('cerpen-01', 30);
+env.DB.trackUsers.get('device:' + TRK_E).last_eval_at = 0;
+await hbE('cerpen-01', 30);
+assert(env.DB.trackWatchlist.some(w => w.owner_key === 'device:' + TRK_E && w.status === 'watching' && (w.reason || '').includes('pola perilaku')), 'track behavior: kemiripan ~75% dengan pengguna dibanned -> masuk daftar pantau (belum auto-ban di bawah 80%)');
+// Ban perangkat: kunci dicabut + fingerprint ikut dibanned + tolak di koin lama.
+env.DB.rateLimits = new Map();
+r = await trackAdmin('/api/admin/cerpen-track/bans', 'POST', { target_type: 'device', target_id: TRK_B, reason: 'uji ban perangkat' });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.ok === true, 'track ban: ban perangkat dibuat (201)');
+const BAN_B_ID = rj.id;
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_B }, { 'x-cerpen-api-key': KEY_B });
+rj = JSON.parse(await r.text());
+assert(r.status === 403 && rj.error === 'banned', 'track ban: kunci dicabut -> heartbeat 403 banned');
+r = await coinCall('GET', '/api/cerpen-coins/me?device_id=' + TRK_B, null, { 'x-cerpen-api-key': KEY_B });
+assert(r.status === 403, 'track ban: kunci dicabut -> 403 di endpoint koin lama');
+r = await trackAdmin('/api/admin/cerpen-track/keys', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.keys.some(k => k.key_id === KEY_B_ID), 'track ban: kunci B tampil di daftar kunci dicabut');
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: 'aaaaaaaa-9999-4aaa-8aaa-aaaaaaaaaaaa', fingerprint: 'fp-track-b-12345678' });
+assert(r.status === 403, 'track ban: perangkat baru dengan fingerprint sama tetap ditolak (anti-bypass)');
+// Unban perangkat -> kunci dipulihkan, tapi fingerprint masih dibanned.
+r = await trackAdmin('/api/admin/cerpen-track/bans/' + BAN_B_ID + '/unban', 'POST', { note: 'uji unban' });
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'track unban: ban perangkat dicabut');
+r = await trackAdmin('/api/admin/cerpen-track/keys', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && !rj.keys.some(k => k.key_id === KEY_B_ID), 'track unban: kunci yang dicabut oleh ban itu dipulihkan');
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_B }, { 'x-cerpen-api-key': KEY_B });
+assert(r.status === 403, 'track unban: fingerprint masih dibanned -> heartbeat tetap 403');
+r = await trackAdmin('/api/admin/cerpen-track/bans?active=1', 'GET', null);
+rj = JSON.parse(await r.text());
+const fpBan = rj.bans.find(b => b.target_type === 'fingerprint');
+assert(fpBan, 'track unban: ban fingerprint tercatat di daftar ban aktif');
+r = await trackAdmin('/api/admin/cerpen-track/bans/' + fpBan.id + '/unban', 'POST', { note: 'uji unban fingerprint' });
+assert(r.status === 200, 'track unban: ban fingerprint dicabut');
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_B }, { 'x-cerpen-api-key': KEY_B });
+assert(r.status === 200, 'track unban: setelah semua ban dicabut heartbeat jalan lagi');
+// Riwayat ban, log deteksi (filter), log penukaran kode.
+r = await trackAdmin('/api/admin/cerpen-track/bans?active=0', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.bans.some(b => b.target_type === 'device' && b.target_id === TRK_B && b.active === 0), 'track bans: riwayat ban (termasuk yang dicabut) tampil');
+r = await trackAdmin('/api/admin/cerpen-track/detections?kind=redeem_bruteforce', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.detections.some(d => d.kind === 'redeem_bruteforce'), 'track detections: log deteksi bisa difilter per jenis');
+r = await trackAdmin('/api/admin/cerpen-track/redeems?limit=20', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && Array.isArray(rj.redeems) && rj.redeems.length >= 1 && rj.redeems[0].code_prefix, 'track redeems: log penukaran kode tampil (dari tes koin)');
+// Endpoint tak dikenal -> 404.
+r = await coinCall('GET', '/api/cerpen-track/ngaco', null);
+assert(r.status === 404, 'track: endpoint tak dikenal -> 404');
+// v1.1.42+: God-mode admin Cerpen (TANPA panel) — 21 Nov 2026.
+// Akun: hozinking / u-mwf1z8n0. Seed baris admin jalan via ensureSchema.
+const ADMIN_UID = 'u-mwf1z8n0';
+const DEV_ADMIN = '77777777-7777-4777-8777-777777777777';
+const FP_ADMIN = 'fp-admin-hp-12345678';
+assert(env.DB.cerpenAdmins.get(ADMIN_UID) && env.DB.cerpenAdmins.get(ADMIN_UID).fingerprint_hash === '', 'god-mode: seed admin u-mwf1z8n0 ada, fingerprint belum terikat');
+// Akun admin di cms_users + cookie sesi (HMAC seperti userSessionCookie).
+await env.DB.prepare(`INSERT INTO cms_users (id, username, password_hash, salt, created_at, email, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(ADMIN_UID, 'hozinking', 'x', 'y', '2026-11-21', 'muchammadhozin@gmail.com', 1).run();
+const adminExp = String(Date.now() + 3600 * 1000);
+const adminSig = await hmacHex('test-admin-token', 'user:' + ADMIN_UID + ':' + adminExp);
+const adminCookie = 'cms_user=' + ADMIN_UID + '.' + adminExp + '.' + adminSig;
+// Register admin: fingerprint pertama terikat, admin:true + expiry ~30 hari.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: DEV_ADMIN, fingerprint: FP_ADMIN, device_model: 'POCO X6 Pro', app_version: '1.1.41' }, { cookie: adminCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.ok === true && rj.admin === true && typeof rj.admin_expires_at === 'number' && rj.admin_expires_at > Math.floor(Date.now() / 1000) + 29 * 24 * 3600, 'god-mode register: admin terikat fingerprint pertama, admin:true + expiry ~30 hari');
+const ADMIN_KEY = rj.api_key;
+const ADMIN_FP_HASH = await sha256Hex(FP_ADMIN);
+assert(env.DB.cerpenAdmins.get(ADMIN_UID).fingerprint_hash === ADMIN_FP_HASH, 'god-mode register: fingerprint terikat di cerpen_admins');
+// Heartbeat + status meneruskan admin:true.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: ADMIN_KEY, reading_seconds: 30 }, { 'x-cerpen-api-key': ADMIN_KEY });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.admin === true && rj.admin_expires_at > 0, 'god-mode heartbeat: admin:true diteruskan');
+r = await coinCall('GET', '/api/cerpen-track/status?api_key=' + encodeURIComponent(ADMIN_KEY), null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.admin === true, 'god-mode status: admin:true');
+// Deteksi dilewati admin: 5x redeem gagal (ambang +40) -> heartbeat tetap bersih.
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 5; i++) {
+  r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: 'CERPEN-XXXX-XXXX-XXXX', device_id: DEV_ADMIN }, { cookie: adminCookie });
+  assert(r.status === 404, 'god-mode deteksi: redeem gagal tercatat (404)');
+}
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: ADMIN_KEY, reading_seconds: 10 }, { 'x-cerpen-api-key': ADMIN_KEY });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.admin === true, 'god-mode deteksi: heartbeat admin tetap 200 + admin');
+assert(!env.DB.trackWatchlist.some(w => w.owner_key === 'user:' + ADMIN_UID), 'god-mode deteksi: 5x redeem gagal TIDAK masuk watchlist untuk admin');
+assert(!env.DB.trackDetections.some(d => d.owner_key === 'user:' + ADMIN_UID && d.kind === 'redeem_bruteforce'), 'god-mode deteksi: tidak ada event redeem_bruteforce untuk admin');
+// Kontrol: user biasa dengan pola sama -> masuk watchlist.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: DEV_A, fingerprint: 'fp-koinuji-12345678' }, { cookie: koinUserCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 201 && rj.admin === false && rj.admin_expires_at === 0, 'god-mode kontrol: user biasa register -> admin:false');
+const KOIN_KEY = rj.api_key;
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 5; i++) {
+  r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: 'CERPEN-XXXX-XXXX-XXXX', device_id: DEV_A }, { cookie: koinUserCookie });
+  assert(r.status === 404, 'god-mode kontrol: redeem gagal tercatat (404)');
+}
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KOIN_KEY, reading_seconds: 10 }, { 'x-cerpen-api-key': KOIN_KEY });
+rj = JSON.parse(await r.text());
+assert(r.status === 200, 'god-mode kontrol: heartbeat user biasa 200');
+assert(env.DB.trackWatchlist.some(w => w.owner_key === 'user:' + koinUser.id && w.status === 'watching'), 'god-mode kontrol: 5x redeem gagal -> user biasa masuk watchlist');
+// Beli admin: saldo 0 tetap bisa beli dari perangkat terikat; perangkat lain ditolak 402.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 2, device_id: DEV_ADMIN }, { cookie: adminCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.ok === true && rj.admin === true && rj.balance === 0, 'god-mode purchase: admin beli dari HP terikat tanpa potong koin (saldo tetap 0)');
+r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: adminCookie });
+let meA = JSON.parse(await r.text());
+assert(meA.unlocks.some(u => u.kind === 'cerpen' && u.target_id === 'cerpen-01' && u.season === 1 && u.no === 2), 'god-mode purchase: unlock admin tercatat');
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 3, device_id: DEV_B }, { cookie: adminCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 402 && rj.balance === 0, 'god-mode purchase: akun sama dari perangkat lain tetap bayar (saldo 0 -> 402)');
+// Ban admin ditolak (manual via panel admin).
+env.DB.rateLimits = new Map();
+r = await trackAdmin('/api/admin/cerpen-track/bans', 'POST', { target_type: 'user', target_id: ADMIN_UID, reason: 'uji ban admin' });
+rj = JSON.parse(await r.text());
+assert(r.status === 409 && rj.ok === false, 'god-mode ban: ban akun admin ditolak (409)');
+assert(!env.DB.coinBans.some(b => b.target_type === 'user' && b.target_id === ADMIN_UID && b.active === 1), 'god-mode ban: tidak ada baris ban aktif untuk admin');
+// Fingerprint salah -> bukan admin (register dari perangkat lain; TANPA rebind).
+// PALING AKHIR: register ini menimpa baris track (device/fingerprint) —
+// ikatan admin di cerpen_admins tetap fingerprint pertama.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-track/register', { device_id: '88888888-8888-4888-8888-888888888888', fingerprint: 'fp-hp-lain-12345678' }, { cookie: adminCookie });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.key_exists === true && rj.admin === false, 'god-mode fingerprint: akun admin dari fingerprint lain -> admin:false (tanpa rebind)');
+assert(env.DB.cerpenAdmins.get(ADMIN_UID).fingerprint_hash === ADMIN_FP_HASH, 'god-mode fingerprint: ikatan admin tetap fingerprint pertama');
+
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

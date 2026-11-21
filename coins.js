@@ -15,6 +15,7 @@ import { checkRateLimit } from './security.js';
 import { validEmail, issueOtp, verifyOtp, OTP_SEND_LIMIT, OTP_SEND_WINDOW_MS } from './otp.js';
 import { getSetting } from './store.js';
 import { HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
+import { isCerpenAdminUser, isCerpenAdminDevice } from './cerpen-admin.js';
 
 const COIN_MAX_BALANCE_DELTA = 100000; // batas sekali adjust admin
 const COIN_MAX_ACCOUNTS_PER_DEVICE = 3;
@@ -114,6 +115,9 @@ async function touchDeviceWatch(env, deviceId, androidId) {
 // ditolak 403 walau cookie-nya masih valid.
 async function coinBanCheck(env, userId) {
   if (!userId) return null;
+  // God-mode admin (21 Nov 2026): kebal ban koin — baris ban untuk akun
+  // admin diabaikan di jalur koin (applyCerpenBan juga menolak membuatnya).
+  if (await isCerpenAdminUser(env, userId)) return null;
   const now = Date.now();
   await env.DB.prepare(`UPDATE cerpen_bans SET active = 0 WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?`).bind(now).run();
   const row = await env.DB.prepare(`SELECT id, reason, expires_at FROM cerpen_bans WHERE target_type = 'user' AND target_id = ? AND active = 1`).bind(userId).first();
@@ -531,6 +535,16 @@ export async function handleCoinApi(request, env, url, adminEmail) {
         await addLedger(env, { ownerKey: ident.ownerKey, userId: ident.userId, deviceId: ident.deviceId, delta: 0, balanceAfter: wv ? Number(wv.balance) || 0 : 0, reason: 'baca VIP', ref: kind + ':' + targetId + ':' + season + ':' + no });
         return aj({ ok: true, vip: true, vip_until: vip.expires_at, balance: wv ? Number(wv.balance) || 0 : 0 });
       }
+    }
+    // God-mode admin (21 Nov 2026): semua episode gratis tanpa potong
+    // koin — HANYA bila perangkat pembelian = perangkat terikat admin
+    // (kunci 1 HP, via fingerprint di baris track). Dari perangkat lain,
+    // akun yang sama tetap membayar normal.
+    if (ident.kind === 'user' && await isCerpenAdminDevice(env, ident.userId, ident.deviceId)) {
+      await env.DB.prepare(`INSERT OR IGNORE INTO cerpen_unlocks (owner_key, kind, target_id, season, no, created_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(ident.ownerKey, kind, targetId, season, no, now).run();
+      const wa = await getWallet(env, ident.ownerKey);
+      await addLedger(env, { ownerKey: ident.ownerKey, userId: ident.userId, deviceId: ident.deviceId, delta: 0, balanceAfter: wa ? Number(wa.balance) || 0 : 0, reason: 'beli admin', ref: kind + ':' + targetId + ':' + season + ':' + no });
+      return aj({ ok: true, admin: true, balance: wa ? Number(wa.balance) || 0 : 0 });
     }
     if (free) {
       await env.DB.prepare(`INSERT OR IGNORE INTO cerpen_unlocks (owner_key, kind, target_id, season, no, created_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(ident.ownerKey, kind, targetId, season, no, now).run();

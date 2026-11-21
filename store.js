@@ -90,6 +90,35 @@ export async function ensureSchema(env) {
         // 15 Nov 2026 (v87.5): bookmark ikut akun — sinkron server
         // (lihat social.js handleBookmarksApi + social_ddl.sql).
         `CREATE TABLE IF NOT EXISTS cerpen_bookmarks (user_id TEXT NOT NULL, kind TEXT NOT NULL, content_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (user_id, kind, content_id))`,
+        // 18 Nov 2026 (v1.1.40+): paket admin/keamanan Cerpen — tracking
+        // + API key + perintah paksa + deteksi + watchlist (cerpen-admin.js).
+        // Kunci API disimpan HANYA sebagai hash SHA-256 (key_hash); plaintext
+        // 'ck-' + 32 hex hanya diberikan sekali saat register/rotate.
+        `CREATE TABLE IF NOT EXISTS cerpen_track_users (owner_key TEXT PRIMARY KEY, user_id TEXT, device_id TEXT NOT NULL, android_id TEXT NOT NULL DEFAULT '', device_model TEXT NOT NULL DEFAULT '', android_version TEXT NOT NULL DEFAULT '', app_version TEXT NOT NULL DEFAULT '', fingerprint_hash TEXT NOT NULL DEFAULT '', first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, current_kind TEXT, current_target TEXT, current_season INTEGER, current_no INTEGER, reading_since INTEGER, is_rooted INTEGER NOT NULL DEFAULT 0, root_methods TEXT NOT NULL DEFAULT '', is_emulator INTEGER NOT NULL DEFAULT 0, emulator_signals TEXT NOT NULL DEFAULT '', bootloader_locked INTEGER, verified_boot INTEGER, custom_rom INTEGER NOT NULL DEFAULT 0, integrity_status TEXT NOT NULL DEFAULT 'unknown', integrity_verified INTEGER NOT NULL DEFAULT 0, integrity_checked_at INTEGER, integrity_token_hash TEXT NOT NULL DEFAULT '', last_eval_at INTEGER)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_track_users_lastseen ON cerpen_track_users(last_seen)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_track_users_fp ON cerpen_track_users(fingerprint_hash)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_track_api_keys (key_id TEXT PRIMARY KEY, key_hash TEXT NOT NULL, owner_key TEXT NOT NULL, device_id TEXT NOT NULL, fingerprint_hash TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL, revoked_at INTEGER, revoke_reason TEXT NOT NULL DEFAULT '', last_used_at INTEGER)`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_cerpen_track_api_keys_hash ON cerpen_track_api_keys(key_hash)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_track_api_keys_owner ON cerpen_track_api_keys(owner_key, status)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_read_sessions (id TEXT PRIMARY KEY, owner_key TEXT NOT NULL, user_id TEXT, device_id TEXT NOT NULL, kind TEXT NOT NULL, target_id TEXT NOT NULL, season INTEGER, no INTEGER, started_at INTEGER NOT NULL, ended_at INTEGER, seconds INTEGER NOT NULL DEFAULT 0, app_version TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_read_sessions_owner ON cerpen_read_sessions(owner_key, started_at)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_read_sessions_target ON cerpen_read_sessions(kind, target_id, started_at)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_read_sessions_open ON cerpen_read_sessions(owner_key, ended_at)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_commands (id TEXT PRIMARY KEY, owner_key TEXT NOT NULL, user_id TEXT, device_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, created_by TEXT NOT NULL DEFAULT 'admin', delivered_at INTEGER, executed_at INTEGER, note TEXT NOT NULL DEFAULT '')`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_commands_owner ON cerpen_commands(owner_key, status)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_watchlist (id TEXT PRIMARY KEY, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, owner_key TEXT NOT NULL, reason TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '', score INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'watching', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, reviewed_by TEXT, reviewed_at INTEGER, review_note TEXT NOT NULL DEFAULT '')`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_watchlist_status ON cerpen_watchlist(status, updated_at)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_detection_events (id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner_key TEXT NOT NULL DEFAULT '', device_id TEXT NOT NULL DEFAULT '', user_id TEXT, detail TEXT NOT NULL DEFAULT '', score INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_detection_events_kind ON cerpen_detection_events(kind, created_at)`,
+        `CREATE INDEX IF NOT EXISTS idx_cerpen_detection_events_owner ON cerpen_detection_events(owner_key, created_at)`,
+        `CREATE TABLE IF NOT EXISTS cerpen_behavior_profiles (owner_key TEXT PRIMARY KEY, fingerprint_hash TEXT NOT NULL DEFAULT '', series_json TEXT NOT NULL DEFAULT '{}', hours_json TEXT NOT NULL DEFAULT '[]', avg_session_seconds INTEGER NOT NULL DEFAULT 0, total_sessions INTEGER NOT NULL DEFAULT 0, redeem_attempts INTEGER NOT NULL DEFAULT 0, redeem_failed INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)`,
+        // 21 Nov 2026 (god-mode admin Cerpen, TANPA panel): satu baris
+        // per akun admin. fingerprint_hash kosong = belum terikat
+        // perangkat; fingerprint pertama yang register untuk akun admin
+        // menjadi yang terikat (bound_at). Rebind HANYA manual di D1.
+        `CREATE TABLE IF NOT EXISTS cerpen_admins (user_id TEXT PRIMARY KEY, fingerprint_hash TEXT NOT NULL DEFAULT '', bound_at INTEGER, note TEXT NOT NULL DEFAULT '')`,
+        // Seed: hozinking (u-mwf1z8n0) — satu-satunya admin god-mode.
+        `INSERT OR IGNORE INTO cerpen_admins (user_id, fingerprint_hash, bound_at, note) VALUES ('u-mwf1z8n0', '', NULL, 'hozinking — god-mode admin')`,
       ];
       // 11 Nov 2026 (performa): DDL dieksekusi via SATU batch, bukan
       // ~30 round-trip D1 berurutan — di isolate dingin tiap round-trip
@@ -138,6 +167,14 @@ export async function ensureSchema(env) {
         // 13 Nov 2026 (v87): default harga koin Cerpen.
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('cerpen_coin_price_default', '10')`),
         env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('cerpen_coin_free_episodes_default', '1')`),
+        // 18 Nov 2026 (v1.1.40+): ambang deteksi paket admin/keamanan Cerpen
+        // (cerpen-admin.js): deteksi aktif, skor masuk watchlist, skor
+        // auto-ban, kemiripan perilaku masuk pantau, kemiripan auto-ban.
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('cerpen_detect_enabled', '1')`),
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('cerpen_detect_watch_score', '40')`),
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('cerpen_detect_auto_ban_score', '100')`),
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('cerpen_detect_behavior_match', '50')`),
+        env.DB.prepare(`INSERT OR IGNORE INTO cms_settings (key, value) VALUES ('cerpen_detect_behavior_ban', '80')`),
         ...pluginDefs.map(p => env.DB.prepare(`INSERT OR IGNORE INTO cms_plugins (id, enabled) VALUES (?, 1)`).bind(p.id)),
       ]);
       const existing = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_posts`).first();

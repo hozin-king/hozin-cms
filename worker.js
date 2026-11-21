@@ -33,6 +33,7 @@ import { validEmail, issueOtp, verifyOtp, OTP_SEND_LIMIT, OTP_SEND_WINDOW_MS } f
 import { handleCoinApi, handleCoinAdmin, renderCoinPanel } from './coins.js';
 import { handleSocialApi, handleSocialAdminApi, handleBookmarksApi, renderSocialReportsPanel, renderSocialStatsPanel, getSocialDashboardSummary } from './social.js';
 import { resolveCerpenRelease, enforceCerpenAppGate, CERPEN_MIN_VERSION } from './cerpen-gate.js';
+import { handleCerpenTrackApi, handleCerpenTrackAdmin, renderCerpenTrackPanel, enforceCerpenApiKeyIfPresent } from './cerpen-admin.js';
 export { resetCerpenReleaseCacheForTest } from './cerpen-gate.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
 import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, STOPWATCH_EVENTS, nextEventMs, readingTrackerScript, HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
@@ -331,7 +332,7 @@ input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/statistik', 'Statistik'], ['/kendali/laporan', 'Laporan'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper'], ['/kendali/taptap', 'Tap Tap']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/cerpen-pantau', 'Pantau Cerpen'], ['/kendali/statistik', 'Statistik'], ['/kendali/laporan', 'Laporan'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper'], ['/kendali/taptap', 'Tap Tap']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -3255,6 +3256,19 @@ async function handleFetch(request, env) {
       return html(await renderPage(env, meta.title, content), 200);
     }
 
+    // ---- Tracking + API Key + perintah paksa Cerpen (v1.1.40+, cerpen-admin.js) ----
+    // Register/heartbeat/sesi/status/rotate. Kunci API terikat device
+    // fingerprint; ban dicabut otomatis di server. Ditempatkan di sini
+    // (sebelum blok POST admin yang memanggil formData()) karena membaca
+    // body JSON.
+    if (path.startsWith('/api/cerpen-track/')) {
+      // v1.1.38: gerbang versi + anti-bypass — tracking ikut terkunci.
+      const gate = await enforceCerpenAppGate(request, env);
+      if (gate) return gate;
+      const r = await handleCerpenTrackApi(request, env, url);
+      if (r) return r;
+    }
+
     // ---- Sistem Koin Cerpen (v87, modul coins.js) ----
     // Auth aplikasi + endpoint koin + admin koin. Ditempatkan di sini
     // (sebelum blok POST admin yang memanggil formData()) karena membaca
@@ -3264,6 +3278,11 @@ async function handleFetch(request, env) {
       // (versi lama tidak boleh login/beli koin dari server).
       const gate = await enforceCerpenAppGate(request, env);
       if (gate) return gate;
+      // v1.1.40+: bila klien mengirim x-cerpen-api-key, kuncinya WAJIB
+      // valid — kunci dicabut (ban) ditolak di sini. Tanpa header,
+      // perilaku lama (klien versi lama belum mengirim kunci).
+      const keyErr = await enforceCerpenApiKeyIfPresent(request, env);
+      if (keyErr) return keyErr;
       const r = await handleCoinApi(request, env, url, ADMIN_EMAIL);
       if (r) return r;
     }
@@ -3280,6 +3299,8 @@ async function handleFetch(request, env) {
       // v1.1.38: gerbang versi + anti-bypass — sosial ikut terkunci.
       const gate = await enforceCerpenAppGate(request, env);
       if (gate) return gate;
+      const keyErr = await enforceCerpenApiKeyIfPresent(request, env);
+      if (keyErr) return keyErr;
       const r = await handleSocialApi(request, env, url);
       if (r) return r;
     }
@@ -3289,11 +3310,22 @@ async function handleFetch(request, env) {
       // v1.1.38: gerbang versi + anti-bypass — bookmark ikut terkunci.
       const gate = await enforceCerpenAppGate(request, env);
       if (gate) return gate;
+      const keyErr = await enforceCerpenApiKeyIfPresent(request, env);
+      if (keyErr) return keyErr;
       const r = await handleBookmarksApi(request, env, url);
       if (r) return r;
     }
     if (path.startsWith('/api/admin/cerpen-social/')) {
       const r = await handleSocialAdminApi(request, env, url, admin);
+      if (r) return r;
+    }
+
+    // ---- Admin: Pantau Cerpen (v1.1.40+, modul cerpen-admin.js) ----
+    // Harus SEBELUM blok generik /api/admin/cerpen-* di bawah (prefix
+    // cerpen-track juga cocok dengan prefix itu). Auth + CSRF + rate
+    // limit ditangani di dalam handler.
+    if (path.startsWith('/api/admin/cerpen-track')) {
+      const r = await handleCerpenTrackAdmin(request, env, url, admin);
       if (r) return r;
     }
 
@@ -4823,7 +4855,7 @@ requestAnimationFrame(draw);
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/statistik' || path === '/kendali/laporan' || path === '/kendali/md-backup' || path === '/kendali/tamper' || path === '/kendali/taptap')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/cerpen-pantau' || path === '/kendali/statistik' || path === '/kendali/laporan' || path === '/kendali/md-backup' || path === '/kendali/tamper' || path === '/kendali/taptap')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
@@ -4831,6 +4863,11 @@ requestAnimationFrame(draw);
       if (path === '/kendali/koin') {
         const content = await renderCoinPanel(env, csrf, nav, noticeHtml(url));
         return html(await renderPage(env, 'Koin Cerpen', content));
+      }
+      // ---- Admin: panel Pantau Cerpen (v1.1.40+, modul cerpen-admin.js) ----
+      if (path === '/kendali/cerpen-pantau') {
+        const content = await renderCerpenTrackPanel(env, csrf, nav, noticeHtml(url));
+        return html(await renderPage(env, 'Pantau Cerpen', content));
       }
       // ---- Admin: statistik Cerpen ala YouTube Studio (v87.3, social.js) ----
       if (path === '/kendali/statistik') {
