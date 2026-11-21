@@ -330,6 +330,40 @@ button{font:inherit;background:#3b82f6;color:#fff;border:0;border-radius:10px;pa
 form[action$="/delete"] button{background:#dc2626}
 label{display:block;font-weight:600;font-size:14px;margin:14px 0 4px}
 input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;border:1px solid rgba(128,128,128,.32);background:rgba(128,128,128,.06);color:inherit;font:inherit}
+/* v128 (21 Nov 2026): panel admin rapi di HP — tabel jadi kartu bertumpuk,
+   nav admin jadi satu baris geser, pesan aksi inline (tanpa alert),
+   ruang bawah cukup supaya konten tidak tertutup tabbar fixed. */
+.adm-msg{margin:0 0 14px;padding:12px 14px;border-radius:12px;font-weight:600;font-size:14px;line-height:1.5}
+.adm-msg.ok{background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}
+.adm-msg.err{background:rgba(220,38,38,.12);border:1px solid rgba(220,38,38,.4)}
+.adm-codebox{margin-top:12px;padding:14px;border-radius:12px;border:1px solid rgba(59,130,246,.5);background:rgba(59,130,246,.10)}
+.adm-codebox-label{font-size:13px;font-weight:700;opacity:.7;margin-bottom:6px}
+.adm-codebox-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.adm-codebox-row code{font-size:20px;font-weight:800;letter-spacing:1px;overflow-wrap:anywhere}
+.adm-codebox-row button{flex:none}
+.adm-tbl{width:100%;border-collapse:collapse}
+.adm-tbl th,.adm-tbl td{padding:8px 10px;border-bottom:1px solid rgba(128,128,128,.14);text-align:left;vertical-align:top;font-size:14px;line-height:1.5}
+.adm-tbl th{font-size:13px;opacity:.7;white-space:nowrap}
+.adm-tbl td{overflow-wrap:break-word}
+.adm-tbl td .num{white-space:nowrap}
+.adm-det summary{cursor:pointer;font-weight:700;color:#3b82f6;font-size:13px}
+.adm-det pre{margin:8px 0 0;padding:10px;border-radius:10px;background:rgba(128,128,128,.08);font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto}
+@media (max-width:640px){
+.adm-nav{flex-wrap:nowrap;overflow-x:auto;padding:8px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.adm-nav::-webkit-scrollbar{display:none}
+.adm-nav a{flex:none}
+body.nav-modern{padding-bottom:132px}
+.adm-tbl thead{display:none}
+.adm-tbl,.adm-tbl tbody,.adm-tbl tr,.adm-tbl td{display:block;width:100%;box-sizing:border-box}
+.adm-tbl{border:0}
+.adm-tbl tr{margin:0 0 10px;border:1px solid rgba(128,128,128,.18);border-radius:12px;padding:8px 12px;background:rgba(128,128,128,.05)}
+.adm-tbl tr:last-child{margin-bottom:0}
+.adm-tbl td{border:0;padding:3px 0}
+.adm-tbl td::before{content:attr(data-label);display:block;font-size:12px;font-weight:700;opacity:.55}
+.adm-tbl td.adm-empty::before{display:none}
+.adm-tbl td.adm-empty{opacity:.7}
+.adm-codebox-row code{font-size:18px}
+}
 </style>`;
 
 function adminNav(current) {
@@ -1357,44 +1391,85 @@ async function renderTttAdminPanel(env, nav, notice) {
       Number(r.is_emulator) === 1 ? 'EMU' : '',
       (r.integrity_status || 'unknown') !== 'unknown' ? 'INT:' + r.integrity_status : '',
     ].filter(Boolean).join(' ');
-    return `<tr><td><a href="/kendali/taptap?user=${esc(r.account_id || '')}">${esc(r.player_name || '(tanpa nama)')}</a><br><span style="opacity:.6">${esc(r.account_id || '')}</span></td><td>${esc(r.device_model || '')}<br><span style="opacity:.6">${esc(r.app_version || '')}</span></td><td>${esc(sig) || '—'}</td><td>${banned ? '<b style="color:#dc2626">DIBLOKIR</b>' : 'aktif'}</td><td>${esc(r.last_seen || '')}</td></tr>`;
-  }).join('') || '<tr><td colspan="5">Tidak ada yang online.</td></tr>';
+    return `<tr><td data-label="Pemain"><a href="/kendali/taptap?user=${esc(r.account_id || '')}">${esc(r.player_name || '(tanpa nama)')}</a><br><span style="opacity:.6">${esc(r.account_id || '')}</span></td><td data-label="Perangkat">${esc(r.device_model || '')}<br><span style="opacity:.6">${esc(r.app_version || '')}</span></td><td data-label="Sinyal">${esc(sig) || '—'}</td><td data-label="Status">${banned ? '<b style="color:#dc2626">DIBLOKIR</b>' : 'aktif'}</td><td data-label="Terakhir terlihat">${esc(r.last_seen || '')}</td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="adm-empty">Tidak ada yang online.</td></tr>';
   const watchHtml = (watch.results || []).map((r) => {
     let ev = '';
     try { const j = JSON.parse(r.evidence || '{}'); ev = j.similarity != null ? `mirip ${j.similarity}% vs ${esc(j.matches_banned || '')}` : esc(r.evidence || ''); } catch (e) { ev = esc(r.evidence || ''); }
-    return `<tr><td>${esc(r.target_type)}<br><b>${esc(r.target_id)}</b></td><td>${esc(r.reason)}</td><td>${Number(r.score) || 0}%</td><td style="font-size:12px">${ev}</td><td><button type="button" data-ttt="watchlist-clear" data-id="${r.id}">Bukan orang yang sama</button></td></tr>`;
-  }).join('') || '<tr><td colspan="5">Daftar pantau kosong.</td></tr>';
+    return `<tr><td data-label="Target">${esc(r.target_type)}<br><b>${esc(r.target_id)}</b></td><td data-label="Alasan">${esc(r.reason)}</td><td data-label="Skor">${Number(r.score) || 0}%</td><td data-label="Bukti" style="font-size:12px">${ev}</td><td data-label="Aksi"><button type="button" data-ttt="watchlist-clear" data-id="${r.id}">Bukan orang yang sama</button></td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="adm-empty">Daftar pantau kosong.</td></tr>';
   const codeHtml = (codeRows.results || []).map((r) => {
-    return `<tr><td><b>${esc(r.code)}</b></td><td>${esc(r.benefit_type)} +${Number(r.benefit_value).toLocaleString('id-ID')}</td><td>${Number(r.used_count)}/${Number(r.max_uses)}</td><td>${esc(r.expires_at || '—')}</td><td>${Number(r.active) === 1 ? 'aktif' : 'nonaktif'}</td><td>${Number(r.active) === 1 ? `<button type="button" data-ttt="redeem-deactivate" data-code="${esc(r.code)}">Nonaktifkan</button>` : ''}</td></tr>`;
-  }).join('') || '<tr><td colspan="6">Belum ada kode.</td></tr>';
+    return `<tr><td data-label="Kode"><b>${esc(r.code)}</b></td><td data-label="Manfaat">${esc(r.benefit_type)} +${Number(r.benefit_value).toLocaleString('id-ID')}</td><td data-label="Terpakai">${Number(r.used_count)}/${Number(r.max_uses)}</td><td data-label="Kedaluarsa">${esc(r.expires_at || '—')}</td><td data-label="Status">${Number(r.active) === 1 ? 'aktif' : 'nonaktif'}</td><td data-label="Aksi">${Number(r.active) === 1 ? `<button type="button" data-ttt="redeem-deactivate" data-code="${esc(r.code)}">Nonaktifkan</button>` : ''}</td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="adm-empty">Belum ada kode.</td></tr>';
   const flagHtml = (flagRows.results || []).map((r) => {
-    return `<tr><td><a href="/kendali/taptap?user=${esc(r.account_id)}">${esc(r.account_id)}</a></td><td>${esc(r.reason)}</td><td style="font-size:12px">${esc((r.details || '').slice(0, 200))}</td><td>${esc(r.created_at || '')}</td></tr>`;
-  }).join('') || '<tr><td colspan="4">Tidak ada flag belum direview.</td></tr>';
+    // Ringkasan manusiawi bila detailnya JSON skor (mis. score_growth):
+    // "Naik 16.715.170 dalam 60 dtk (85.839/dtk)" + JSON lengkap di <details>.
+    let sum = '';
+    try {
+      const j = JSON.parse(r.details || '{}');
+      if (j.growth != null) {
+        const g = Number(j.growth);
+        const cps = Number(j.cps);
+        const el = Number(j.elapsed_seconds);
+        sum = `Naik ${Number.isFinite(g) ? g.toLocaleString('id-ID') : esc(String(j.growth))} dalam ${Number.isFinite(el) ? el : '?'} dtk${Number.isFinite(cps) && cps ? ` (${cps.toLocaleString('id-ID')}/dtk)` : ''}`;
+      }
+    } catch (e) { /* bukan JSON — pakai potongan teks di bawah */ }
+    if (!sum) sum = esc((r.details || '').slice(0, 120));
+    const det = `<details class="adm-det"><summary>Lihat detail</summary><pre>${esc(r.details || '')}</pre></details>`;
+    return `<tr><td data-label="Akun"><a href="/kendali/taptap?user=${esc(r.account_id)}">${esc(r.account_id)}</a></td><td data-label="Alasan">${esc(r.reason)}</td><td data-label="Detail">${sum}${det}</td><td data-label="Waktu">${esc(wib(Date.parse(r.created_at || '')))}</td></tr>`;
+  }).join('') || '<tr><td colspan="4" class="adm-empty">Tidak ada flag belum direview.</td></tr>';
   return `<h2>Tap Tap Tycoon</h2>${nav}${notice}
+  <div id="ttt-msg" class="adm-msg" hidden></div>
   <div class="card"><h3>Ringkasan</h3><p>
   Pemain: <b>${total}</b> · Online sekarang: <b>${online}</b> · Sesi 24 jam: <b>${sessions}</b> ·
-  Ban aktif: <b>${bans}</b> · Dipantau: <b>${watching}</b> · Kode redeem aktif: <b>${codes}</b> ·
+  Ban aktif: <b>${bans}</b> · Dipantau: <b>${watching}</b> · Kode redeem aktif: <b id="ttt-code-count">${codes}</b> ·
   Flag belum direview: <b>${flags}</b></p>
   <p style="font-size:13px;opacity:.7">Root / emulator / integritas gagal sendirian TIDAK PERNAH memicu auto-ban — hanya sinyal. Ban otomatis hanya dari skor perilaku ≥ ${TTT_BEHAVIOR_CONFIRM}% (naik dari pantauan ≥ ${TTT_BEHAVIOR_WATCH}%) atau pelanggaran skor/tap.</p></div>
-  <div class="card"><h3>Online sekarang (&lt; 3 menit)</h3><table><thead><tr><th>Pemain</th><th>Perangkat</th><th>Sinyal</th><th>Status</th><th>Terakhir terlihat</th></tr></thead><tbody>${liveHtml}</tbody></table></div>
-  <div class="card"><h3>Daftar pantau (perilaku / abuse)</h3><table><thead><tr><th>Target</th><th>Alasan</th><th>Skor</th><th>Bukti</th><th>Aksi</th></tr></thead><tbody>${watchHtml}</tbody></table></div>
+  <div class="card"><h3>Online sekarang (&lt; 3 menit)</h3><table class="adm-tbl"><thead><tr><th>Pemain</th><th>Perangkat</th><th>Sinyal</th><th>Status</th><th>Terakhir terlihat</th></tr></thead><tbody>${liveHtml}</tbody></table></div>
+  <div class="card"><h3>Daftar pantau (perilaku / abuse)</h3><table class="adm-tbl"><thead><tr><th>Target</th><th>Alasan</th><th>Skor</th><th>Bukti</th><th>Aksi</th></tr></thead><tbody>${watchHtml}</tbody></table></div>
   <div class="card"><h3>Ban / Unban / Perintah paksa</h3>
   <form id="ttt-ban-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">ID akun<input name="account_id" required pattern="[1-9][0-9]{7}" maxlength="8" placeholder="12345678"></label><label style="margin:0">Tipe<select name="ban_type"><option value="warning">warning</option><option value="temp7">temp7 (7 hari)</option><option value="temp30">temp30 (30 hari)</option><option value="permanent">permanent</option></select></label><label style="margin:0">Alasan<input name="reason" maxlength="200" placeholder="alasan ban"></label><button type="submit">Ban</button> <button type="button" id="ttt-unban-btn">Unban</button></form>
   <form id="ttt-command-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-top:12px"><label style="margin:0">Target<select name="target_type"><option value="account">akun</option><option value="guest">guest</option></select></label><label style="margin:0">ID target<input name="target_id" required maxlength="40" placeholder="12345678 / ttt-guest-..."></label><label style="margin:0">Perintah<select name="command"><option value="kick">kick paksa</option><option value="crash">crash paksa</option></select></label><button type="submit">Kirim perintah</button></form>
   <p style="font-size:13px;opacity:.7">Ban akun otomatis mencabut semua API key perangkatnya (anti-bypass); unban memulihkan key-nya. Perintah kick/crash dieksekusi aplikasi saat heartbeat/register berikutnya.</p></div>
   <div class="card"><h3>Buat kode redeem</h3>
   <form id="ttt-redeem-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">Manfaat<select name="benefit_type"><option value="energy">Energi</option><option value="savings">Tabungan</option></select></label><label style="margin:0">Nilai<input name="benefit_value" type="number" min="1" max="1000000000" value="100000" required></label><label style="margin:0">Maks pakai<input name="max_uses" type="number" min="1" max="10000" value="10" required></label><label style="margin:0">Kedaluarsa (opsional)<input name="expires_at" type="datetime-local"></label><label style="margin:0">Kode khusus (opsional)<input name="code" maxlength="20" placeholder="kosong = acak"></label><button type="submit">Buat kode</button></form>
-  <table style="margin-top:12px"><thead><tr><th>Kode</th><th>Manfaat</th><th>Terpakai</th><th>Kedaluarsa</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${codeHtml}</tbody></table></div>
-  <div class="card"><h3>Flag belum direview</h3><table><thead><tr><th>Akun</th><th>Alasan</th><th>Detail</th><th>Waktu</th></tr></thead><tbody>${flagHtml}</tbody></table></div>
+  <div id="ttt-new-code" class="adm-codebox" hidden>
+    <div class="adm-codebox-label">Kode baru dibuat — ketuk Salin, lalu bagikan</div>
+    <div class="adm-codebox-row"><code id="ttt-new-code-text"></code><button type="button" id="ttt-copy-code">Salin</button></div>
+    <div id="ttt-new-code-meta" class="adm-muted" style="font-size:13px;margin-top:6px"></div>
+  </div>
+  <table class="adm-tbl" style="margin-top:12px"><thead><tr><th>Kode</th><th>Manfaat</th><th>Terpakai</th><th>Kedaluarsa</th><th>Status</th><th>Aksi</th></tr></thead><tbody id="ttt-code-body">${codeHtml}</tbody></table></div>
+  <div class="card"><h3>Flag belum direview</h3><table class="adm-tbl"><thead><tr><th>Akun</th><th>Alasan</th><th>Detail</th><th>Waktu</th></tr></thead><tbody>${flagHtml}</tbody></table></div>
   <div class="card"><h3>Cari pengguna</h3>
-  <form method="get" action="/kendali/taptap" style="display:flex;gap:8px"><input name="user" pattern="[1-9][0-9]{7}" maxlength="8" placeholder="ID akun 8 digit" required><button type="submit">Lihat riwayat</button></form>
+  <form method="get" action="/kendali/taptap" style="display:flex;gap:8px;flex-wrap:wrap"><input name="user" pattern="[1-9][0-9]{7}" maxlength="8" placeholder="ID akun 8 digit" required style="flex:1 1 200px;min-width:0"><button type="submit" style="flex:none;white-space:nowrap">Lihat riwayat</button></form>
   <p style="font-size:13px;opacity:.7">Riwayat lengkap (perangkat, sesi, ban, flag, redeem, pantauan, profil perilaku) juga tersedia lewat API: GET /api/taptap/admin/users/:id — dan kemiripan perilaku lewat GET /api/taptap/admin/behavior/:id.</p></div>
   <script>
   (function(){
+    function showMsg(text, ok){
+      var m = document.getElementById('ttt-msg');
+      if (!m) return;
+      m.textContent = text;
+      m.className = 'adm-msg ' + (ok ? 'ok' : 'err');
+      m.hidden = false;
+      if (!ok) m.scrollIntoView({ block: 'nearest' });
+    }
+    function escHtml(s){ return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    async function copyText(t){
+      try { await navigator.clipboard.writeText(t); return true; }
+      catch (e) {
+        try {
+          var ta = document.createElement('textarea');
+          ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.select();
+          var ok = document.execCommand('copy');
+          document.body.removeChild(ta); return ok;
+        } catch (e2) { return false; }
+      }
+    }
     async function post(path, body){
       const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(body) });
       const j = await r.json().catch(function(){ return {}; });
-      if (!r.ok) { alert('Gagal: ' + (j.error || r.status)); return null; }
+      if (!r.ok) { showMsg('Gagal: ' + (j.error || r.status), false); return null; }
       return j;
     }
     function bindForm(id, fn){
@@ -1405,9 +1480,34 @@ async function renderTttAdminPanel(env, nav, notice) {
         const d = {};
         new FormData(f).forEach(function(v, k){ d[k] = v; });
         const ok = await fn(d);
-        if (ok !== false) location.reload();
+        if (ok) location.reload();
       });
     }
+    function prependCodeRow(code, d){
+      var body = document.getElementById('ttt-code-body');
+      if (!body) return;
+      var empty = body.querySelector('td.adm-empty');
+      if (empty) { var tr0 = empty.closest('tr'); if (tr0) tr0.remove(); }
+      var tr = document.createElement('tr');
+      var exp = d.expires_at ? new Date(d.expires_at).toISOString() : '—';
+      tr.innerHTML = '<td data-label="Kode"><b>' + escHtml(code) + '</b></td>' +
+        '<td data-label="Manfaat">' + escHtml(d.benefit_type) + ' +' + Number(d.benefit_value || 0).toLocaleString('id-ID') + '</td>' +
+        '<td data-label="Terpakai">0/' + Number(d.max_uses || 0) + '</td>' +
+        '<td data-label="Kedaluarsa">' + escHtml(exp) + '</td>' +
+        '<td data-label="Status">aktif</td>' +
+        '<td data-label="Aksi"><button type="button" data-ttt="redeem-deactivate" data-code="' + escHtml(code) + '">Nonaktifkan</button></td>';
+      body.prepend(tr);
+      var c = document.getElementById('ttt-code-count');
+      if (c) c.textContent = String((parseInt(c.textContent, 10) || 0) + 1);
+    }
+    var copyBtn = document.getElementById('ttt-copy-code');
+    if (copyBtn) copyBtn.addEventListener('click', async function(){
+      var code = (document.getElementById('ttt-new-code-text') || {}).textContent || '';
+      if (!code) return;
+      var ok = await copyText(code);
+      copyBtn.textContent = ok ? 'Tersalin' : 'Gagal menyalin — salin manual';
+      setTimeout(function(){ copyBtn.textContent = 'Salin'; }, 2000);
+    });
     bindForm('ttt-ban-form', async function(d){
       return post('/api/taptap/admin/ban', { account_id: d.account_id, ban_type: d.ban_type, reason: d.reason || '' });
     });
@@ -1419,13 +1519,19 @@ async function renderTttAdminPanel(env, nav, notice) {
       if (d.expires_at) body.expires_at = new Date(d.expires_at).toISOString();
       if (d.code) body.code = d.code.toUpperCase();
       const j = await post('/api/taptap/admin/redeem/create', body);
-      if (j) alert('Kode dibuat: ' + j.code);
-      return j;
+      if (j && j.code) {
+        document.getElementById('ttt-new-code-text').textContent = j.code;
+        document.getElementById('ttt-new-code-meta').textContent = (d.benefit_type === 'savings' ? 'Tabungan' : 'Energi') + ' +' + Number(d.benefit_value).toLocaleString('id-ID') + ' · maks ' + d.max_uses + ' pakai' + (d.expires_at ? ' · kedaluarsa ' + String(d.expires_at).replace('T', ' ') : '');
+        document.getElementById('ttt-new-code').hidden = false;
+        prependCodeRow(j.code, d);
+        showMsg('Kode dibuat.', true);
+      }
+      return false;
     });
     const unbanBtn = document.getElementById('ttt-unban-btn');
     if (unbanBtn) unbanBtn.addEventListener('click', async function(){
       const id = document.querySelector('#ttt-ban-form input[name="account_id"]').value.trim();
-      if (!id) { alert('Isi ID akun dulu.'); return; }
+      if (!id) { showMsg('Isi ID akun dulu.', false); return; }
       const j = await post('/api/taptap/admin/unban', { account_id: id });
       if (j) location.reload();
     });
