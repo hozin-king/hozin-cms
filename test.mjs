@@ -1072,6 +1072,9 @@ class MockDB {
     if (s.startsWith('INSERT INTO ttt_redeem_codes')) { this.tttRedeemCodes.set(a[0], { code: a[0], benefit_type: a[1], benefit_value: a[2], max_uses: a[3], used_count: 0, expires_at: a[4] || '', active: 1, created_by: a[5], created_at: a[6] }); return []; }
     if (s.startsWith('UPDATE ttt_redeem_codes SET used_count = used_count + 1 WHERE code = ?')) { const r = this.tttRedeemCodes.get(a[0]); if (r) r.used_count = (Number(r.used_count) || 0) + 1; return []; }
     if (s.startsWith('UPDATE ttt_redeem_codes SET active = 0 WHERE code = ?')) { const r = this.tttRedeemCodes.get(a[0]); if (r) r.active = 0; return []; }
+    if (s.startsWith('UPDATE ttt_redeem_codes SET benefit_type = ?, benefit_value = ?, max_uses = ?, expires_at = ? WHERE code = ?')) { const r = this.tttRedeemCodes.get(a[4]); if (r) { r.benefit_type = a[0]; r.benefit_value = a[1]; r.max_uses = a[2]; r.expires_at = a[3] || ''; } return []; }
+    if (s.startsWith("SELECT account_id, guest_id, benefit_type, benefit_value, redeemed_at FROM ttt_redeem_log WHERE code = ? AND status = 'ok'")) return [...this.tttRedeemLog].filter(x => x.code === a[0] && x.status === 'ok').sort((x, y) => String(y.redeemed_at || '').localeCompare(String(x.redeemed_at || ''))).slice(0, 100).map(x => ({ account_id: x.account_id, guest_id: x.guest_id, benefit_type: x.benefit_type, benefit_value: x.benefit_value, redeemed_at: x.redeemed_at }));
+    if (s.startsWith("SELECT COUNT(*) AS c FROM ttt_redeem_log WHERE code = ? AND status = 'ok'")) return [{ c: this.tttRedeemLog.filter(x => x.code === a[0] && x.status === 'ok').length }];
     if (s.startsWith('SELECT code, benefit_type, benefit_value, max_uses, used_count, expires_at, active, created_by, created_at FROM ttt_redeem_codes ORDER BY created_at DESC LIMIT 100')) return [...this.tttRedeemCodes.values()].sort((x, y) => String(y.created_at || '').localeCompare(String(x.created_at || ''))).slice(0, 100).map(x => ({ code: x.code, benefit_type: x.benefit_type, benefit_value: x.benefit_value, max_uses: x.max_uses, used_count: x.used_count, expires_at: x.expires_at, active: x.active, created_by: x.created_by, created_at: x.created_at }));
     if (s.startsWith("SELECT COUNT(*) AS c FROM ttt_redeem_log WHERE guest_id = ? AND status = 'failed' AND redeemed_at > ?")) return [{ c: this.tttRedeemLog.filter(x => x.guest_id === a[0] && x.status === 'failed' && String(x.redeemed_at || '') > a[1]).length }];
     if (s.startsWith('INSERT INTO ttt_redeem_log')) { if (s.includes("'failed'")) this.tttRedeemLog.push({ id: ++this.tttRedeemLogSeq, code: a[0], account_id: a[1], guest_id: a[2], benefit_type: '', benefit_value: 0, status: 'failed', fail_reason: a[3], redeemed_at: a[4] }); else this.tttRedeemLog.push({ id: ++this.tttRedeemLogSeq, code: a[0], account_id: a[1], guest_id: a[2], benefit_type: a[3], benefit_value: a[4], status: 'ok', fail_reason: '', redeemed_at: a[5] }); return []; }
@@ -4026,6 +4029,46 @@ r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id:
 assert(r.status === 403 && JSON.parse(await r.text()).error === 'already_redeemed', 'taptap admin: redeem kode yang sama kedua kali -> 403 already_redeemed');
 r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: CODE1 });
 assert(r.status === 401 && JSON.parse(await r.text()).error === 'api_key_required', 'taptap admin: redeem tanpa key -> 401');
+// 4b. Redeem: edit kode, riwayat penukaran, cabut (nonaktifkan).
+r = await tttCall('POST', '/api/taptap/admin/redeem/create', { benefit_type: 'energy', benefit_value: 1000, max_uses: 2 }, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && typeof sj.code === 'string', 'taptap admin: buat kode ke-2 untuk uji edit/cabut');
+const CODE2 = sj.code;
+r = await tttCall('POST', '/api/taptap/profile', { account_id: '77777777', player_name: 'RedeemDua', score: 0, total_energy_all_time: 0, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+assert(r.status === 200, 'taptap admin: buat akun redeem ke-2 77777777 ok');
+r = await tttCall('POST', '/api/taptap/register', { account_id: '77777777', fingerprint: 'e'.repeat(64), device_model: 'POCO X6 Pro', android_version: '16', app_version: '1.1.2' });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && typeof sj.api_key === 'string', 'taptap admin: register guest ke-2 ok');
+const GUEST_R2 = sj.guest_id;
+const KEY_R2 = sj.api_key;
+r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: CODE2 }, { 'x-ttt-api-key': KEY_D });
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap admin: redeem CODE2 oleh akun pertama ok');
+r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_R2, account_id: '77777777', code: CODE2 }, { 'x-ttt-api-key': KEY_R2 });
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap admin: redeem CODE2 oleh akun kedua ok (terpakai 2/2)');
+r = await tttCall('GET', '/api/taptap/admin/redeem/history?code=' + CODE2, null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.total === 2 && sj.redeems.length === 2 && sj.redeems.some(x => x.account_id === '66666666') && sj.redeems.some(x => x.account_id === '77777777'), 'taptap admin: riwayat kode tampilkan 2 penukar + ID akun');
+r = await tttCall('POST', '/api/taptap/admin/redeem/update', { code: CODE2, benefit_type: 'energy', benefit_value: 2000, max_uses: 1 }, TTT_ADMIN_H);
+assert(r.status === 400 && JSON.parse(await r.text()).error === 'max_uses_below_used', 'taptap admin: edit maks pakai di bawah terpakai (1 < 2) -> 400');
+r = await tttCall('POST', '/api/taptap/admin/redeem/update', { code: CODE2, benefit_type: 'savings', benefit_value: 2000, max_uses: 3, expires_at: '' }, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && sj.benefit_type === 'savings' && sj.benefit_value === 2000 && sj.max_uses === 3 && sj.expires_at === null, 'taptap admin: edit kode ok (manfaat + nilai + maks pakai)');
+r = await tttCall('GET', '/api/taptap/admin/redeem/list', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.codes.some(x => x.code === CODE2 && x.benefit_type === 'savings' && x.benefit_value === 2000 && x.max_uses === 3), 'taptap admin: daftar kode tampilkan hasil edit');
+r = await tttCall('POST', '/api/taptap/admin/redeem/update', { code: 'TTT-TIDAK-ADA', benefit_type: 'energy', benefit_value: 100, max_uses: 1 }, TTT_ADMIN_H);
+assert(r.status === 404 && JSON.parse(await r.text()).error === 'code_not_found', 'taptap admin: edit kode tak ada -> 404');
+r = await tttCall('POST', '/api/taptap/admin/redeem/update', { code: CODE2, benefit_type: 'energy', benefit_value: 100, max_uses: 1 });
+assert(r.status === 401, 'taptap admin: edit kode tanpa admin -> 401');
+r = await tttCall('POST', '/api/taptap/admin/redeem/deactivate', { code: CODE2 }, TTT_ADMIN_H);
+assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap admin: cabut CODE2 ok');
+r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_R2, account_id: '77777777', code: CODE2 }, { 'x-ttt-api-key': KEY_R2 });
+assert(r.status === 403 && JSON.parse(await r.text()).error === 'code_inactive', 'taptap admin: kode yang dicabut tidak bisa ditukar lagi -> 403 code_inactive');
+// Reset penghitung rate-limit redeem (blok 4b memakai 3 slot dari 10/10
+// menit untuk IP yang sama) supaya hitungan brute-force di bawah tetap
+// seperti semula (sudah tercatat gagal 1x, lalu 4x kode salah -> 404,
+// percobaan ke-5 -> 429).
+env.DB.rateLimits = new Map();
 // Catatan: percobaan already_redeemed ikut tercatat sebagai gagal (1);
   // cek ambang berjalan SEBELUM log percobaan ini, jadi 429 baru muncul
   // di percobaan kode-salah ke-5 (total gagal tercatat sudah 5).

@@ -34,7 +34,7 @@ import { handleCoinApi, handleCoinAdmin, renderCoinPanel } from './coins.js';
 import { handleSocialApi, handleSocialAdminApi, handleBookmarksApi, renderSocialReportsPanel, renderSocialStatsPanel, getSocialDashboardSummary } from './social.js';
 import { resolveCerpenRelease, enforceCerpenAppGate, CERPEN_MIN_VERSION } from './cerpen-gate.js';
 import { handleCerpenTrackApi, handleCerpenTrackAdmin, renderCerpenTrackPanel, enforceCerpenApiKeyIfPresent } from './cerpen-admin.js';
-import { handleDlRedirect, renderDlPanel, handleDlCreate, handleDlToggle, DL_HOST } from './dl.js';
+import { handleDlRedirect, tryDlRedirect, renderDlPanel, handleDlCreate, handleDlToggle, DL_HOST, DL_WORKERS_DEV_HOST } from './dl.js';
 export { resetCerpenReleaseCacheForTest } from './cerpen-gate.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
 import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, STOPWATCH_EVENTS, nextEventMs, readingTrackerScript, HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
@@ -1347,7 +1347,7 @@ async function tttVerifyPlayIntegrity(env, token) {
 // Halaman /kendali/taptap: ringkasan + live + daftar pantau + redeem +
 // flag + riwayat per pengguna. Aksi lewat fetch ke /api/taptap/admin/*
 // (sesi admin cookie — pola yang sama dengan panel Cerpen API).
-async function renderTttAdminPanel(env, nav, notice) {
+async function renderTttAdminPanel(env, nav, notice, url) {
   const db = env.BACKUP_DB;
   if (!db) {
     return `<h2>Tap Tap Tycoon</h2>${nav}<div class="card"><p>Database (stopwatch-db) tidak tersedia — panel tidak bisa dimuat.</p></div>`;
@@ -1384,6 +1384,23 @@ async function renderTttAdminPanel(env, nav, notice) {
   const flagRows = await db.prepare(
     'SELECT id, account_id, reason, details, created_at, reviewed FROM ttt_flags WHERE reviewed = 0 ORDER BY id DESC LIMIT 100'
   ).all();
+  // Detail pengguna bila ?user=<id 8 digit> dibuka (dari "Cari pengguna"
+  // atau tautan ID akun di tabel): ringkasan + riwayat penukaran kode.
+  let userHtml = '';
+  const userQ = url ? String(url.searchParams.get('user') || '') : '';
+  if (/^[1-9][0-9]{7}$/.test(userQ)) {
+    const up = await db.prepare('SELECT * FROM ttt_players WHERE account_id = ?').bind(userQ).first();
+    if (!up) {
+      userHtml = `<div class="card"><h3>Riwayat pengguna ${esc(userQ)}</h3><p>Akun tidak ditemukan.</p><p><a href="/kendali/taptap">← Kembali ke panel</a></p></div>`;
+    } else {
+      const uredeems = await db.prepare(
+        'SELECT code, benefit_type, benefit_value, status, redeemed_at FROM ttt_redeem_log WHERE account_id = ? ORDER BY id DESC LIMIT 20'
+      ).bind(userQ).all();
+      const uRows = (uredeems.results || []).map((x) => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title"><b>${esc(x.code)}</b> · ${esc(x.benefit_type)} +${Number(x.benefit_value).toLocaleString('id-ID')}</span><div class="adm-row-meta">${esc(x.status)} · ${esc(wib(Date.parse(x.redeemed_at || '')))}</div></div></div>`).join('') || '<p>Belum pernah menukar kode.</p>';
+      const uban = taptapBanActive(up, nowMs);
+      userHtml = `<div class="card"><h3>Riwayat pengguna ${esc(userQ)}</h3><p><b>${esc(up.player_name || '(tanpa nama)')}</b> · Skor ${Number(up.score || 0).toLocaleString('id-ID')} · Tabungan ${Number(up.savings || 0).toLocaleString('id-ID')} · ${uban ? '<b style="color:#dc2626">DIBLOKIR</b>' : 'aktif'}</p><h4>Penukaran kode</h4>${uRows}<p><a href="/kendali/taptap">← Kembali ke panel</a></p></div>`;
+    }
+  }
   const liveHtml = (live.results || []).map((r) => {
     const banned = taptapBanActive(r, nowMs);
     const sig = [
@@ -1399,7 +1416,7 @@ async function renderTttAdminPanel(env, nav, notice) {
     return `<tr><td data-label="Target">${esc(r.target_type)}<br><b>${esc(r.target_id)}</b></td><td data-label="Alasan">${esc(r.reason)}</td><td data-label="Skor">${Number(r.score) || 0}%</td><td data-label="Bukti" style="font-size:12px">${ev}</td><td data-label="Aksi"><button type="button" data-ttt="watchlist-clear" data-id="${r.id}">Bukan orang yang sama</button></td></tr>`;
   }).join('') || '<tr><td colspan="5" class="adm-empty">Daftar pantau kosong.</td></tr>';
   const codeHtml = (codeRows.results || []).map((r) => {
-    return `<tr><td data-label="Kode"><b>${esc(r.code)}</b></td><td data-label="Manfaat">${esc(r.benefit_type)} +${Number(r.benefit_value).toLocaleString('id-ID')}</td><td data-label="Terpakai">${Number(r.used_count)}/${Number(r.max_uses)}</td><td data-label="Kedaluarsa">${esc(r.expires_at || '—')}</td><td data-label="Status">${Number(r.active) === 1 ? 'aktif' : 'nonaktif'}</td><td data-label="Aksi">${Number(r.active) === 1 ? `<button type="button" data-ttt="redeem-deactivate" data-code="${esc(r.code)}">Nonaktifkan</button>` : ''}</td></tr>`;
+    return `<tr><td data-label="Kode"><b>${esc(r.code)}</b></td><td data-label="Manfaat">${esc(r.benefit_type)} +${Number(r.benefit_value).toLocaleString('id-ID')}</td><td data-label="Terpakai">${Number(r.used_count)}/${Number(r.max_uses)}</td><td data-label="Kedaluarsa">${esc(r.expires_at || '—')}</td><td data-label="Status">${Number(r.active) === 1 ? 'aktif' : 'nonaktif'}</td><td data-label="Aksi"><button type="button" data-ttt="redeem-edit" data-code="${esc(r.code)}" data-benefit="${esc(r.benefit_type)}" data-value="${Number(r.benefit_value)}" data-max="${Number(r.max_uses)}" data-used="${Number(r.used_count)}" data-expires="${esc(r.expires_at || '')}">Edit</button> <button type="button" data-ttt="redeem-history" data-code="${esc(r.code)}">Riwayat</button>${Number(r.active) === 1 ? ` <button type="button" data-ttt="redeem-deactivate" data-code="${esc(r.code)}">Cabut</button>` : ''}</td></tr>`;
   }).join('') || '<tr><td colspan="6" class="adm-empty">Belum ada kode.</td></tr>';
   const flagHtml = (flagRows.results || []).map((r) => {
     // Ringkasan manusiawi bila detailnya JSON skor (mis. score_growth):
@@ -1418,7 +1435,7 @@ async function renderTttAdminPanel(env, nav, notice) {
     const det = `<details class="adm-det"><summary>Lihat detail</summary><pre>${esc(r.details || '')}</pre></details>`;
     return `<tr><td data-label="Akun"><a href="/kendali/taptap?user=${esc(r.account_id)}">${esc(r.account_id)}</a></td><td data-label="Alasan">${esc(r.reason)}</td><td data-label="Detail">${sum}${det}</td><td data-label="Waktu">${esc(wib(Date.parse(r.created_at || '')))}</td></tr>`;
   }).join('') || '<tr><td colspan="4" class="adm-empty">Tidak ada flag belum direview.</td></tr>';
-  return `<h2>Tap Tap Tycoon</h2>${nav}${notice}
+  return `<h2>Tap Tap Tycoon</h2>${nav}${notice}${userHtml}
   <div id="ttt-msg" class="adm-msg" hidden></div>
   <div class="card"><h3>Ringkasan</h3><p>
   Pemain: <b>${total}</b> · Online sekarang: <b>${online}</b> · Sesi 24 jam: <b>${sessions}</b> ·
@@ -1439,6 +1456,10 @@ async function renderTttAdminPanel(env, nav, notice) {
     <div id="ttt-new-code-meta" class="adm-muted" style="font-size:13px;margin-top:6px"></div>
   </div>
   <table class="adm-tbl" style="margin-top:12px"><thead><tr><th>Kode</th><th>Manfaat</th><th>Terpakai</th><th>Kedaluarsa</th><th>Status</th><th>Aksi</th></tr></thead><tbody id="ttt-code-body">${codeHtml}</tbody></table></div>
+  <div class="card" id="ttt-edit-code" hidden><h3>Edit kode <code id="ttt-edit-code-name"></code></h3>
+  <form id="ttt-edit-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end"><label style="margin:0">Manfaat<select name="benefit_type"><option value="energy">Energi</option><option value="savings">Tabungan</option></select></label><label style="margin:0">Nilai<input name="benefit_value" type="number" min="1" max="1000000000" required></label><label style="margin:0">Maks pakai<input name="max_uses" type="number" min="1" max="10000" required></label><label style="margin:0">Kedaluarsa<input name="expires_at" type="datetime-local"></label><label style="margin:0;display:flex;align-items:center;gap:4px"><input name="no_expires" type="checkbox"> Tanpa kedaluwarsa</label><button type="submit">Simpan</button> <button type="button" id="ttt-edit-cancel">Batal</button></form>
+  <p id="ttt-edit-used" class="adm-muted" style="font-size:13px"></p></div>
+  <div class="card" id="ttt-code-history" hidden><h3 id="ttt-history-title">Riwayat penukaran</h3><div id="ttt-history-body"><p>Memuat…</p></div></div>
   <div class="card"><h3>Flag belum direview</h3><table class="adm-tbl"><thead><tr><th>Akun</th><th>Alasan</th><th>Detail</th><th>Waktu</th></tr></thead><tbody>${flagHtml}</tbody></table></div>
   <div class="card"><h3>Cari pengguna</h3>
   <form method="get" action="/kendali/taptap" style="display:flex;gap:8px;flex-wrap:wrap"><input name="user" pattern="[1-9][0-9]{7}" maxlength="8" placeholder="ID akun 8 digit" required style="flex:1 1 200px;min-width:0"><button type="submit" style="flex:none;white-space:nowrap">Lihat riwayat</button></form>
@@ -1454,6 +1475,17 @@ async function renderTttAdminPanel(env, nav, notice) {
       if (!ok) m.scrollIntoView({ block: 'nearest' });
     }
     function escHtml(s){ return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function toLocalInput(iso){
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return '';
+      function p(n){ return String(n).padStart(2, '0'); }
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
+    }
+    function wibText(iso){
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return String(iso || '—');
+      try { return d.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }); } catch (e) { return d.toISOString().replace('T', ' ').slice(0, 16); }
+    }
     async function copyText(t){
       try { await navigator.clipboard.writeText(t); return true; }
       catch (e) {
@@ -1495,7 +1527,9 @@ async function renderTttAdminPanel(env, nav, notice) {
         '<td data-label="Terpakai">0/' + Number(d.max_uses || 0) + '</td>' +
         '<td data-label="Kedaluarsa">' + escHtml(exp) + '</td>' +
         '<td data-label="Status">aktif</td>' +
-        '<td data-label="Aksi"><button type="button" data-ttt="redeem-deactivate" data-code="' + escHtml(code) + '">Nonaktifkan</button></td>';
+        '<td data-label="Aksi"><button type="button" data-ttt="redeem-edit" data-code="' + escHtml(code) + '" data-benefit="' + escHtml(d.benefit_type) + '" data-value="' + Number(d.benefit_value || 0) + '" data-max="' + Number(d.max_uses || 0) + '" data-used="0" data-expires="' + (d.expires_at ? escHtml(new Date(d.expires_at).toISOString()) : '') + '">Edit</button> ' +
+        '<button type="button" data-ttt="redeem-history" data-code="' + escHtml(code) + '">Riwayat</button> ' +
+        '<button type="button" data-ttt="redeem-deactivate" data-code="' + escHtml(code) + '">Cabut</button></td>';
       body.prepend(tr);
       var c = document.getElementById('ttt-code-count');
       if (c) c.textContent = String((parseInt(c.textContent, 10) || 0) + 1);
@@ -1508,6 +1542,48 @@ async function renderTttAdminPanel(env, nav, notice) {
       copyBtn.textContent = ok ? 'Tersalin' : 'Gagal menyalin — salin manual';
       setTimeout(function(){ copyBtn.textContent = 'Salin'; }, 2000);
     });
+    var editForm = document.getElementById('ttt-edit-form');
+    if (editForm) editForm.addEventListener('submit', async function(e){
+      e.preventDefault();
+      var d = {};
+      new FormData(editForm).forEach(function(v, k){ d[k] = v; });
+      var code = (document.getElementById('ttt-edit-code-name') || {}).textContent || '';
+      var maxUses = Number(d.max_uses);
+      var used = 0;
+      var rowBtn = document.querySelector('[data-ttt="redeem-edit"][data-code="' + code + '"]');
+      if (rowBtn) used = Number(rowBtn.getAttribute('data-used') || 0);
+      if (maxUses < used) { showMsg('Maks pakai tidak boleh di bawah ' + used + ' (sudah terpakai).', false); return; }
+      var body = { code: code, benefit_type: d.benefit_type, benefit_value: Number(d.benefit_value), max_uses: maxUses };
+      if (!d.no_expires && d.expires_at) body.expires_at = new Date(d.expires_at).toISOString();
+      var r = await fetch('/api/taptap/admin/redeem/update', { method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(body) });
+      var j = await r.json().catch(function(){ return {}; });
+      if (!r.ok) {
+        var msg = 'Gagal menyimpan: ' + (j.error || r.status);
+        if (j.error === 'max_uses_below_used') msg = 'Maks pakai tidak boleh di bawah ' + (j.used_count || used) + ' (sudah terpakai).';
+        if (j.error === 'code_not_found') msg = 'Kode tidak ditemukan.';
+        if (j.error === 'bad_benefit_value') msg = 'Nilai manfaat tidak valid.';
+        showMsg(msg, false);
+        return;
+      }
+      // Perbarui baris di tempat tanpa reload.
+      if (rowBtn) {
+        var tr = rowBtn.closest('tr');
+        if (tr) {
+          var tds = tr.querySelectorAll('td');
+          if (tds[1]) tds[1].textContent = (d.benefit_type === 'savings' ? 'savings' : 'energy') + ' +' + Number(d.benefit_value).toLocaleString('id-ID');
+          if (tds[2]) tds[2].textContent = used + '/' + maxUses;
+          if (tds[3]) tds[3].textContent = body.expires_at ? body.expires_at : '—';
+          rowBtn.setAttribute('data-benefit', d.benefit_type);
+          rowBtn.setAttribute('data-value', String(d.benefit_value));
+          rowBtn.setAttribute('data-max', String(maxUses));
+          rowBtn.setAttribute('data-expires', body.expires_at || '');
+        }
+      }
+      document.getElementById('ttt-edit-code').hidden = true;
+      showMsg('Kode ' + code + ' diperbarui.', true);
+    });
+    var editCancel = document.getElementById('ttt-edit-cancel');
+    if (editCancel) editCancel.addEventListener('click', function(){ document.getElementById('ttt-edit-code').hidden = true; });
     bindForm('ttt-ban-form', async function(d){
       return post('/api/taptap/admin/ban', { account_id: d.account_id, ban_type: d.ban_type, reason: d.reason || '' });
     });
@@ -1544,8 +1620,44 @@ async function renderTttAdminPanel(env, nav, notice) {
         const j = await post('/api/taptap/admin/watchlist/clear', { id: Number(b.getAttribute('data-id')) });
         if (j) location.reload();
       }
+      if (action === 'redeem-edit') {
+        var f = document.getElementById('ttt-edit-form');
+        if (!f) return;
+        f.elements['benefit_type'].value = b.getAttribute('data-benefit') || 'energy';
+        f.elements['benefit_value'].value = b.getAttribute('data-value') || '';
+        f.elements['max_uses'].value = b.getAttribute('data-max') || '';
+        var exp = b.getAttribute('data-expires') || '';
+        f.elements['expires_at'].value = exp ? toLocalInput(exp) : '';
+        f.elements['no_expires'].checked = !exp;
+        document.getElementById('ttt-edit-code-name').textContent = b.getAttribute('data-code') || '';
+        document.getElementById('ttt-edit-used').textContent = 'Sudah terpakai ' + (b.getAttribute('data-used') || '0') + ' kali — maks pakai baru tidak boleh di bawah angka ini.';
+        document.getElementById('ttt-edit-code').hidden = false;
+        document.getElementById('ttt-edit-code').scrollIntoView({ block: 'nearest' });
+        return;
+      }
+      if (action === 'redeem-history') {
+        var hcode = b.getAttribute('data-code') || '';
+        var hcard = document.getElementById('ttt-code-history');
+        var hbody = document.getElementById('ttt-history-body');
+        if (!hcard || !hbody) return;
+        document.getElementById('ttt-history-title').textContent = 'Riwayat penukaran ' + hcode;
+        hcard.hidden = false;
+        hbody.innerHTML = '<p>Memuat…</p>';
+        hcard.scrollIntoView({ block: 'nearest' });
+        fetch('/api/taptap/admin/redeem/history?code=' + encodeURIComponent(hcode), { credentials: 'same-origin' })
+          .then(function(r){ return r.json(); })
+          .then(function(j){
+            if (!j || !Array.isArray(j.redeems)) { hbody.innerHTML = '<p>Gagal memuat riwayat.</p>'; return; }
+            if (!j.redeems.length) { hbody.innerHTML = '<p>Belum ada yang menukar kode ini.</p><p class="adm-muted" style="font-size:13px">Hanya penukaran yang berhasil yang tercatat di sini.</p>'; return; }
+            hbody.innerHTML = '<p>' + j.total + ' penukaran berhasil.</p>' + j.redeems.map(function(x){
+              return '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title"><a href="/kendali/taptap?user=' + escHtml(x.account_id) + '">' + escHtml(x.account_id) + '</a> · ' + escHtml(x.benefit_type) + ' +' + Number(x.benefit_value || 0).toLocaleString('id-ID') + '</span><div class="adm-row-meta">' + escHtml(wibText(x.redeemed_at)) + '</div></div></div>';
+            }).join('') + '<p class="adm-muted" style="font-size:13px">Hanya penukaran yang berhasil yang tercatat di sini.</p>';
+          })
+          .catch(function(){ hbody.innerHTML = '<p>Gagal memuat riwayat.</p>'; });
+        return;
+      }
       if (action === 'redeem-deactivate') {
-        if (!confirm('Nonaktifkan kode ' + b.getAttribute('data-code') + '?')) return;
+        if (!confirm('Cabut kode ' + b.getAttribute('data-code') + '? Kode yang dicabut tidak bisa ditukar lagi.')) return;
         const j = await post('/api/taptap/admin/redeem/deactivate', { code: b.getAttribute('data-code') });
         if (j) location.reload();
       }
@@ -1989,6 +2101,58 @@ async function handleTapTap(request, env, url) {
         'UPDATE ttt_redeem_codes SET active = 0 WHERE code = ?'
       ).bind(String(b.code).trim().toUpperCase()).run();
       return taptapJson({ ok: true });
+    }
+    // POST /api/taptap/admin/redeem/update {code, benefit_type, benefit_value, max_uses, expires_at?}
+    // Edit kode yang sudah ada: manfaat, nilai, maks pakai, kedaluwarsa.
+    // expires_at kosong/null = hapus kedaluwarsa. Edit TIDAK mengubah
+    // status aktif/nonaktif dan TIDAK mereset used_count. Maks pakai baru
+    // tidak boleh di bawah jumlah yang sudah terpakai.
+    if (request.method === 'POST' && sub === 'redeem' && parts[4] === 'update') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const b = await request.json().catch(() => null);
+      const code = String(b && b.code || '').trim().toUpperCase();
+      if (!code || !TTT_REDEEM_TYPES.includes(b.benefit_type)) {
+        return taptapJson({ error: 'bad_request' }, 400);
+      }
+      const value = Number(b.benefit_value);
+      if (!Number.isFinite(value) || value <= 0 || value > TTT_REDEEM_MAX_VALUE) {
+        return taptapJson({ error: 'bad_benefit_value' }, 400);
+      }
+      const maxUses = Math.floor(Number(b.max_uses) || 0);
+      if (maxUses < 1 || maxUses > 10000) return taptapJson({ error: 'bad_max_uses' }, 400);
+      const row = await db.prepare('SELECT * FROM ttt_redeem_codes WHERE code = ?').bind(code).first();
+      if (!row) return taptapJson({ error: 'code_not_found' }, 404);
+      if (maxUses < Number(row.used_count)) {
+        return taptapJson({ error: 'max_uses_below_used', used_count: Number(row.used_count) }, 400);
+      }
+      let expiresAt = null;
+      if (b.expires_at) {
+        if (!Number.isFinite(Date.parse(String(b.expires_at)))) {
+          return taptapJson({ error: 'bad_expires_at' }, 400);
+        }
+        expiresAt = String(b.expires_at);
+      }
+      await db.prepare(
+        'UPDATE ttt_redeem_codes SET benefit_type = ?, benefit_value = ?, max_uses = ?, expires_at = ? WHERE code = ?'
+      ).bind(b.benefit_type, value, maxUses, expiresAt, code).run();
+      return taptapJson({ ok: true, code, benefit_type: b.benefit_type, benefit_value: value, max_uses: maxUses, expires_at: expiresAt });
+    }
+    // GET /api/taptap/admin/redeem/history?code=XXX — siapa saja yang
+    // menukar kode ini (hanya penukaran berhasil; sudah tercatat di
+    // ttt_redeem_log sejak fitur redeem diluncurkan).
+    if (request.method === 'GET' && sub === 'redeem' && parts[4] === 'history') {
+      if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      const code = String(url.searchParams.get('code') || '').trim().toUpperCase();
+      if (!code) return taptapJson({ error: 'bad_request' }, 400);
+      const { results } = await db.prepare(
+        "SELECT account_id, guest_id, benefit_type, benefit_value, redeemed_at FROM ttt_redeem_log WHERE code = ? AND status = 'ok' ORDER BY redeemed_at DESC LIMIT 100"
+      ).bind(code).all();
+      const total = await db.prepare(
+        "SELECT COUNT(*) AS c FROM ttt_redeem_log WHERE code = ? AND status = 'ok'"
+      ).bind(code).first();
+      return taptapJson({ ok: true, code, total: Number(total && total.c) || 0, redeems: results || [] });
     }
     // ---- Paket admin: perintah paksa (admin-batch) ----
     // POST /api/taptap/admin/command {target_type: guest|account, target_id, command: kick|crash}
@@ -2788,6 +2952,13 @@ async function handleFetch(request, env, ctx) {
     // klik via waitUntil, supaya pencatatan tidak menghambat redirect.
     if (url.hostname === DL_HOST) {
       return handleDlRedirect(request, env, ctx, url);
+    }
+    // ---- Domain bawaan workers.dev: host backup situs + share (sudah ada
+    // sebelum link-dl). Hanya kode dl yang dikenal yang diarahkan (302 +
+    // catat klik); sisanya jatuh ke handler normal.
+    if (url.hostname === DL_WORKERS_DEV_HOST) {
+      const dlRes = await tryDlRedirect(request, env, ctx, url);
+      if (dlRes) return dlRes;
     }
 
     let nowIso = new Date().toISOString();
@@ -5016,7 +5187,7 @@ requestAnimationFrame(draw);
       }
       // ---- Admin: panel Tap Tap Tycoon (admin-batch) ----
       if (path === '/kendali/taptap') {
-        const content = await renderTttAdminPanel(env, nav, noticeHtml(url));
+        const content = await renderTttAdminPanel(env, nav, noticeHtml(url), url);
         return html(await renderPage(env, 'Tap Tap Tycoon', content));
       }
       // ---- Admin: Link Download + analitik (modul dl.js) ----

@@ -1,19 +1,28 @@
-// Link Download + analitik (21 Nov 2026) — subdomain link-dl.hozinking.my.id.
+// Link Download + analitik (21 Nov 2026) — subdomain link-dl.hozinking.my.id
+// + domain bawaan Cloudflare hozin-cms.muchammadhozin.workers.dev.
 // Modul mandiri: redirect /<code> -> target (302) + pencatatan klik di D1,
 // dan panel /kendali/dl. Satu-satunya otoritas kode adalah tabel dl_links
 // di D1 cms-db (env.DB).
 // Batas jujur: "siapa" = alamat IP + user-agent/perangkat, BUKAN nama orang
 // — kecuali pengunjung sedang login (user_id terisi). IP hanya tampil di
 // panel admin, tidak pernah di halaman publik. Retensi klik 90 hari.
-import { esc, clientIp, slugify, randomHex } from './util.js';
+import { esc, clientIp } from './util.js';
 import { getCommenter } from './auth.js';
 import { ensureSchema } from './store.js';
 
 export const DL_HOST = 'link-dl.hozinking.my.id';
+export const DL_WORKERS_DEV_HOST = 'hozin-cms.muchammadhozin.workers.dev';
 export const DL_CLICK_RETENTION_DAYS = 90;
 export const DL_PRUNE_BATCH = 500;
 
-const CODE_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+const B62 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+// ID acak 7 karakter base62 (huruf+angka) untuk link baru tanpa kode
+// kustom (aturan 20:20 — default, bukan slug judul).
+export function randomDlCode() {
+  const b = crypto.getRandomValues(new Uint8Array(7));
+  return Array.from(b, x => B62[x % 62]).join('');
+}
 const wib = v => { const n = Number(v || 0); const ms = (n > 0 && n < 1e12) ? n * 1000 : n; return new Date(ms + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16); };
 
 export function dlShortUrl(code) { return 'https://' + DL_HOST + '/' + code; }
@@ -70,25 +79,45 @@ export async function handleDlRedirect(request, env, ctx, url) {
   }
 }
 
+// ---- Host backup workers.dev: HANYA layani kode dl yang dikenal + aktif.
+// Yang lain (root, /s/<token>, /api/..., halaman biasa, kode tak dikenal)
+// mengembalikan null supaya handleFetch lanjut ke handler normal — host ini
+// sudah dipakai sebagai host backup fitur share + halaman biasa (tes
+// test.mjs "share: create/landing via workers.dev"), jadi TIDAK BOLEH
+// membajak semua path seperti host link-dl.
+export async function tryDlRedirect(request, env, ctx, url) {
+  if (request.method !== 'GET') return null;
+  const code = decodeURIComponent(url.pathname.replace(/^\/+|\/+$/g, ''));
+  if (!code || code.includes('/') || !validDlCode(code)) return null;
+  try {
+    await ensureSchema(env);
+    const link = await env.DB.prepare(`SELECT target_url FROM dl_links WHERE code = ? AND active = 1`).bind(code).first();
+    if (!link || !link.target_url) return null;
+    const p = logDlClick(env, request, code);
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(p);
+    else await p;
+    return new Response(null, { status: 302, headers: { location: link.target_url, 'cache-control': 'no-store' } });
+  } catch (e) { return null; }
+}
+
 // ---- Admin: buat link baru (dipanggil dari POST /kendali/dl/create) ----
 export async function handleDlCreate(env, form) {
   const target = String(form.get('target_url') || '').trim().slice(0, 2000);
   if (!/^https?:\/\/[^\s"'<>]+$/.test(target)) return { ok: false };
   let code = String(form.get('code') || '').trim().toLowerCase().slice(0, 64);
-  if (!code) {
-    code = slugify(String(form.get('title') || '')) || '';
-    if (!code) code = 'link-' + randomHex(3);
-  }
+  const autoCode = !code;
+  if (autoCode) code = randomDlCode();
   if (!validDlCode(code)) return { ok: false };
   const title = String(form.get('title') || '').trim().slice(0, 200);
   const postId = String(form.get('post_id') || '').trim().slice(0, 40);
-  // Bentrok kode: tambah -2, -3, ... (maks 9 percobaan, lalu gagal jujur).
+  // Bentrok kode: kode kustom tambah -2, -3, ... (maks 9 percobaan);
+  // kode acak diganti dengan ID acak baru. Lalu gagal jujur.
   let finalCode = code;
   for (let i = 2; i <= 10; i++) {
     const clash = await env.DB.prepare(`SELECT code FROM dl_links WHERE code = ?`).bind(finalCode).first();
     if (!clash) break;
     if (i === 10) return { ok: false };
-    finalCode = code + '-' + i;
+    finalCode = autoCode ? randomDlCode() : code + '-' + i;
     if (!validDlCode(finalCode)) return { ok: false };
   }
   await env.DB.prepare(`INSERT INTO dl_links (code, target_url, title, post_id, created_at, active) VALUES (?, ?, ?, ?, ?, 1)`).bind(finalCode, target, title, postId, Date.now()).run();
@@ -134,7 +163,7 @@ export async function renderDlPanel(env, csrf, nav, notice, url) {
   const formTarget = url.searchParams.get('target') || '';
   return `<h2>Link Download</h2>${nav}${notice}`
     + `<div class="card"><h3>Ringkasan</h3><div class="adm-stats"><div class="adm-stat"><span class="adm-stat-num">${Number(totalRow && totalRow.c) || 0}</span><span class="adm-stat-label">klik total</span></div><div class="adm-stat"><span class="adm-stat-num">${Number(todayRow && todayRow.c) || 0}</span><span class="adm-stat-label">klik 24 jam terakhir</span></div><div class="adm-stat"><span class="adm-stat-num">${(links.results || []).length}</span><span class="adm-stat-label">link aktif dibuat</span></div></div><p style="font-size:13px;opacity:.7">"Siapa" di bawah = alamat IP + perangkat (user-agent), bukan nama orang — nama hanya muncul bila pengunjung sedang login. IP hanya terlihat di halaman ini (admin), tidak pernah tampil di halaman publik. Klik disimpan 90 hari.</p></div>`
-    + `<div class="card"><h3>Buat link baru</h3><form method="post" action="/kendali/dl/create"><input type="hidden" name="csrf" value="${csrf}"><label>URL target (wajib)<input name="target_url" type="url" required maxlength="2000" placeholder="https://drive.google.com/..." value="${esc(formTarget)}"></label><label>Kode pendek (opsional, kosong = otomatis dari judul)<input name="code" maxlength="64" placeholder="mis. ksu-next" value="${esc(formCode)}"></label><label>Judul (opsional)<input name="title" maxlength="200" placeholder="mis. KSU NEXT Modul Safe"></label><label>ID postingan (opsional)<input name="post_id" maxlength="40" placeholder="mis. p-20261117-ksu-next-modul-safe"></label><p><button type="submit">Buat short link</button></p><p style="font-size:13px;opacity:.7">Hasilnya: https://link-dl.hozinking.my.id/&lt;kode&gt; — pengunjung diarahkan ke URL target (302) setelah kliknya dicatat.</p></form></div>`
+    + `<div class="card"><h3>Buat link baru</h3><form method="post" action="/kendali/dl/create"><input type="hidden" name="csrf" value="${csrf}"><label>URL target (wajib)<input name="target_url" type="url" required maxlength="2000" placeholder="https://drive.google.com/..." value="${esc(formTarget)}"></label><label>Kode pendek (opsional, kosong = ID acak)<input name="code" maxlength="64" placeholder="mis. ksu-next" value="${esc(formCode)}"></label><label>Judul (opsional)<input name="title" maxlength="200" placeholder="mis. KSU NEXT Modul Safe"></label><label>ID postingan (opsional)<input name="post_id" maxlength="40" placeholder="mis. p-20261117-ksu-next-modul-safe"></label><p><button type="submit">Buat short link</button></p><p style="font-size:13px;opacity:.7">Hasilnya: https://link-dl.hozinking.my.id/&lt;kode&gt; (juga bisa lewat https://hozin-cms.muchammadhozin.workers.dev/&lt;kode&gt;) — pengunjung diarahkan ke URL target (302) setelah kliknya dicatat.</p></form></div>`
     + `<div class="card"><h3>Daftar link</h3>${linkRows}</div>`
     + `<div class="card"><h3>Klik per hari (7 hari terakhir, WIB)</h3>${dayRows}</div>`
     + `<div class="card"><h3>Klik per negara</h3>${countryRows}</div>`
