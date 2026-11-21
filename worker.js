@@ -85,7 +85,7 @@ async function generateAutoReply(env, postTitle, commentText) {
     return text ? text.slice(0, 500) : null;
   } catch (e) { return null; }
 }
-const ADSENSE_CSP = "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://pagead2.googlesyndication.com; frame-src https://googleads.g.doubleclick.net https://tpc.googlesyndication.com https://pagead2.googlesyndication.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
+const ADSENSE_CSP = "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://pagead2.googlesyndication.com; frame-src https://googleads.g.doubleclick.net https://tpc.googlesyndication.com https://pagead2.googlesyndication.com https://www.youtube-nocookie.com https://player.vimeo.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
 // ID otoritas sertifikasi akun AdSense pemilik (field ke-4 baris ads.txt,
 // dari akun AdSense yang sama dengan setting adsense_client).
 const ADSENSE_ADS_TXT_CA = 'f08c47fec0942fa0';

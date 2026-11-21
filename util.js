@@ -42,7 +42,7 @@ export function html(body, status = 200, headers = {}) {
     // skrip inline (footer uptime, editor). Yang dilarang keras: objek/embed
     // (Flash/Java), frame dari luar (clickjacking sudah DENY juga), form ke
     // luar situs, dan gambar hanya dari situs sendiri / https / data.
-    'content-security-policy': "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+    'content-security-policy': "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; frame-src https://www.youtube-nocookie.com https://player.vimeo.com; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
     ...headers,
   } });
 }
@@ -111,6 +111,41 @@ export async function readCappedBody(request, maxBytes) {
   return out;
 }
 
+// Sisip video dari URL (editor ala Blogspot): YouTube / Vimeo -> iframe embed
+// kanonis, file video langsung (.mp4/.webm/.mov) -> <video>. Selain itu null
+// (URL ditolak editor, dan iframe-nya dibuang sanitasi). ID YouTube harus
+// tepat 11 karakter; parameter lain (mis. ?t=) dibuang demi URL kanonis.
+export function videoEmbedUrl(u) {
+  const raw = String(u || '').trim();
+  if (!raw) return null;
+  let url;
+  try { url = new URL(raw); } catch (e) { return null; }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+  const host = url.hostname.toLowerCase();
+  const ytId = (() => {
+    if (host === 'youtu.be') {
+      const id = url.pathname.split('/').filter(Boolean)[0] || '';
+      return /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
+    }
+    if (host === 'www.youtube.com' || host === 'youtube.com' || host === 'm.youtube.com' || host === 'www.youtube-nocookie.com') {
+      if (url.pathname === '/watch') {
+        const id = url.searchParams.get('v') || '';
+        return /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
+      }
+      const m = url.pathname.match(/^\/(shorts|live|embed)\/([A-Za-z0-9_-]{11})(?:\/|$)/);
+      return m ? m[2] : null;
+    }
+    return null;
+  })();
+  if (ytId) return { kind: 'youtube', embed: 'https://www.youtube-nocookie.com/embed/' + ytId, id: ytId };
+  if (host === 'vimeo.com' || host === 'www.vimeo.com' || host === 'player.vimeo.com') {
+    const m = url.pathname.match(/^\/(?:video\/)?(\d+)(?:\/|$)/);
+    if (m) return { kind: 'vimeo', embed: 'https://player.vimeo.com/video/' + m[1], id: m[1] };
+  }
+  const path = url.pathname.toLowerCase();
+  if (/\.(mp4|webm|mov)$/.test(path)) return { kind: 'file', embed: raw, id: '' };
+  return null;
+}
 export function stripTags(s) {
   return String(s ?? '').replace(/<[^>]*>/g, '');
 }
@@ -139,6 +174,24 @@ export function safeUrl(u) {
 export function sanitizeHtml(input) {
   let s = String(input || '');
   s = s.replace(/<!--[\s\S]*?-->/g, '');
+  // iframe HANYA dari host embed yang diizinkan (YouTube/Vimeo): tukar dulu
+  // dengan token supaya tidak ikut dibuang bersama iframe jahat di bawah,
+  // lalu kembalikan dalam bentuk kanonis setelah sanitasi. URL file video
+  // bukan iframe, jadi tidak masuk sini. Token tanpa < > lolos dari pass
+  // tag di bawah tanpa berubah.
+  const embeds = [];
+  const keepFrame = (whole) => {
+    const m = whole.match(/src\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i);
+    const src = m ? (m[1] ?? m[2] ?? m[3] ?? '') : '';
+    const v = videoEmbedUrl(src);
+    if (!v || v.kind === 'file') return '';
+    const title = v.kind === 'youtube' ? 'Video YouTube' : 'Video Vimeo';
+    const allow = v.kind === 'youtube' ? 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share' : 'autoplay; fullscreen; picture-in-picture';
+    embeds.push('<iframe src="' + esc(v.embed) + '" title="' + title + '" width="560" height="315" loading="lazy" referrerpolicy="strict-origin-when-cross-origin" allow="' + allow + '" allowfullscreen></iframe>');
+    return '__HOZIN_EMBED_' + (embeds.length - 1) + '__';
+  };
+  s = s.replace(/<iframe\b[^>]*>([\s\S]*?)<\/iframe\s*>/gi, keepFrame);
+  s = s.replace(/<iframe\b[^>]*\/>/gi, keepFrame);
   for (const tag of ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'textarea', 'select', 'button', 'link', 'meta', 'title', 'head', 'body', 'html']) {
     s = s.replace(new RegExp('<' + tag + '\\b[^>]*>[\\s\\S]*?<\\/' + tag + '\\s*>', 'gi'), '');
     s = s.replace(new RegExp('<' + tag + '\\b[^>]*\\/?>', 'gi'), '');
@@ -168,5 +221,6 @@ export function sanitizeHtml(input) {
     const selfClose = (tag === 'br' || tag === 'hr' || tag === 'img' || tag === 'source') ? ' /' : '';
     return '<' + tag + out + selfClose + '>';
   });
+  s = s.replace(/__HOZIN_EMBED_(\d+)__/g, (m, i) => embeds[Number(i)] || '');
   return s;
 }

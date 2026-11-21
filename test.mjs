@@ -4,10 +4,11 @@ import worker, { resetCerpenReleaseCacheForTest } from './worker.js';
 import vm from 'node:vm';
 import { themes } from './themes.js';
 import { renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
-import { parseTags, tagSlug, sanitizeHtml, sha256Hex, hmacHex } from './util.js';
+import { parseTags, tagSlug, sanitizeHtml, sha256Hex, hmacHex, videoEmbedUrl } from './util.js';
 import { renderMarkdown } from './markdown.js';
 import { checkRateLimit } from './security.js';
 import { tagLinks } from './content.js';
+import { editorCard } from './editor.js';
 import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, nextEventMs, countActiveSeconds } from './reading.js';
 
 class Stmt {
@@ -2201,6 +2202,36 @@ for (const v of badVectors) {
 }
 const goodHtml = sanitizeHtml('<p>Halo <b>Dunia</b></p><a href="https://ok.test">tautan</a><img src="https://ok.test/a.png" alt="gambar"><video controls src="https://ok.test/v.mp4"></video>');
 assert(goodHtml.includes('<p>Halo <b>Dunia</b></p>') && goodHtml.includes('<a href="https://ok.test">tautan</a>') && goodHtml.includes('<img src="https://ok.test/a.png" alt="gambar" />') && goodHtml.includes('<video controls src="https://ok.test/v.mp4">'), 'sanitasi: tag + media yang diizinkan tetap lolos');
+// 34b. Editor Blogspot: video dari URL -> embed kanonis; iframe jahat tetap dibuang.
+const yt = videoEmbedUrl('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+assert(yt && yt.kind === 'youtube' && yt.embed === 'https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ', 'video: YouTube watch -> embed nocookie');
+assert(videoEmbedUrl('https://youtu.be/dQw4w9WgXcQ?t=30')?.embed === 'https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ', 'video: youtu.be -> embed nocookie');
+assert(videoEmbedUrl('https://www.youtube.com/shorts/dQw4w9WgXcQ')?.kind === 'youtube', 'video: YouTube shorts dikenali');
+assert(videoEmbedUrl('https://www.youtube.com/live/dQw4w9WgXcQ')?.kind === 'youtube', 'video: YouTube live dikenali');
+assert(videoEmbedUrl('https://www.youtube.com/embed/dQw4w9WgXcQ')?.embed === 'https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ', 'video: YouTube embed dinormalisasi ke nocookie');
+assert(videoEmbedUrl('https://vimeo.com/123456789')?.embed === 'https://player.vimeo.com/video/123456789', 'video: Vimeo -> player embed');
+assert(videoEmbedUrl('https://cdn.test/v.mp4?x=1')?.kind === 'file', 'video: file .mp4 dikenali');
+assert(videoEmbedUrl('https://cdn.test/v.webm')?.kind === 'file', 'video: file .webm dikenali');
+assert(videoEmbedUrl('https://www.tiktok.com/@u/video/123') === null, 'video: TikTok ditolak');
+assert(videoEmbedUrl('https://evil.test/x.mp4.evil.com/') === null, 'video: URL menipu ditolak');
+assert(videoEmbedUrl('javascript:alert(1)') === null, 'video: javascript: ditolak');
+assert(videoEmbedUrl('https://www.youtube.com/watch?v=pendek') === null, 'video: ID YouTube pendek ditolak');
+const ytKept = sanitizeHtml('<p>t</p><iframe src="https://www.youtube.com/watch?v=dQw4w9WgXcQ"></iframe>');
+assert(ytKept.includes('<iframe src="https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"') && ytKept.includes('allowfullscreen'), 'sanitasi: iframe YouTube dipertahankan + dikanonisasi');
+const vimKept = sanitizeHtml('<iframe src="https://player.vimeo.com/video/123456789"></iframe>');
+assert(vimKept.includes('<iframe src="https://player.vimeo.com/video/123456789"'), 'sanitasi: iframe Vimeo dipertahankan');
+const evilFrame = sanitizeHtml('<iframe src="https://evil.test/x"></iframe>');
+assert(!/<iframe/i.test(evilFrame), 'sanitasi: iframe host lain tetap dibuang');
+const edNew = editorCard('<input name="csrf" value="x">');
+assert(edNew.includes('contenteditable="true"') && edNew.includes('id="edToolbar"') && edNew.includes('id="edDlgVideo"') && edNew.includes('id="edDlgLink"') && edNew.includes('id="edDlgImg"') && edNew.includes('id="viewPrevBtn"') && edNew.includes('name="body_mode" value="html"'), 'editor: rich text + toolbar + dialog video/tautan/gambar + pratinjau');
+assert(!edNew.includes('modeTextBtn') && !edNew.includes('Blok Mudah') && !edNew.includes('modeBlocksBtn'), 'editor: mode lama (Teks Biasa/Blok Mudah) sudah diganti');
+assert(edNew.includes('imgbbFile') && edNew.includes('name="title"') && edNew.includes('name="category"') && edNew.includes('name="tags"'), 'editor: ImgBB + Judul/Kategori/Tag tetap ada');
+const edScript = edNew.match(/<script>([\s\S]*)<\/script>/)[1];
+let edScriptOk = true;
+try { new Function(edScript); } catch (e) { edScriptOk = false; }
+assert(edScriptOk, 'editor: skrip inline lolos parse (pelajaran: editor lama gagal parse karena \\n di regex)');
+const edEdit = editorCard('<input name="csrf" value="x">', { post: { id: 'p-1', title: 'Judul', category: 'Umum', tags: '', body: 'baris1\n\nbaris2', body_mode: 'text', visibility: 'public', publish_at: '' }, action: '/kendali/posts/update' });
+assert(edEdit.includes('&lt;p&gt;baris1&lt;/p&gt;') || edEdit.includes('baris1'), 'editor: post teks lama dimuat ke editor');
 // 35. Batas ukuran request tanpa Content-Length (B4)
 async function callStream(method, path, bodyText, cookie = '') {
   const stream = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(bodyText)); c.close(); } });
