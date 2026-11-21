@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS cms_rate_limits (key TEXT PRIMARY KEY, count INTEGER 
 -- identitas perangkat di tabel mana pun; usage hanya simpan lokasi kasar
 -- dari request.cf, tanpa IP dan tanpa user-agent).
 CREATE TABLE IF NOT EXISTS dracin_api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL, scope TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
+-- Link Download + analitik (21 Nov 2026, subdomain link-dl.hozinking.my.id).
+-- dl_links: short code -> target. dl_clicks: satu baris per klik.
+-- "Siapa" = IP + user-agent, BUKAN nama — kecuali pengunjung login.
+-- IP hanya tampil di panel admin, tidak pernah di halaman publik.
+-- Retensi klik 90 hari (prune saat panel /kendali/dl dibuka).
+CREATE TABLE IF NOT EXISTS dl_links (code TEXT PRIMARY KEY, target_url TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', post_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS dl_clicks (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, code TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '', referer TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS idx_dl_clicks_code_ts ON dl_clicks (code, ts);
+CREATE INDEX IF NOT EXISTS idx_dl_clicks_ts ON dl_clicks (ts);
+
 CREATE TABLE IF NOT EXISTS dracin_catalog (platform TEXT NOT NULL, title_id TEXT NOT NULL, title TEXT NOT NULL, cover_url TEXT NOT NULL DEFAULT '', synopsis TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT '', episode_count INTEGER NOT NULL DEFAULT 0, free_count INTEGER NOT NULL DEFAULT 0, locked_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (platform, title_id));
 CREATE TABLE IF NOT EXISTS dracin_episodes (platform TEXT NOT NULL, title_id TEXT NOT NULL, idx INTEGER NOT NULL, item_id TEXT NOT NULL, duration_s REAL NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (platform, title_id, idx));
 CREATE TABLE IF NOT EXISTS dracin_seeds (platform TEXT NOT NULL, query TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (platform, query));

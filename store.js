@@ -119,6 +119,14 @@ export async function ensureSchema(env) {
         `CREATE TABLE IF NOT EXISTS cerpen_admins (user_id TEXT PRIMARY KEY, fingerprint_hash TEXT NOT NULL DEFAULT '', bound_at INTEGER, note TEXT NOT NULL DEFAULT '')`,
         // Seed: hozinking (u-mwf1z8n0) — satu-satunya admin god-mode.
         `INSERT OR IGNORE INTO cerpen_admins (user_id, fingerprint_hash, bound_at, note) VALUES ('u-mwf1z8n0', '', NULL, 'hozinking — god-mode admin')`,
+        // 21 Nov 2026: link download + analitik (subdomain link-dl).
+        // dl_links: short code -> target. dl_clicks: satu baris per klik;
+        // IP hanya untuk admin, tidak pernah tampil publik. Retensi 90 hari
+        // (prune saat panel /kendali/dl dibuka, maks 500 baris).
+        `CREATE TABLE IF NOT EXISTS dl_links (code TEXT PRIMARY KEY, target_url TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', post_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1)`,
+        `CREATE TABLE IF NOT EXISTS dl_clicks (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, code TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '', referer TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '')`,
+        `CREATE INDEX IF NOT EXISTS idx_dl_clicks_code_ts ON dl_clicks (code, ts)`,
+        `CREATE INDEX IF NOT EXISTS idx_dl_clicks_ts ON dl_clicks (ts)`,
       ];
       // 11 Nov 2026 (performa): DDL dieksekusi via SATU batch, bukan
       // ~30 round-trip D1 berurutan — di isolate dingin tiap round-trip

@@ -34,6 +34,7 @@ import { handleCoinApi, handleCoinAdmin, renderCoinPanel } from './coins.js';
 import { handleSocialApi, handleSocialAdminApi, handleBookmarksApi, renderSocialReportsPanel, renderSocialStatsPanel, getSocialDashboardSummary } from './social.js';
 import { resolveCerpenRelease, enforceCerpenAppGate, CERPEN_MIN_VERSION } from './cerpen-gate.js';
 import { handleCerpenTrackApi, handleCerpenTrackAdmin, renderCerpenTrackPanel, enforceCerpenApiKeyIfPresent } from './cerpen-admin.js';
+import { handleDlRedirect, renderDlPanel, handleDlCreate, handleDlToggle, DL_HOST } from './dl.js';
 export { resetCerpenReleaseCacheForTest } from './cerpen-gate.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
 import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, STOPWATCH_EVENTS, nextEventMs, readingTrackerScript, HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
@@ -332,7 +333,7 @@ input:not([type=checkbox]):not([type=hidden]):not([type=submit]),select,textarea
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/cerpen-pantau', 'Pantau Cerpen'], ['/kendali/statistik', 'Statistik'], ['/kendali/laporan', 'Laporan'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper'], ['/kendali/taptap', 'Tap Tap']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/cerpen-pantau', 'Pantau Cerpen'], ['/kendali/statistik', 'Statistik'], ['/kendali/laporan', 'Laporan'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper'], ['/kendali/taptap', 'Tap Tap'], ['/kendali/dl', 'Link Download']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -359,10 +360,13 @@ const ADMIN_NOTICES = {
   'backup-dibuat': 'Backup dibuat — lihat riwayat di bawah.',
   'cerpen-config-tidak-valid': 'Remote config Cerpen tidak valid — tidak disimpan, nilai lama tetap dipakai.',
   'adsense-tidak-valid': 'ID AdSense tidak valid — tidak disimpan, nilai lama tetap dipakai. Isi ID ca-pub-… atau tempel script AdSense lengkap.',
+  'link-dibuat': 'Link download dibuat.',
+  'link-diubah': 'Link download diubah.',
+  'link-gagal': 'Link gagal dibuat — periksa URL target dan kode.',
 };
 // Slug notice yang menandai KEGAGALAN (bukan keberhasilan): tampil dengan
 // label "Gagal:" + garis merah, bukan "Berhasil:".
-const ADMIN_NOTICE_ERRORS = new Set(['cerpen-config-tidak-valid', 'adsense-tidak-valid']);
+const ADMIN_NOTICE_ERRORS = new Set(['cerpen-config-tidak-valid', 'adsense-tidak-valid', 'link-gagal']);
 function noticeHtml(url) {
   const slug = url.searchParams.get('notice') || '';
   const msg = ADMIN_NOTICES[slug];
@@ -651,7 +655,7 @@ export default {
   // lagi (kuota reset tengah malam UTC = 07:00 WIB), semua kembali normal
   // tanpa redeploy, karena schemaReady di-reset saat gagal. Data tidak hilang:
   // ini hanya gagal baca, bukan gagal tulis.
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       // Perpanjang sesi admin secara transparan: bila token akses sudah
       // kedaluwarsa tapi refresh masih sah, putar refresh dan teruskan request
@@ -670,7 +674,7 @@ export default {
           if (r) { req = r.request; refreshedCookies = r.cookies; }
         }
       }
-      let res = await handleFetch(req, env);
+      let res = await handleFetch(req, env, ctx);
       if (refreshedCookies.length) {
         const h = new Headers(res.headers);
         for (const c of refreshedCookies) h.append('set-cookie', c);
@@ -2669,9 +2673,17 @@ async function handleDompet(request, env, url) {
   return taptapJson({ error: 'not_found' }, 404);
 }
 
-async function handleFetch(request, env) {
+async function handleFetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // ---- Subdomain link-dl: short link download + analitik (21 Nov 2026) ----
+    // Host ini hanya melayani redirect /<code> -> target (302) + pencatatan
+    // klik via waitUntil, supaya pencatatan tidak menghambat redirect.
+    if (url.hostname === DL_HOST) {
+      return handleDlRedirect(request, env, ctx, url);
+    }
+
     let nowIso = new Date().toISOString();
     // Penjaga ukuran body: tolak POST raksasa sebelum dibaca penuh (anti
     // banjir POST). Batas 200 KB jauh di atas post/komentar normal; upload
@@ -4872,7 +4884,7 @@ requestAnimationFrame(draw);
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/cerpen-pantau' || path === '/kendali/statistik' || path === '/kendali/laporan' || path === '/kendali/md-backup' || path === '/kendali/tamper' || path === '/kendali/taptap')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/cerpen-pantau' || path === '/kendali/statistik' || path === '/kendali/laporan' || path === '/kendali/md-backup' || path === '/kendali/tamper' || path === '/kendali/taptap' || path === '/kendali/dl')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
@@ -4900,6 +4912,11 @@ requestAnimationFrame(draw);
       if (path === '/kendali/taptap') {
         const content = await renderTttAdminPanel(env, nav, noticeHtml(url));
         return html(await renderPage(env, 'Tap Tap Tycoon', content));
+      }
+      // ---- Admin: Link Download + analitik (modul dl.js) ----
+      if (path === '/kendali/dl') {
+        const content = await renderDlPanel(env, csrf, nav, noticeHtml(url), url);
+        return html(await renderPage(env, 'Link Download', content));
       }
       // ---- Admin: panel kontrol API Cerpen (v66) ----
       // Statistik + keys + submissions + audit, semua dari D1 stopwatch-db
@@ -5933,6 +5950,15 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
         }
         const retP = String(form.get('return_to') || '');
         return redirect(withNotice(retP.startsWith('/kendali/') ? retP : '/kendali/plugins', 'plugin-disimpan'));
+      }
+      // ---- Admin: Link Download (modul dl.js) ----
+      if (path === '/kendali/dl/create') {
+        const r = await handleDlCreate(env, form);
+        return redirect(withNotice('/kendali/dl', r.ok ? 'link-dibuat' : 'link-gagal'));
+      }
+      if (path === '/kendali/dl/toggle') {
+        await handleDlToggle(env, form);
+        return redirect(withNotice('/kendali/dl', 'link-diubah'));
       }
     }
     // Jalur /admin lama sudah pensiun: siapa pun yang menebak /admin atau
