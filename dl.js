@@ -26,7 +26,55 @@ export function randomDlCode() {
 const wib = v => { const n = Number(v || 0); const ms = (n > 0 && n < 1e12) ? n * 1000 : n; return new Date(ms + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 16); };
 
 export function dlShortUrl(code) { return 'https://' + DL_HOST + '/' + code; }
+export function dlShortUrlFor(host, code) { return 'https://' + host + '/' + code; }
 export function validDlCode(code) { return CODE_RE.test(code || ''); }
+
+// ---- Status domain link (21 Nov 2026): panel /kendali/dl menampilkan
+// AKTIF/NONAKTIF kedua host + link baru otomatis memakai host yang aktif.
+// Pengecekan: GET ringan ke root tiap host, timeout 5 dtk; HTTP 2xx =
+// aktif, selain itu / timeout / error jaringan = nonaktif. Hasil di-cache
+// 60 dtk di memori (per isolate) supaya panel tidak melambat tiap dibuka.
+// Bila fetch tidak tersedia sama sekali -> 'unknown' (jangan mengarang
+// status). ok bernilai true | false | 'unknown'.
+export const DL_HOST_STATUS_CACHE_MS = 60_000;
+export const DL_HOST_CHECK_TIMEOUT_MS = 5000;
+let dlHostStatusCache = null;
+export function resetDlHostStatusCache() { dlHostStatusCache = null; }
+
+async function probeDlHost(host, fetchFn) {
+  try {
+    const res = await fetchFn('https://' + host + '/', { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(DL_HOST_CHECK_TIMEOUT_MS) });
+    return { host, ok: res.status >= 200 && res.status < 300, checkedAt: Date.now() };
+  } catch (e) {
+    return { host, ok: false, checkedAt: Date.now() };
+  }
+}
+
+export async function checkDlHostStatus(fetchFn) {
+  const fn = fetchFn || (typeof globalThis.fetch === 'function' ? globalThis.fetch : null);
+  const now = Date.now();
+  if (dlHostStatusCache && now - dlHostStatusCache.at < DL_HOST_STATUS_CACHE_MS) return dlHostStatusCache.status;
+  let status;
+  if (!fn) {
+    status = {
+      primary: { host: DL_HOST, ok: 'unknown', checkedAt: now },
+      backup: { host: DL_WORKERS_DEV_HOST, ok: 'unknown', checkedAt: now },
+    };
+  } else {
+    const [primary, backup] = await Promise.all([probeDlHost(DL_HOST, fn), probeDlHost(DL_WORKERS_DEV_HOST, fn)]);
+    status = { primary, backup };
+  }
+  dlHostStatusCache = { at: now, status };
+  return status;
+}
+
+// Host short URL untuk link baru: primer bila aktif, cadangan bila primer
+// mati, primer lagi bila keduanya mati (link tetap dibuat + peringatan).
+export function pickDlHost(status) {
+  if (status && status.primary && status.primary.ok === true) return DL_HOST;
+  if (status && status.backup && status.backup.ok === true) return DL_WORKERS_DEV_HOST;
+  return DL_HOST;
+}
 
 // Catat satu klik. TIDAK PERNAH melempar — gagal catat tidak boleh
 // menggagalkan redirect.
@@ -135,7 +183,23 @@ export async function handleDlToggle(env, form) {
 // ---- Admin: panel /kendali/dl ----
 // Sengaja tanpa <table>: daftar memakai .adm-row/.adm-stats seperti panel
 // admin lain, supaya tidak meluber di layar HP (keluhan 20:09).
-export async function renderDlPanel(env, csrf, nav, notice, url) {
+export async function renderDlPanel(env, csrf, nav, notice, url, deps = {}) {
+  const hostStatus = await checkDlHostStatus(deps.fetch);
+  const activeHost = pickDlHost(hostStatus);
+  const statusBadge = s => s.ok === true ? '<b style="color:#16a34a">AKTIF</b>' : s.ok === false ? '<b style="color:#dc2626">NONAKTIF</b>' : '<b style="color:#6b7280">tidak bisa dicek</b>';
+  const hostWarn = hostStatus.primary.ok === true
+    ? `Link baru memakai domain primer (${esc(activeHost)}).`
+    : hostStatus.backup.ok === true
+      ? '<b style="color:#dc2626">Perhatian: link-dl sedang nonaktif — link baru otomatis memakai workers.dev (cadangan).</b>'
+      : hostStatus.primary.ok === 'unknown' || hostStatus.backup.ok === 'unknown'
+        ? `Status domain tidak bisa dicek saat ini — link baru memakai ${esc(activeHost)}.`
+        : '<b style="color:#dc2626">Perhatian: kedua domain tidak merespons — link baru tetap memakai link-dl. Periksa domain sebelum membagikan.</b>';
+  const statusCard = `<div class="card"><h3>Status domain</h3>`
+    + `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(hostStatus.primary.host)}</span><div class="adm-row-meta">primer · dicek ${esc(wib(hostStatus.primary.checkedAt))} WIB</div></div>${statusBadge(hostStatus.primary)}</div>`
+    + `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(hostStatus.backup.host)}</span><div class="adm-row-meta">cadangan · dicek ${esc(wib(hostStatus.backup.checkedAt))} WIB</div></div>${statusBadge(hostStatus.backup)}</div>`
+    + `<p style="font-size:13px">${hostWarn}</p></div>`;
+  const urlLine = (short, st) => `<div class="adm-row-meta" style="word-break:break-all"><a href="${esc(short)}" target="_blank" rel="noopener">${esc(short)}</a> ${statusBadge(st)} <button type="button" data-dl-copy="${esc(short)}">Salin</button></div>`;
+  const copyScript = `<script>(function(){async function copyText(t){try{await navigator.clipboard.writeText(t);return true;}catch(e){try{var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();var ok=document.execCommand('copy');document.body.removeChild(ta);return ok;}catch(e2){return false;}}}document.querySelectorAll('[data-dl-copy]').forEach(function(b){b.addEventListener('click',async function(){var ok=await copyText(b.getAttribute('data-dl-copy')||'');b.textContent=ok?'Tersalin':'Gagal menyalin';setTimeout(function(){b.textContent='Salin';},2000);});});})();</script>`;
   const now = Date.now();
   const day7 = now - 7 * 24 * 3600 * 1000;
   // Prune retensi 90 hari, bertahap (maks 500 baris). Gagal prune tidak
@@ -153,8 +217,9 @@ export async function renderDlPanel(env, csrf, nav, notice, url) {
   ]);
   const linkRows = (links.results || []).map(l => {
     const short = dlShortUrl(l.code);
+    const backupShort = dlShortUrlFor(DL_WORKERS_DEV_HOST, l.code);
     const active = Number(l.active) === 1;
-    return `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title"><a href="${esc(short)}" target="_blank" rel="noopener">${esc(short)}</a>${active ? '' : ' <b style="color:#dc2626">(nonaktif)</b>'}</span><div class="adm-row-meta">${esc(l.title || '(tanpa judul)')}${l.post_id ? ` · post ${esc(l.post_id)}` : ''} · ${Number(l.total) || 0} klik total · ${Number(l.d7) || 0} klik 7 hari</div><div class="adm-row-meta" style="word-break:break-all">→ ${esc(l.target_url)}</div></div><form method="post" action="/kendali/dl/toggle" style="display:inline"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="code" value="${esc(l.code)}"><input type="hidden" name="active" value="${active ? '0' : '1'}"><button type="submit">${active ? 'Nonaktifkan' : 'Aktifkan'}</button></form></div>`;
+    return `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(l.code)}${active ? '' : ' <b style="color:#dc2626">(nonaktif)</b>'}</span><div class="adm-row-meta">${esc(l.title || '(tanpa judul)')}${l.post_id ? ` · post ${esc(l.post_id)}` : ''} · ${Number(l.total) || 0} klik total · ${Number(l.d7) || 0} klik 7 hari</div>${urlLine(short, hostStatus.primary)}${urlLine(backupShort, hostStatus.backup)}<div class="adm-row-meta" style="word-break:break-all">→ ${esc(l.target_url)}</div></div><form method="post" action="/kendali/dl/toggle" style="display:inline"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="code" value="${esc(l.code)}"><input type="hidden" name="active" value="${active ? '0' : '1'}"><button type="submit">${active ? 'Nonaktifkan' : 'Aktifkan'}</button></form></div>`;
   }).join('') || '<p>Belum ada link. Buat yang pertama di bawah.</p>';
   const dayRows = (perDay.results || []).map(r => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(r.d)}</span></div><span>${Number(r.c) || 0} klik</span></div>`).join('') || '<p>Belum ada klik 7 hari terakhir.</p>';
   const countryRows = (perCountry.results || []).map(r => `<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">${esc(r.country || '(tidak diketahui)')}</span></div><span>${Number(r.c) || 0} klik</span></div>`).join('') || '<p>Belum ada data negara.</p>';
@@ -163,9 +228,11 @@ export async function renderDlPanel(env, csrf, nav, notice, url) {
   const formTarget = url.searchParams.get('target') || '';
   return `<h2>Link Download</h2>${nav}${notice}`
     + `<div class="card"><h3>Ringkasan</h3><div class="adm-stats"><div class="adm-stat"><span class="adm-stat-num">${Number(totalRow && totalRow.c) || 0}</span><span class="adm-stat-label">klik total</span></div><div class="adm-stat"><span class="adm-stat-num">${Number(todayRow && todayRow.c) || 0}</span><span class="adm-stat-label">klik 24 jam terakhir</span></div><div class="adm-stat"><span class="adm-stat-num">${(links.results || []).length}</span><span class="adm-stat-label">link aktif dibuat</span></div></div><p style="font-size:13px;opacity:.7">"Siapa" di bawah = alamat IP + perangkat (user-agent), bukan nama orang — nama hanya muncul bila pengunjung sedang login. IP hanya terlihat di halaman ini (admin), tidak pernah tampil di halaman publik. Klik disimpan 90 hari.</p></div>`
-    + `<div class="card"><h3>Buat link baru</h3><form method="post" action="/kendali/dl/create"><input type="hidden" name="csrf" value="${csrf}"><label>URL target (wajib)<input name="target_url" type="url" required maxlength="2000" placeholder="https://drive.google.com/..." value="${esc(formTarget)}"></label><label>Kode pendek (opsional, kosong = ID acak)<input name="code" maxlength="64" placeholder="mis. ksu-next" value="${esc(formCode)}"></label><label>Judul (opsional)<input name="title" maxlength="200" placeholder="mis. KSU NEXT Modul Safe"></label><label>ID postingan (opsional)<input name="post_id" maxlength="40" placeholder="mis. p-20261117-ksu-next-modul-safe"></label><p><button type="submit">Buat short link</button></p><p style="font-size:13px;opacity:.7">Hasilnya: https://link-dl.hozinking.my.id/&lt;kode&gt; (juga bisa lewat https://hozin-cms.muchammadhozin.workers.dev/&lt;kode&gt;) — pengunjung diarahkan ke URL target (302) setelah kliknya dicatat.</p></form></div>`
+    + statusCard
+    + `<div class="card"><h3>Buat link baru</h3><form method="post" action="/kendali/dl/create"><input type="hidden" name="csrf" value="${csrf}"><label>URL target (wajib)<input name="target_url" type="url" required maxlength="2000" placeholder="https://drive.google.com/..." value="${esc(formTarget)}"></label><label>Kode pendek (opsional, kosong = ID acak)<input name="code" maxlength="64" placeholder="mis. ksu-next" value="${esc(formCode)}"></label><label>Judul (opsional)<input name="title" maxlength="200" placeholder="mis. KSU NEXT Modul Safe"></label><label>ID postingan (opsional)<input name="post_id" maxlength="40" placeholder="mis. p-20261117-ksu-next-modul-safe"></label><p><button type="submit">Buat short link</button></p><p style="font-size:13px;opacity:.7">Hasilnya: https://${esc(activeHost)}/&lt;kode&gt; — pengunjung diarahkan ke URL target (302) setelah kliknya dicatat. Versi cadangan: https://${esc(activeHost === DL_HOST ? DL_WORKERS_DEV_HOST : DL_HOST)}/&lt;kode&gt;.</p></form></div>`
     + `<div class="card"><h3>Daftar link</h3>${linkRows}</div>`
     + `<div class="card"><h3>Klik per hari (7 hari terakhir, WIB)</h3>${dayRows}</div>`
     + `<div class="card"><h3>Klik per negara</h3>${countryRows}</div>`
-    + `<div class="card"><h3>Klik terbaru (50 terakhir)</h3>${recentRows}</div>`;
+    + `<div class="card"><h3>Klik terbaru (50 terakhir)</h3>${recentRows}</div>`
+    + copyScript;
 }
