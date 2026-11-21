@@ -165,8 +165,16 @@ sini adalah modul JS khusus WorkerCMS (lihat `plugins.js` dan
 node test.mjs
 
 # Build bundle untuk deploy (output ke dist/, di-gitignore — jangan
-# edit hasil build langsung, edit sumbernya lalu build ulang)
-npx esbuild worker.js --bundle --format=esm --outfile=dist/worker.js
+# edit hasil build langsung, edit sumbernya lalu build ulang).
+# build.mjs: minify skrip inline panel admin (esbuild, tanpa mangling
+# identifier; blok yang gagal verifikasi dilewati apa adanya) + minify
+# konstanta globeScript, lalu bundle --minify -> dist/worker.js.
+# TIDAK dipakai obfuscator berat / "enkripsi" JS — JS harus bisa jalan di
+# browser sehingga selalu bisa dikembalikan, dan repo ini publik.
+npm ci
+node build.mjs
+# Uji bundle hasil build (seluruh suite melawan dist/worker.js):
+npm run test:dist
 ```
 
 Deploy:

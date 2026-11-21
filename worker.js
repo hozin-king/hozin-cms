@@ -25,7 +25,7 @@
 // Situs lama yang ada di root harus dipindah ke subdomain dulu bila root mau jadi CMS ini.
 import { themes, adsenseHead } from './themes.js';
 import { pluginDefs } from './plugins.js';
-import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex, parseTags, tagSlug, readCappedBody, sha256Hex, b64url } from './util.js';
+import { esc, para, slugify, sanitizeHtml, html, redirect, parseCookies, clientIp, randomHex, parseTags, tagSlug, readCappedBody, sha256Hex, b64url, safeEqualHex, isImageMagic } from './util.js';
 import { renderMarkdown } from './markdown.js';
 import { isAdmin, csrfToken, issueTokens, getRefreshRow, revokeAllRefresh, tryRefresh, redirectWithCookies, clearAuthCookies, hashPassword, verifyPassword, userCsrf, getCommenter, userSessionCookie, isPostUnlocked, postUnlockCookie, isValidCommenterPassword, COMMENTER_PASSWORD_MIN, COMMENTER_PASSWORD_MAX } from './auth.js';
 import { checkRateLimit } from './security.js';
@@ -720,6 +720,14 @@ export default {
         h.set('cache-control', 'no-store');
         res = new Response(res.body, { status: res.status, headers: h });
       }
+      // Header keamanan di SEMUA respons (bukan hanya HTML — html() sudah
+      // memasangnya sendiri): HSTS + nosniff untuk JSON/redirect/unduhan.
+      {
+        const h = new Headers(res.headers);
+        h.set('strict-transport-security', 'max-age=31536000; includeSubDomains');
+        h.set('x-content-type-options', 'nosniff');
+        res = new Response(res.body, { status: res.status, headers: h });
+      }
       return res;
     } catch (e) {
       const theme = themes.terang;
@@ -735,7 +743,7 @@ export default {
       // dijadikan Inggris dan berlaku untuk seluruh situs, termasuk beranda
       // (menggantikan fallback beranda statis sebelumnya).
       const maintenance = `<div class="card"><h2>Under Maintenance</h2><p>This site is currently under maintenance. We'll be back soon.</p><p>Please check back later.</p></div>`;
-      return html(theme.render({ siteTitle: esc(envSiteTitle(env) || 'WorkerCMS'), pageTitle: 'Under Maintenance', content: maintenance }), 503);
+      return html(theme.render({ siteTitle: envSiteTitle(env) || 'WorkerCMS', pageTitle: 'Under Maintenance', content: maintenance }), 503);
     }
   },
 };
@@ -1033,8 +1041,8 @@ async function taptapIsAdmin(request, env) {
   const auth = request.headers.get('authorization') || '';
   const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   const headerToken = request.headers.get('x-admin-token') || '';
-  return (bearer !== '' && bearer === env.ADMIN_TOKEN) ||
-    (headerToken !== '' && headerToken === env.ADMIN_TOKEN);
+  return (bearer !== '' && safeEqualHex(bearer, env.ADMIN_TOKEN)) ||
+    (headerToken !== '' && safeEqualHex(headerToken, env.ADMIN_TOKEN));
 }
 
 // ---- Paket admin Tap Tap Tycoon (admin-batch, 18 Nov 2026) ----
@@ -1347,7 +1355,7 @@ async function tttVerifyPlayIntegrity(env, token) {
 // Halaman /kendali/taptap: ringkasan + live + daftar pantau + redeem +
 // flag + riwayat per pengguna. Aksi lewat fetch ke /api/taptap/admin/*
 // (sesi admin cookie — pola yang sama dengan panel Cerpen API).
-async function renderTttAdminPanel(env, nav, notice, url) {
+async function renderTttAdminPanel(env, nav, notice, url, csrf) {
   const db = env.BACKUP_DB;
   if (!db) {
     return `<h2>Tap Tap Tycoon</h2>${nav}<div class="card"><p>Database (stopwatch-db) tidak tersedia — panel tidak bisa dimuat.</p></div>`;
@@ -1466,6 +1474,7 @@ async function renderTttAdminPanel(env, nav, notice, url) {
   <p style="font-size:13px;opacity:.7">Riwayat lengkap (perangkat, sesi, ban, flag, redeem, pantauan, profil perilaku) juga tersedia lewat API: GET /api/taptap/admin/users/:id — dan kemiripan perilaku lewat GET /api/taptap/admin/behavior/:id.</p></div>
   <script>
   (function(){
+    var TTT_CSRF = "${csrf}";
     function showMsg(text, ok){
       var m = document.getElementById('ttt-msg');
       if (!m) return;
@@ -1499,7 +1508,7 @@ async function renderTttAdminPanel(env, nav, notice, url) {
       }
     }
     async function post(path, body){
-      const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(body) });
+      const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf': TTT_CSRF }, credentials: 'same-origin', body: JSON.stringify(body) });
       const j = await r.json().catch(function(){ return {}; });
       if (!r.ok) { showMsg('Gagal: ' + (j.error || r.status), false); return null; }
       return j;
@@ -1555,7 +1564,7 @@ async function renderTttAdminPanel(env, nav, notice, url) {
       if (maxUses < used) { showMsg('Maks pakai tidak boleh di bawah ' + used + ' (sudah terpakai).', false); return; }
       var body = { code: code, benefit_type: d.benefit_type, benefit_value: Number(d.benefit_value), max_uses: maxUses };
       if (!d.no_expires && d.expires_at) body.expires_at = new Date(d.expires_at).toISOString();
-      var r = await fetch('/api/taptap/admin/redeem/update', { method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(body) });
+      var r = await fetch('/api/taptap/admin/redeem/update', { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf': TTT_CSRF }, credentials: 'same-origin', body: JSON.stringify(body) });
       var j = await r.json().catch(function(){ return {}; });
       if (!r.ok) {
         var msg = 'Gagal menyimpan: ' + (j.error || r.status);
@@ -1644,7 +1653,7 @@ async function renderTttAdminPanel(env, nav, notice, url) {
         hcard.hidden = false;
         hbody.innerHTML = '<p>Memuat…</p>';
         hcard.scrollIntoView({ block: 'nearest' });
-        fetch('/api/taptap/admin/redeem/history?code=' + encodeURIComponent(hcode), { credentials: 'same-origin' })
+        fetch('/api/taptap/admin/redeem/history?code=' + encodeURIComponent(hcode), { credentials: 'same-origin', headers: { 'x-csrf': TTT_CSRF } })
           .then(function(r){ return r.json(); })
           .then(function(j){
             if (!j || !Array.isArray(j.redeems)) { hbody.innerHTML = '<p>Gagal memuat riwayat.</p>'; return; }
@@ -1985,6 +1994,12 @@ async function handleTapTap(request, env, url) {
   // ---- Admin TTT (v1.1.0, butuh ADMIN_TOKEN via sesi CMS / header) ----
   if (seg === 'admin') {
     const sub = parts[3] || '';
+    // CSRF hanya untuk sesi cookie (panel admin di browser): request Bearer
+    // (tes/skrip) tidak memakai cookie sehingga tidak butuh CSRF. GET
+    // read-only tidak dicek (tidak mengubah state).
+    if (request.method !== 'GET' && await isAdmin(request, env)) {
+      if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) return taptapJson({ error: 'csrf tidak valid' }, 403);
+    }
     // POST /api/taptap/admin/ban {account_id, ban_type, reason}
     // ban_until = now+7 hari (temp7) / now+30 hari (temp30) / '' (permanent,
     // warning). Riwayat ditulis ke ttt_bans.
@@ -2815,6 +2830,19 @@ async function handleTapTap(request, env, url) {
     if (already) { await failLog('failed', 'already_redeemed'); return taptapJson({ error: 'already_redeemed' }, 403); }
     const player = await db.prepare('SELECT * FROM ttt_players WHERE account_id = ?').bind(b.account_id).first();
     if (!player) return taptapJson({ error: 'not_found' }, 404);
+    if (row.benefit_type !== 'energy' && row.benefit_type !== 'savings') {
+      return taptapJson({ error: 'bad_benefit' }, 400);
+    }
+    // Klaim kuota kondisional atomik: hanya request yang berhasil menaikkan
+    // used_count (changes==1) yang lanjut — cegah double-spend bila dua
+    // request bersamaan lolos cek di atas.
+    const claimed = await db.prepare(
+      'UPDATE ttt_redeem_codes SET used_count = used_count + 1 WHERE code = ? AND active = 1 AND used_count < max_uses'
+    ).bind(code).run();
+    if (!claimed || !claimed.meta || Number(claimed.meta.changes) !== 1) {
+      await failLog('failed', 'code_used_up');
+      return taptapJson({ error: 'code_used_up' }, 403);
+    }
     // Manfaat diterapkan SERVER (bukan angka kiriman klien).
     const value = Number(row.benefit_value) || 0;
     if (row.benefit_type === 'energy') {
@@ -2825,15 +2853,27 @@ async function handleTapTap(request, env, url) {
       await db.prepare(
         'UPDATE ttt_players SET savings = savings + ?, updated_at = ? WHERE account_id = ?'
       ).bind(value, now, b.account_id).run();
-    } else {
-      return taptapJson({ error: 'bad_benefit' }, 400);
     }
-    await db.prepare(
-      'UPDATE ttt_redeem_codes SET used_count = used_count + 1 WHERE code = ?'
-    ).bind(code).run();
-    await db.prepare(
-      "INSERT INTO ttt_redeem_log (code, account_id, guest_id, benefit_type, benefit_value, status, fail_reason, redeemed_at) VALUES (?, ?, ?, ?, ?, 'ok', '', ?)"
-    ).bind(code, b.account_id, device.guest_id, row.benefit_type, value, now).run();
+    // Catat penukaran kondisional: hanya satu baris 'ok' per kode+akun.
+    // Bila INSERT ini gagal (akun sudah menukar — balapan), kembalikan
+    // kuota + batalkan kredit yang sudah diberikan.
+    const logged = await db.prepare(
+      "INSERT INTO ttt_redeem_log (code, account_id, guest_id, benefit_type, benefit_value, status, fail_reason, redeemed_at) SELECT ?, ?, ?, ?, ?, 'ok', '', ? WHERE NOT EXISTS (SELECT 1 FROM ttt_redeem_log WHERE code = ? AND account_id = ? AND status = 'ok')"
+    ).bind(code, b.account_id, device.guest_id, row.benefit_type, value, now, code, b.account_id).run();
+    if (!logged || !logged.meta || Number(logged.meta.changes) !== 1) {
+      await db.prepare('UPDATE ttt_redeem_codes SET used_count = used_count - 1 WHERE code = ?').bind(code).run();
+      if (row.benefit_type === 'energy') {
+        await db.prepare(
+          'UPDATE ttt_players SET score = score - ?, total_energy_all_time = total_energy_all_time - ?, updated_at = ? WHERE account_id = ?'
+        ).bind(value, value, now, b.account_id).run();
+      } else if (row.benefit_type === 'savings') {
+        await db.prepare(
+          'UPDATE ttt_players SET savings = savings - ?, updated_at = ? WHERE account_id = ?'
+        ).bind(value, now, b.account_id).run();
+      }
+      await failLog('failed', 'already_redeemed');
+      return taptapJson({ error: 'already_redeemed' }, 403);
+    }
     return taptapJson({ ok: true, code, benefit_type: row.benefit_type, benefit_value: value });
   }
 
@@ -2841,6 +2881,7 @@ async function handleTapTap(request, env, url) {
   // Token diverifikasi SISI SERVER (bila secret PLAY_INTEGRITY_SA_JSON
   // ada). Bila belum ada -> status 'not_configured', BUKAN error.
   if (request.method === 'POST' && seg === 'integrity') {
+    if (!(await checkRateLimit(env, 'taptap-integrity:' + clientIp(request), 30, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
     const keyed = await tttRequireKey(request, db);
     if (!keyed.device) return keyed;
     const b = await request.json().catch(() => null);
@@ -2875,8 +2916,11 @@ async function handleTapTap(request, env, url) {
 // GET /api/dompet/version.
 const DOMPET_VERSION = '1.1.0';
 
+// account_id WAJIB UUID v4 (yang dihasilkan aplikasi via UUID.randomUUID()).
+// Tanpa validasi ini, siapa pun bisa menulis/membaca "akun" dengan ID
+// tebak-tebakan pendek — UUID v4 122-bit tidak bisa ditebak.
 function dompetValidAccountId(id) {
-  return typeof id === 'string' && id.length > 0 && id.length <= 200;
+  return typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
 }
 
 async function handleDompet(request, env, url) {
@@ -2894,6 +2938,7 @@ async function handleDompet(request, env, url) {
 
   // GET /api/dompet/backup/:account — dump penuh tanpa baris deleted=1.
   if (request.method === 'GET' && seg === 'backup') {
+    if (!(await checkRateLimit(env, 'dompet-backup:' + clientIp(request), 60, 10 * 60 * 1000))) return taptapJson({ ok: false, error: 'too_many_requests' }, 429);
     let accountId = '';
     try { accountId = parts[3] ? decodeURIComponent(parts[3]) : ''; } catch (e) { accountId = ''; }
     if (!dompetValidAccountId(accountId)) return taptapJson({ ok: false, error: 'invalid_account_id' }, 400);
@@ -2907,6 +2952,7 @@ async function handleDompet(request, env, url) {
   // yang baru di-upsert dari klien — klien juga last-write-wins, jadi
   // echo tidak berbahaya).
   if (request.method === 'POST' && seg === 'sync') {
+    if (!(await checkRateLimit(env, 'dompet-sync:' + clientIp(request), 60, 10 * 60 * 1000))) return taptapJson({ ok: false, error: 'too_many_requests' }, 429);
     let body;
     try { body = await request.json(); } catch (e) { return taptapJson({ ok: false, error: 'invalid_body' }, 400); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return taptapJson({ ok: false, error: 'invalid_body' }, 400);
@@ -2916,12 +2962,16 @@ async function handleDompet(request, env, url) {
     const txIn = Array.isArray(body.transactions) ? body.transactions : [];
     const catIn = Array.isArray(body.categories) ? body.categories : [];
     const now = Date.now();
+    // updated_at masa depan (> now + 5 menit) DITOLAK per baris: tanpa ini,
+    // satu baris beracun bisa membekukan baris itu selamanya (last-write-
+    // wins tidak pernah kalah dari kiriman normal yang lebih lama).
+    const maxUpdatedAt = now + 5 * 60 * 1000;
     await db.prepare('INSERT OR IGNORE INTO dompet_accounts (account_id, created_at) VALUES (?, ?)').bind(accountId, now).run();
     for (const row of txIn) {
       if (!row || typeof row !== 'object') continue;
       const id = Math.floor(+row.id);
       const updatedAt = Math.floor(+row.updated_at);
-      if (!Number.isFinite(id) || !Number.isFinite(updatedAt)) continue;
+      if (!Number.isFinite(id) || !Number.isFinite(updatedAt) || updatedAt > maxUpdatedAt) continue;
       const cur = await db.prepare('SELECT updated_at FROM dompet_transactions WHERE account_id = ? AND id = ?').bind(accountId, id).first();
       if (cur && Number(cur.updated_at) >= updatedAt) continue;
       await db.prepare('INSERT OR REPLACE INTO dompet_transactions (account_id, id, dateMillis, type, category, method, amount, note, updated_at, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(accountId, id, Math.floor(+row.dateMillis) || 0, Math.floor(+row.type) || 0, String(row.category ?? ''), String(row.method ?? ''), Math.floor(+row.amount) || 0, String(row.note ?? ''), updatedAt, row.deleted ? 1 : 0).run();
@@ -2930,7 +2980,7 @@ async function handleDompet(request, env, url) {
       if (!row || typeof row !== 'object') continue;
       const id = Math.floor(+row.id);
       const updatedAt = Math.floor(+row.updated_at);
-      if (!Number.isFinite(id) || !Number.isFinite(updatedAt)) continue;
+      if (!Number.isFinite(id) || !Number.isFinite(updatedAt) || updatedAt > maxUpdatedAt) continue;
       const cur = await db.prepare('SELECT updated_at FROM dompet_categories WHERE account_id = ? AND id = ?').bind(accountId, id).first();
       if (cur && Number(cur.updated_at) >= updatedAt) continue;
       await db.prepare('INSERT OR REPLACE INTO dompet_categories (account_id, id, name, type, color, isDefault, updated_at, deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(accountId, id, String(row.name ?? ''), Math.floor(+row.type) || 0, Math.floor(+row.color) || 0, row.isDefault ? 1 : 0, updatedAt, row.deleted ? 1 : 0).run();
@@ -2972,15 +3022,18 @@ async function handleFetch(request, env, ctx) {
     if (request.method === 'POST') {
       const clRaw = request.headers.get('content-length');
       const cl = clRaw === null ? NaN : Number(clRaw);
-      const upLimit = path === '/kendali/upload-image' ? 6000000 : 200000;
+      // Dompet sync boleh 2 MB (riwayat transaksi); upload gambar 6 MB;
+      // sisanya 200 KB.
+      const upLimit = path === '/kendali/upload-image' ? 6000000 : path === '/api/dompet/sync' ? 2000000 : 200000;
+      const upLabel = upLimit >= 1000000 ? (upLimit / 1000000) + ' MB' : Math.round(upLimit / 1000) + ' KB';
       if (!Number.isNaN(cl) && cl >= 0) {
         if (cl > upLimit) {
-          return html(themes.terang.render({ siteTitle: esc(envSiteTitle(env) || 'WorkerCMS'), pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
+          return html(themes.terang.render({ siteTitle: envSiteTitle(env) || 'WorkerCMS', pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks ' + upLabel + ').</p></div>' }), 413);
         }
       } else {
         const capped = await readCappedBody(request, upLimit);
         if (capped === null) {
-          return html(themes.terang.render({ siteTitle: esc(envSiteTitle(env) || 'WorkerCMS'), pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks 200 KB).</p></div>' }), 413);
+          return html(themes.terang.render({ siteTitle: envSiteTitle(env) || 'WorkerCMS', pageTitle: 'Terlalu besar', content: '<div class="card"><p>Data yang dikirim terlalu besar (maks ' + upLabel + ').</p></div>' }), 413);
         }
         request = new Request(request, { body: capped });
       }
@@ -3104,6 +3157,15 @@ async function handleFetch(request, env, ctx) {
       const r = await fetchFbmLatestRelease(env);
       if (r.error === 'no-token') return fbmJson({ ok: false, error: 'unduhan belum tersedia' }, 502);
       if (r.error || !r.data || !r.data.apkDownloadUrl) return fbmJson({ ok: false, error: 'gagal mengambil APK' }, 502);
+      // Host tujuan HANYA dari daftar ini (URL datang dari respons API
+      // GitHub untuk repo sendiri — tetap divalidasi supaya tidak bisa
+      // dibelokkan ke host lain bila respons API berubah).
+      let dlHost = '';
+      try { dlHost = new URL(r.data.apkDownloadUrl).hostname.toLowerCase(); } catch (e) { dlHost = ''; }
+      if (!['github.com', 'api.github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'].includes(dlHost)) return fbmJson({ ok: false, error: 'gagal mengambil APK' }, 502);
+      // Batas ukuran 100 MB (APK ~6 MB): tolak bila metadata / respons
+      // menyatakan lebih besar — jangan stream tanpa batas.
+      if (r.data.apkSize && Number(r.data.apkSize) > 100 * 1024 * 1024) return fbmJson({ ok: false, error: 'gagal mengambil APK' }, 502);
       let up;
       try {
         up = await fetch(r.data.apkDownloadUrl, { headers: { 'authorization': 'Bearer ' + env.GITHUB_PAT_READ, 'accept': 'application/octet-stream', 'user-agent': 'hozin-cms-fbm-apk/1.0' } });
@@ -3111,9 +3173,16 @@ async function handleFetch(request, env, ctx) {
         return fbmJson({ ok: false, error: 'gagal mengambil APK' }, 502);
       }
       if (!up.ok || !up.body) return fbmJson({ ok: false, error: 'gagal mengambil APK' }, 502);
+      // content-length boleh tidak ada (chunked / mock) — hanya tolak bila
+      // header menyatakan lebih dari 100 MB.
+      const upLen = Number((up.headers && typeof up.headers.get === 'function' && up.headers.get('content-length')) || 0);
+      if (upLen > 100 * 1024 * 1024) return fbmJson({ ok: false, error: 'gagal mengambil APK' }, 502);
       const h = new Headers();
       h.set('content-type', 'application/vnd.android.package-archive');
-      h.set('content-disposition', 'attachment; filename="' + (r.data.apkName || 'HozinFBManager.apk') + '"');
+      // Nama file dibersihkan (tanpa kutip / CR-LF / pemisah path) supaya
+      // tidak bisa membobol header Content-Disposition.
+      const apkName = String(r.data.apkName || 'HozinFBManager.apk').replace(/["\r\n\/\\]/g, '').slice(0, 100) || 'HozinFBManager.apk';
+      h.set('content-disposition', 'attachment; filename="' + apkName + '"');
       if (r.data.apkSize) h.set('content-length', String(r.data.apkSize));
       h.set('cache-control', 'no-store');
       return new Response(up.body, { status: 200, headers: h });
@@ -3631,7 +3700,7 @@ async function handleFetch(request, env, ctx) {
     if (path.startsWith('/api/admin/cerpen-')) {
       const aj = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
       if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
-      if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) { await logSecurityEvent(env, 'csrf_gagal', request); return aj({ ok: false, error: 'csrf tidak valid' }, 403); }
+      if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) { await logSecurityEvent(env, 'csrf_gagal', request); return aj({ ok: false, error: 'csrf tidak valid' }, 403); }
       if (!env.BACKUP_DB) return aj({ ok: false, error: 'database tidak tersedia' }, 503);
       if (!(await checkRateLimit(env, 'cerpen-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
       const B = env.BACKUP_DB;
@@ -3872,7 +3941,7 @@ async function handleFetch(request, env, ctx) {
     if (path.startsWith('/api/admin/md-backup')) {
       const aj = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
       if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
-      if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) { await logSecurityEvent(env, 'csrf_gagal', request); return aj({ ok: false, error: 'csrf tidak valid' }, 403); }
+      if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) { await logSecurityEvent(env, 'csrf_gagal', request); return aj({ ok: false, error: 'csrf tidak valid' }, 403); }
       if (!env.BACKUP_DB) return aj({ ok: false, error: 'database tidak tersedia' }, 503);
       if (!(await checkRateLimit(env, 'md-backup-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
       const B = env.BACKUP_DB;
@@ -4272,7 +4341,7 @@ async function handleFetch(request, env, ctx) {
       const res = html(await renderPage(env, 'Beranda', content, { ...pageOpts(settingsMap, env), pageUrl: url.origin + '/' }), 200, /^ca-pub-\d+$/.test(String(adsenseClient || '').trim()) ? { 'content-security-policy': ADSENSE_CSP } : {});
       if (isFirstVisit && welcome) {
         const h = new Headers(res.headers);
-        h.append('set-cookie', 'cms_fv=1; Path=/; Max-Age=2592000; SameSite=Lax; Secure');
+        h.append('set-cookie', 'cms_fv=1; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax; Secure');
         return new Response(res.body, { status: res.status, headers: h });
       }
       return res;
@@ -4740,7 +4809,7 @@ requestAnimationFrame(draw);
               await env.DB.prepare(`UPDATE cms_posts SET views = views + 1 WHERE id = ?`).bind(post.id).run();
             }
             post.views = (Number(post.views) || 0) + 1;
-            viewCookie = viewName + '=1; Path=/; Max-Age=86400';
+            viewCookie = viewName + '=1; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax';
             // Riwayat views harian untuk dashboard (mulai rilis ini; data lama
             // tidak direkonstruksi — total lama tetap dari counter cms_posts).
           }
@@ -5102,7 +5171,7 @@ requestAnimationFrame(draw);
         if (fails && Number(fails.n) >= 5) {
           return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
         }
-        if (env.ADMIN_TOKEN && password === env.ADMIN_TOKEN) {
+        if (env.ADMIN_TOKEN && safeEqualHex(password, env.ADMIN_TOKEN)) {
           await env.DB.prepare(`DELETE FROM cms_login_attempts WHERE ip = ?`).bind(ip).run();
           const remember = form.get('remember') === '1';
           const cookies = await issueTokens(env, request, remember);
@@ -5147,7 +5216,7 @@ requestAnimationFrame(draw);
     // jadi tidak ada lagi form login admin terpisah di /kendali/login) ----
     if (path === '/kendali/logout' && request.method === 'POST') {
       const form = await request.formData();
-      if (String(form.get('csrf') || '') !== await csrfToken(env)) {
+      if (!safeEqualHex(String(form.get('csrf') || ''), await csrfToken(env))) {
         return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid.</p></div>'), 403);
       }
       // Logout tidak digate admin: token akses bisa saja sudah kedaluwarsa
@@ -5187,7 +5256,7 @@ requestAnimationFrame(draw);
       }
       // ---- Admin: panel Tap Tap Tycoon (admin-batch) ----
       if (path === '/kendali/taptap') {
-        const content = await renderTttAdminPanel(env, nav, noticeHtml(url), url);
+        const content = await renderTttAdminPanel(env, nav, noticeHtml(url), url, csrf);
         return html(await renderPage(env, 'Tap Tap Tycoon', content));
       }
       // ---- Admin: Link Download + analitik (modul dl.js) ----
@@ -5879,7 +5948,7 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
     // ---- Admin: aksi (butuh login + CSRF) ----
     if (admin && request.method === 'POST') {
       const form = await request.formData();
-      if (String(form.get('csrf') || '') !== await csrfToken(env)) {
+      if (!safeEqualHex(String(form.get('csrf') || ''), await csrfToken(env))) {
         return html(await renderPage(env, 'Admin', '<div class="card"><p>Token CSRF tidak valid. Muat ulang dashboard lalu coba lagi.</p></div>'), 403);
       }
       if (path === '/kendali/upload-image') {
@@ -5899,6 +5968,13 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
         const ftype = String(file.type || '').toLowerCase();
         const fname = String(file.name || '').toLowerCase();
         if (!(ftype.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp|bmp)$/.test(fname))) return json({ ok: false, error: 'File harus gambar (JPG/PNG/GIF/WebP).' }, 400);
+        // Magic bytes: MIME + ekstensi bisa dipalsukan (SVG lolos sebagai
+        // image/svg+xml) — baca 12 byte pertama dan cocokkan format gambar.
+        let magicOk = false;
+        try {
+          if (typeof file.slice === 'function') magicOk = isImageMagic(new Uint8Array(await file.slice(0, 12).arrayBuffer()));
+        } catch (e) { magicOk = false; }
+        if (!magicOk) return json({ ok: false, error: 'File bukan gambar yang valid (JPG/PNG/GIF/WebP).' }, 400);
         // Pilih acak, coba satu per satu sampai ada yang berhasil.
         const order = keys.map((_, i) => i);
         for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }

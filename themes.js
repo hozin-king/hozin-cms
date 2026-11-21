@@ -1,5 +1,6 @@
 // Tema WorkerCMS — sistem tema data-driven.
 // Responsif mobile / tablet / desktop. Aksen solid, tipografi nyaman, tidak gradient berat.
+import { esc } from './util.js';
 function baseCss(def) {
   const { bg, fg, card, muted, accent, border, font, radius, maxWidth } = def;
   return `body{margin:0;font-family:${font};background:${bg};color:${fg};line-height:1.65;display:flex;flex-direction:column;min-height:100vh;font-size:16px;-webkit-font-smoothing:antialiased}` +
@@ -113,11 +114,16 @@ const SITE_FAVICON_192 = 'https://raw.githubusercontent.com/hozin-king/hozin-cms
 // varian terpilih (satu baris). Kosong = kembali ke huruf pertama judul.
 const SITE_LOGO_MARK_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240"><defs><linearGradient id="aGreen" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="208"><stop offset="0" stop-color="#2BFF8F"/><stop offset="1" stop-color="#00A651"/></linearGradient><linearGradient id="aGold" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="208"><stop offset="0" stop-color="#FFD34D"/><stop offset="1" stop-color="#F59E0B"/></linearGradient><radialGradient id="aGlow"><stop offset="0" stop-color="#00E676" stop-opacity="0.55"/><stop offset="1" stop-color="#00E676" stop-opacity="0"/></radialGradient><linearGradient id="aShine" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset="0.5" stop-color="#fff" stop-opacity="0.55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs><defs><linearGradient id="bGreen" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="208"><stop offset="0" stop-color="#2BFF8F"/><stop offset="1" stop-color="#00A651"/></linearGradient><linearGradient id="bGold" gradientUnits="userSpaceOnUse" x1="0" y1="24" x2="0" y2="208"><stop offset="0" stop-color="#FFD34D"/><stop offset="1" stop-color="#F59E0B"/></linearGradient><radialGradient id="bGlow"><stop offset="0" stop-color="#F5B301" stop-opacity="0.55"/><stop offset="1" stop-color="#F5B301" stop-opacity="0"/></radialGradient><linearGradient id="bShine" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset="0.5" stop-color="#fff" stop-opacity="0.55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs><clipPath id="abClip"><path d="M120,16 L198,44 L198,126 C198,176 164,210 120,228 C76,210 44,176 44,126 L44,44 Z"/></clipPath><path d="M120,16 L198,44 L198,126 C198,176 164,210 120,228 C76,210 44,176 44,126 L44,44 Z" fill="#141a22" stroke="url(#bGold)" stroke-width="7"  stroke-linejoin="round"/><path d="M120,30 L186,54 L186,126 C186,168 158,196 120,212 C82,196 56,168 56,126 L56,54 Z" fill="none" stroke="#2A3442" stroke-width="2"/><g transform="translate(33.6 38.9) scale(0.72)"><g transform="translate(0 0)"><polygon points="80,58 90,30 103,55" fill="url(#aGold)"/><polygon points="106,58 120,24 134,58" fill="url(#aGold)"/><polygon points="137,55 150,30 160,58" fill="url(#aGold)"/><polygon points="80,58 160,58 156,72 84,72" fill="url(#aGold)"/><polygon points="96,61 100,65 96,69 92,65" fill="#B45309"/><polygon points="120,61 124,65 120,69 116,65" fill="#B45309"/><polygon points="144,61 148,65 144,69 140,65" fill="#B45309"/></g><polygon points="52,76 94,76 86,88 86,192 94,204 52,204 60,192 60,88" fill="url(#aGreen)"/><polygon points="146,76 188,76 180,88 180,192 188,204 146,204 154,192 154,88" fill="url(#aGreen)"/><rect x="86" y="128" width="68" height="22" fill="url(#aGreen)"/></g><g clip-path="url(#abClip)"><rect x="-140" y="10" width="70" height="220" fill="url(#aShine)"></rect></g></svg>';
 function shell(css, def, siteTitle, pageTitle, content, siteAvatar, metaDesc = '', navbar = 'klasik', adsenseClient = '', metaImage = '', pageUrl = '', ogType = 'website') {
-  const mark = String(siteTitle || 'W').trim().charAt(0).toUpperCase() || 'W';
+  // Escape di RENDER (bukan di caller): judul situs + judul halaman +
+  // deskripsi di-escape di sini supaya caller yang lupa tidak membobol
+  // <title>/meta/atribut. content tetap HTML (sudah disanitasi caller).
+  const mark = esc(String(siteTitle || 'W').trim().charAt(0).toUpperCase() || 'W');
+  siteTitle = esc(String(siteTitle ?? ''));
+  pageTitle = esc(String(pageTitle ?? ''));
+  const desc = metaDesc ? esc(String(metaDesc).slice(0, 155)) : '';
   const avatarHtml = siteAvatar ? `<img src="${siteAvatar}" alt="" style="width:26px;height:26px;flex:0 0 26px;margin-right:9px;border-radius:50%;object-fit:cover">` : '';
   const accent = def.accent;
   const markSvg = SITE_LOGO_MARK_SVG || `<svg viewBox="0 0 48 48" aria-hidden="true"><rect width="48" height="48" rx="11" fill="${accent}"/><text x="24" y="33" text-anchor="middle" font-size="26" font-weight="700" fill="#fff" font-family="Inter,system-ui,sans-serif">${mark}</text></svg>`;
-  const desc = metaDesc ? String(metaDesc).slice(0, 155) : '';
   // og:image: gambar yang diteruskan caller, kalau tidak ada -> logo situs.
   // URL sudah divalidasi di renderPage (store.js); di sini dicek sekali lagi
   // supaya nilai yang lolos hanya https tanpa kutip/spasi.

@@ -4,6 +4,20 @@
 export function esc(s) {
   return String(s ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 }
+// Bandingkan string tanpa early-exit (tahan orakel timing), untuk HMAC /
+// token / CSRF. Panjang berbeda -> false (bukan kebocoran panjang, karena
+// panjang HMAC hex selalu tetap 64).
+export function safeEqualHex(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+// Escape wildcard LIKE (dipakai dengan ESCAPE '!'): '%'/'_' di input
+// pencarian admin tidak boleh berfungsi sebagai wildcard.
+export function escapeLikeTerm(t) {
+  return String(t ?? '').replaceAll('!', '!!').replaceAll('%', '!%').replaceAll('_', '!_');
+}
 export function para(text) {
   return esc(text).split(/\n\s*\n/).map(p => `<p>${p.replaceAll('\n', '<br>')}</p>`).join('');
 }
@@ -143,7 +157,8 @@ export function videoEmbedUrl(u) {
     if (m) return { kind: 'vimeo', embed: 'https://player.vimeo.com/video/' + m[1], id: m[1] };
   }
   const path = url.pathname.toLowerCase();
-  if (/\.(mp4|webm|mov)$/.test(path)) return { kind: 'file', embed: raw, id: '' };
+  // File video langsung: HANYA https (http = mixed content di halaman HTTPS).
+  if (/\.(mp4|webm|mov)$/.test(path)) return url.protocol === 'https:' ? { kind: 'file', embed: raw, id: '' } : null;
   return null;
 }
 export function stripTags(s) {
@@ -170,6 +185,24 @@ export function safeUrl(u) {
   const v = String(u || '').trim();
   if (/^(https?:\/\/|\/|#|mailto:)/i.test(v)) return v;
   return '';
+}
+// URL media (img src / video poster): HANYA https atau path relatif.
+// http ditolak supaya halaman HTTPS tidak dicampuri mixed content.
+export function safeMediaUrl(u) {
+  const v = String(u || '').trim();
+  if (/^(https:\/\/|\/)/i.test(v)) return v;
+  return '';
+}
+// Cek magic bytes gambar (PNG/JPEG/GIF/WebP/BMP). MIME + ekstensi bisa
+// dipalsukan; SVG (teks '<') selalu ditolak karena tidak punya magic bytes.
+export function isImageMagic(head) {
+  const b = head instanceof Uint8Array ? head : new Uint8Array(head || []);
+  if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return true; // PNG
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return true; // JPEG
+  if (b.length >= 6 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return true; // GIF
+  if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return true; // WebP (RIFF....WEBP)
+  if (b.length >= 2 && b[0] === 0x42 && b[1] === 0x4d) return true; // BMP
+  return false;
 }
 export function sanitizeHtml(input) {
   let s = String(input || '');
@@ -211,7 +244,9 @@ export function sanitizeHtml(input) {
       if (name === 'controls') { out += ' controls'; continue; }
       const val = m[2] ?? m[3] ?? m[4] ?? '';
       if (name === 'href' || name === 'src' || name === 'poster') {
-        const safe = safeUrl(val);
+        // href boleh http/mailto; src/poster media HANYA https (anti mixed
+        // content — halaman HTTPS tidak boleh memuat media http).
+        const safe = name === 'href' ? safeUrl(val) : safeMediaUrl(val);
         if (!safe) continue;
         out += ' ' + name + '="' + esc(safe) + '"';
       } else {

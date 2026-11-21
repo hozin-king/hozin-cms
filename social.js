@@ -22,8 +22,8 @@
 // Bearer <nilai sesi yang sama dengan yang dikembalikan login aplikasi>
 // (format userId.exp.sig, HMAC seperti cookie). Statistik admin hanya
 // dari data yang ada — tanpa demografi / traffic source / perangkat.
-import { esc, clientIp, randomHex, hmacHex } from './util.js';
-import { getCommenter, csrfToken } from './auth.js';
+import { esc, clientIp, randomHex, hmacHex, safeEqualHex } from './util.js';
+import { getCommenter, csrfToken, sessionSecret } from './auth.js';
 import { checkRateLimit } from './security.js';
 
 const aj = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
@@ -83,7 +83,7 @@ async function resolveSocialUser(request, env) {
   if (parts.length !== 3) return null;
   const [userId, exp, sig] = parts;
   if (!userId || !exp || !sig || Number(exp) < Date.now()) return null;
-  if (sig !== await hmacHex(env.ADMIN_TOKEN, 'user:' + userId + ':' + exp)) return null;
+  if (!safeEqualHex(sig, await hmacHex(sessionSecret(env), 'user:' + userId + ':' + exp))) return null;
   return await env.DB.prepare(`SELECT * FROM cms_users WHERE id = ?`).bind(userId).first();
 }
 
@@ -98,7 +98,9 @@ function deviceFrom(request, body) {
 async function socialBanCheck(env, userId) {
   if (!userId) return null;
   const now = Date.now();
-  await env.DB.prepare(`UPDATE cerpen_bans SET active = 0 WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?`).bind(now).run();
+  // D4: expires_at disimpan dalam DETIK — bandingkan dengan detik, bukan ms
+  // (pakai ms, ban berwaktu langsung tersapu di sini).
+  await env.DB.prepare(`UPDATE cerpen_bans SET active = 0 WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?`).bind(Math.floor(now / 1000)).run();
   const row = await env.DB.prepare(`SELECT id, reason, expires_at FROM cerpen_bans WHERE target_type = 'user' AND target_id = ? AND active = 1`).bind(userId).first();
   if (!row) return null;
   return { ok: false, error: 'banned', reason: String(row.reason || ''), expires_at: row.expires_at ? Number(row.expires_at) : null };
@@ -494,7 +496,8 @@ export async function handleSocialAdminApi(request, env, url, admin) {
   const path = url.pathname;
   const method = request.method;
   if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
-  if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
+  if (!(await checkRateLimit(env, 'social-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'too_many_requests' }, 429);
+  if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
   if (method === 'GET' && path === '/api/admin/cerpen-social/stats-overview') {
     const range = Number(url.searchParams.get('range') || '7') === 28 ? 28 : 7;
     return aj({ ok: true, ...(await getSocialStatsOverview(env, range)) });

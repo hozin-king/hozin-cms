@@ -20,8 +20,10 @@ export function randomOtpCode() {
 }
 
 export function validEmail(email) {
+  // Tolak karakter markup/kontrol: email dipakai sebagai identitas + tampil
+  // di panel koin — '<' '>' '"' "'" '(' ')' '/' '\' tidak boleh lolos.
   return typeof email === 'string' && email.length > 0 && email.length <= 128
-    && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email);
+    && /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(email);
 }
 
 // Bandingkan hash best-effort constant-time (tanpa early-exit), pola yang
@@ -66,13 +68,20 @@ export function otpEmailHtml(code) {
 
 // Buat (atau ganti) kode untuk email lalu kirim. Satu kode aktif per email.
 // Bila pengiriman gagal, baris kode dihapus supaya kirim ulang bisa bersih.
+// Kirim ulang kode JANGAN reset hitungan percobaan selama kode lama masih
+// berlaku — kalau tidak, penyerang bisa reset batas 5x dengan minta kode baru.
 export async function issueOtp(env, email) {
   const code = randomOtpCode();
   const codeHash = await sha256Hex(code);
   const now = Date.now();
+  let attempts = 0;
+  try {
+    const prev = await env.DB.prepare(`SELECT attempts, expires_at FROM cms_otp_codes WHERE email = ?`).bind(email).first();
+    if (prev && Number(prev.expires_at) > now) attempts = Number(prev.attempts) || 0;
+  } catch (e) { /* baca gagal -> mulai dari 0 */ }
   await env.DB.prepare(
-    `INSERT OR REPLACE INTO cms_otp_codes (email, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, 0, ?)`
-  ).bind(email, codeHash, now + OTP_TTL_MS, now).run();
+    `INSERT OR REPLACE INTO cms_otp_codes (email, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, ?)`
+  ).bind(email, codeHash, now + OTP_TTL_MS, attempts, now).run();
   const sent = await sendOtpEmail(env, email, code);
   if (!sent.ok) {
     await env.DB.prepare(`DELETE FROM cms_otp_codes WHERE email = ?`).bind(email).run();

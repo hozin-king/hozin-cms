@@ -4,7 +4,9 @@ import worker, { resetCerpenReleaseCacheForTest } from './worker.js';
 import vm from 'node:vm';
 import { themes } from './themes.js';
 import { renderPage, envSiteTitle, pruneAnalytics, pruneRateTables, VIEW_EVENTS_RETENTION_DAYS } from './store.js';
-import { parseTags, tagSlug, sanitizeHtml, sha256Hex, hmacHex, videoEmbedUrl } from './util.js';
+import { parseTags, tagSlug, sanitizeHtml, sha256Hex, hmacHex, videoEmbedUrl, isImageMagic, escapeLikeTerm, safeEqualHex } from './util.js';
+import { validEmail } from './otp.js';
+import { isCerpenAdmin } from './cerpen-admin.js';
 import { renderMarkdown } from './markdown.js';
 import { checkRateLimit } from './security.js';
 import { tagLinks } from './content.js';
@@ -35,11 +37,15 @@ class MockDB {
     this.dracinKeys = []; this.dracinCatalog = []; this.dracinEpisodes = []; this.dracinSeeds = []; this.dracinUsage = [];
     this.viewEventSeq = 0; this.attemptSeq = 0;
     // v62: fixture konten Cerpen (D1 stopwatch-db) untuk tes API /api/c/*/cerpen/*
-    this.cerpenManifest = [{ key: 'version', value: '1' }, { key: 'updated_at', value: '2026-11-12T00:00:00+07:00' }, { key: 'counts', value: '{"cerpen_series":1,"cerpen_episodes":2}' }];
+    this.cerpenManifest = [{ key: 'version', value: '1' }, { key: 'updated_at', value: '2026-11-12T00:00:00+07:00' }, { key: 'counts', value: '{"cerpen_series":1,"cerpen_episodes":6}' }];
     this.cerpenSeries = [{ id: 'cerpen-01', judul: 'Surat Tanpa Nama', genre: 'Misteri', deskripsi: '', cover_url: 'https://example.com/c1.jpg', status: 'aktif' }];
     this.cerpenEpisodes = [
       { series_id: 'cerpen-01', season: 1, no: 1, judul: 'Lestari Tiba', isi_cipher: 'QUJD', word_count: 100 },
       { series_id: 'cerpen-01', season: 1, no: 2, judul: 'Yang Tidak Beres', isi_cipher: 'REVG', word_count: 120 },
+      { series_id: 'cerpen-01', season: 1, no: 3, judul: 'Pesan Ketiga', isi_cipher: 'U0VM', word_count: 90 },
+      { series_id: 'cerpen-01', season: 1, no: 4, judul: 'Pesan Keempat', isi_cipher: 'RU1Q', word_count: 95 },
+      { series_id: 'cerpen-01', season: 2, no: 1, judul: 'Musim Dua Dimulai', isi_cipher: 'TVVE', word_count: 110 },
+      { series_id: 'cerpen-01', season: 3, no: 1, judul: 'Musim Tiga Dimulai', isi_cipher: 'VElH', word_count: 130 },
     ];
     this.cerpenKomik = [{ id: 'komik-01', judul: 'Komik Tes', genre: '', deskripsi: '', cover_url: '' }];
     this.cerpenKomikEpisodes = [{ komik_id: 'komik-01', no: 1, judul: 'Episode 1', panels_cipher: 'UEFORQ==', panels_count: 2 }];
@@ -181,8 +187,9 @@ class MockDB {
     if (s === 'UPDATE cms_users SET email_verified = 1 WHERE email IS NULL') { for (const u of this.users.values()) if (!u.email) u.email_verified = 1; return []; }
     if (s.startsWith('UPDATE cms_users SET email_verified = 1 WHERE email = ?')) { for (const u of this.users.values()) if (u.email === a[0]) u.email_verified = 1; return []; }
     // v83: tabel kode OTP (satu kode aktif per email).
-    if (s.startsWith('INSERT OR REPLACE INTO cms_otp_codes')) { this.otpCodes.set(a[0], { email: a[0], code_hash: a[1], expires_at: a[2], attempts: 0, created_at: a[3] }); return []; }
+    if (s.startsWith('INSERT OR REPLACE INTO cms_otp_codes')) { this.otpCodes.set(a[0], { email: a[0], code_hash: a[1], expires_at: a[2], attempts: a[3], created_at: a[4] }); return []; }
     if (s.startsWith('SELECT * FROM cms_otp_codes WHERE email')) return this.otpCodes.has(a[0]) ? [this.otpCodes.get(a[0])] : [];
+    if (s.startsWith('SELECT attempts, expires_at FROM cms_otp_codes WHERE email = ?')) { const r = this.otpCodes.get(a[0]); return r ? [{ attempts: r.attempts, expires_at: r.expires_at }] : []; }
     if (s.startsWith('UPDATE cms_otp_codes SET attempts = attempts + 1 WHERE email')) { const row = this.otpCodes.get(a[0]); if (row) row.attempts = Number(row.attempts) + 1; return []; }
     if (s.startsWith('DELETE FROM cms_otp_codes WHERE email')) { this.otpCodes.delete(a[0]); return []; }
     if (s.startsWith('SELECT * FROM cms_users WHERE username')) return [...this.users.values()].filter(u => u.username === a[0]);
@@ -661,6 +668,11 @@ class MockDB {
       if (w) w.balance = a[0];
       return [];
     }
+    if (s.startsWith('UPDATE cerpen_wallets SET balance = 0, updated_at = ? WHERE owner_key = ? AND balance = ?')) {
+      const w = this.coinWallets.get(a[1]);
+      if (w && (Number(w.balance) || 0) === a[2]) { w.balance = 0; return { changes: 1 }; }
+      return { changes: 0 };
+    }
     if (s.startsWith('UPDATE cerpen_wallets SET balance = 0, updated_at = ? WHERE owner_key = ?')) {
       const w = this.coinWallets.get(a[1]);
       if (w) w.balance = 0;
@@ -730,8 +742,8 @@ class MockDB {
       return [];
     }
     if (s.startsWith('SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch WHERE device_id = ?')) return this.coinWatch.has(a[0]) ? [{ ...this.coinWatch.get(a[0]) }] : [];
-    if (s.startsWith('SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch WHERE device_id LIKE ? OR android_id LIKE ?')) {
-      const t = String(a[0]).replace(/%/g, '');
+    if (s.startsWith("SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch WHERE device_id LIKE ? ESCAPE '!' OR android_id LIKE ? ESCAPE '!'")) {
+      const t = String(a[0]).replace(/^%|%$/g, '').replace(/!([%_!])/g, '$1');
       return [...this.coinWatch.values()].filter(w => w.device_id.includes(t) || (w.android_id || '').includes(t)).sort((x, y) => y.updated_at - x.updated_at).slice(0, a[2]);
     }
     if (s.startsWith('SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch ORDER BY updated_at DESC LIMIT ?')) return [...this.coinWatch.values()].sort((x, y) => y.updated_at - x.updated_at).slice(0, a[0]);
@@ -864,10 +876,17 @@ class MockDB {
       if (b && b.active === 1 && (Number(b.redeemed_count) || 0) < a[1]) { b.redeemed_count = (Number(b.redeemed_count) || 0) + 1; return { changes: 1 }; }
       return { changes: 0 };
     }
+    if (s.startsWith('UPDATE cerpen_voucher_batches SET redeemed_count = redeemed_count - 1 WHERE batch_id = ?')) { const b = this.coinBatches.get(a[0]); if (b) b.redeemed_count = Math.max(0, (Number(b.redeemed_count) || 0) - 1); return []; }
     if (s.startsWith('UPDATE cerpen_vouchers SET redeemed_count = redeemed_count + 1 WHERE code_hash = ? AND active = 1')) { const v = this.coinVouchers.get(a[0]); if (v && v.active === 1) v.redeemed_count = (Number(v.redeemed_count) || 0) + 1; return []; }
     if (s.startsWith('UPDATE cerpen_vouchers SET active = 0 WHERE code_hash = ?')) { const v = this.coinVouchers.get(a[0]); if (v) v.active = 0; return []; }
     if (s.startsWith('SELECT code_hash FROM cerpen_vouchers WHERE code_hash = ?')) return this.coinVouchers.has(a[0]) ? [{ code_hash: a[0] }] : [];
     if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_vouchers WHERE active = 1')) return [{ c: [...this.coinVouchers.values()].filter(v => v.active === 1).length }];
+    if (s.startsWith('INSERT INTO cerpen_voucher_redemptions (id, code_hash, owner_key, device_id, user_id, created_at) SELECT')) {
+      const dup = this.coinRedemptions.some(r => { const v = this.coinVouchers.get(r.code_hash); return v && v.batch_id === a[6] && (r.device_id === a[7] || (a[8] != null && r.user_id === a[8])); });
+      if (dup) return { changes: 0 };
+      this.coinRedemptions.push({ id: a[0], code_hash: a[1], owner_key: a[2], device_id: a[3], user_id: a[4], created_at: a[5] });
+      return { changes: 1 };
+    }
     if (s.startsWith('INSERT INTO cerpen_voucher_redemptions')) { this.coinRedemptions.push({ id: a[0], code_hash: a[1], owner_key: a[2], device_id: a[3], user_id: a[4], created_at: a[5] }); return []; }
     if (s.startsWith('SELECT COUNT(*) AS c FROM cerpen_voucher_redemptions r JOIN cerpen_vouchers v ON v.code_hash = r.code_hash WHERE v.batch_id = ? AND r.device_id = ?')) {
       const n = this.coinRedemptions.filter(r => { const v = this.coinVouchers.get(r.code_hash); return v && v.batch_id === a[0] && r.device_id === a[1]; }).length;
@@ -926,7 +945,7 @@ class MockDB {
     if (s.startsWith('SELECT id, username, reading_private')) return [...this.users.values()].map(u => ({ id: u.id, username: u.username, reading_private: Number(u.reading_private) || 0, verified: Number(u.verified) || 0 }));
     if (s.startsWith('SELECT id FROM cms_users WHERE id')) return [...this.users.values()].filter(u => u.id === a[0]).map(u => ({ id: u.id }));
     if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked') && s.includes('WHERE username LIKE ?')) {
-      const t = String(a[0]).replace(/%/g, '');
+      const t = String(a[0]).replace(/^%|%$/g, '').replace(/!([%_!])/g, '$1');
       return [...this.users.values()].filter(u => u.username.includes(t) || (u.email || '').includes(t)).sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, a[2]).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0, verified: Number(u.verified) || 0 }));
     }
     if (s.startsWith('SELECT id, username, email, created_at, email_verified, locked') && s.includes('ORDER BY created_at DESC LIMIT') && !s.includes('WHERE')) return [...this.users.values()].sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, a[0] || 20).map(u => ({ id: u.id, username: u.username, email: u.email || '', created_at: u.created_at, email_verified: Number(u.email_verified) || 0, locked: Number(u.locked) || 0, verified: Number(u.verified) || 0 }));
@@ -1071,6 +1090,12 @@ class MockDB {
     if (s.startsWith('SELECT * FROM ttt_redeem_codes WHERE code = ?')) return this.tttRedeemCodes.has(a[0]) ? [this.tttRedeemCodes.get(a[0])] : [];
     if (s.startsWith('SELECT code FROM ttt_redeem_codes WHERE code = ?')) return this.tttRedeemCodes.has(a[0]) ? [{ code: a[0] }] : [];
     if (s.startsWith('INSERT INTO ttt_redeem_codes')) { this.tttRedeemCodes.set(a[0], { code: a[0], benefit_type: a[1], benefit_value: a[2], max_uses: a[3], used_count: 0, expires_at: a[4] || '', active: 1, created_by: a[5], created_at: a[6] }); return []; }
+    if (s.startsWith('UPDATE ttt_redeem_codes SET used_count = used_count + 1 WHERE code = ? AND active = 1 AND used_count < max_uses')) {
+      const r = this.tttRedeemCodes.get(a[0]);
+      if (r && Number(r.active) === 1 && (Number(r.used_count) || 0) < Number(r.max_uses)) { r.used_count = (Number(r.used_count) || 0) + 1; return { changes: 1 }; }
+      return { changes: 0 };
+    }
+    if (s.startsWith('UPDATE ttt_redeem_codes SET used_count = used_count - 1 WHERE code = ?')) { const r = this.tttRedeemCodes.get(a[0]); if (r) r.used_count = Math.max(0, (Number(r.used_count) || 0) - 1); return []; }
     if (s.startsWith('UPDATE ttt_redeem_codes SET used_count = used_count + 1 WHERE code = ?')) { const r = this.tttRedeemCodes.get(a[0]); if (r) r.used_count = (Number(r.used_count) || 0) + 1; return []; }
     if (s.startsWith('UPDATE ttt_redeem_codes SET active = 0 WHERE code = ?')) { const r = this.tttRedeemCodes.get(a[0]); if (r) r.active = 0; return []; }
     if (s.startsWith('UPDATE ttt_redeem_codes SET benefit_type = ?, benefit_value = ?, max_uses = ?, expires_at = ? WHERE code = ?')) { const r = this.tttRedeemCodes.get(a[4]); if (r) { r.benefit_type = a[0]; r.benefit_value = a[1]; r.max_uses = a[2]; r.expires_at = a[3] || ''; } return []; }
@@ -1078,6 +1103,12 @@ class MockDB {
     if (s.startsWith("SELECT COUNT(*) AS c FROM ttt_redeem_log WHERE code = ? AND status = 'ok'")) return [{ c: this.tttRedeemLog.filter(x => x.code === a[0] && x.status === 'ok').length }];
     if (s.startsWith('SELECT code, benefit_type, benefit_value, max_uses, used_count, expires_at, active, created_by, created_at FROM ttt_redeem_codes ORDER BY created_at DESC LIMIT 100')) return [...this.tttRedeemCodes.values()].sort((x, y) => String(y.created_at || '').localeCompare(String(x.created_at || ''))).slice(0, 100).map(x => ({ code: x.code, benefit_type: x.benefit_type, benefit_value: x.benefit_value, max_uses: x.max_uses, used_count: x.used_count, expires_at: x.expires_at, active: x.active, created_by: x.created_by, created_at: x.created_at }));
     if (s.startsWith("SELECT COUNT(*) AS c FROM ttt_redeem_log WHERE guest_id = ? AND status = 'failed' AND redeemed_at > ?")) return [{ c: this.tttRedeemLog.filter(x => x.guest_id === a[0] && x.status === 'failed' && String(x.redeemed_at || '') > a[1]).length }];
+    if (s.startsWith("INSERT INTO ttt_redeem_log (code, account_id, guest_id, benefit_type, benefit_value, status, fail_reason, redeemed_at) SELECT")) {
+      const dup = this.tttRedeemLog.some(x => x.code === a[6] && x.account_id === a[7] && x.status === 'ok');
+      if (dup) return { changes: 0 };
+      this.tttRedeemLog.push({ id: ++this.tttRedeemLogSeq, code: a[0], account_id: a[1], guest_id: a[2], benefit_type: a[3], benefit_value: a[4], status: 'ok', fail_reason: '', redeemed_at: a[5] });
+      return { changes: 1 };
+    }
     if (s.startsWith('INSERT INTO ttt_redeem_log')) { if (s.includes("'failed'")) this.tttRedeemLog.push({ id: ++this.tttRedeemLogSeq, code: a[0], account_id: a[1], guest_id: a[2], benefit_type: '', benefit_value: 0, status: 'failed', fail_reason: a[3], redeemed_at: a[4] }); else this.tttRedeemLog.push({ id: ++this.tttRedeemLogSeq, code: a[0], account_id: a[1], guest_id: a[2], benefit_type: a[3], benefit_value: a[4], status: 'ok', fail_reason: '', redeemed_at: a[5] }); return []; }
     if (s.startsWith("SELECT id FROM ttt_redeem_log WHERE code = ? AND account_id = ? AND status = 'ok' LIMIT 1")) { const r = this.tttRedeemLog.find(x => x.code === a[0] && x.account_id === a[1] && x.status === 'ok'); return r ? [{ id: r.id }] : []; }
     if (s.startsWith('SELECT code, benefit_type, benefit_value, status, redeemed_at FROM ttt_redeem_log WHERE account_id = ?')) return [...this.tttRedeemLog].filter(x => x.account_id === a[0]).sort((x, y) => y.id - x.id).slice(0, 20).map(x => ({ code: x.code, benefit_type: x.benefit_type, benefit_value: x.benefit_value, status: x.status, redeemed_at: x.redeemed_at }));
@@ -1102,6 +1133,8 @@ class MockDB {
     if (s.startsWith('SELECT id, ban_type, reason, created_by, created_at, expires_at, revoked_at FROM ttt_bans WHERE account_id = ? ORDER BY id DESC LIMIT 20')) return [...this.tttBans].filter(x => x.account_id === a[0]).sort((x, y) => y.id - x.id).slice(0, 20).map(x => ({ id: x.id, ban_type: x.ban_type, reason: x.reason, created_by: x.created_by, created_at: x.created_at, expires_at: x.expires_at, revoked_at: x.revoked_at }));
     if (s.startsWith('UPDATE ttt_players SET score = score + ?, total_energy_all_time = total_energy_all_time + ?, updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[3]); if (r) { r.score = (Number(r.score) || 0) + Number(a[0]); r.total_energy_all_time = (Number(r.total_energy_all_time) || 0) + Number(a[1]); r.updated_at = a[2]; } return []; }
     if (s.startsWith('UPDATE ttt_players SET savings = savings + ?, updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[2]); if (r) { r.savings = (Number(r.savings) || 0) + Number(a[0]); r.updated_at = a[1]; } return []; }
+    if (s.startsWith('UPDATE ttt_players SET score = score - ?, total_energy_all_time = total_energy_all_time - ?, updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[3]); if (r) { r.score = (Number(r.score) || 0) - Number(a[0]); r.total_energy_all_time = (Number(r.total_energy_all_time) || 0) - Number(a[1]); r.updated_at = a[2]; } return []; }
+    if (s.startsWith('UPDATE ttt_players SET savings = savings - ?, updated_at = ? WHERE account_id = ?')) { const r = this.tttPlayers.get(a[2]); if (r) { r.savings = (Number(r.savings) || 0) - Number(a[0]); r.updated_at = a[1]; } return []; }
     // Hozin Dompet v1.1 (tabel dompet_*).
     if (s.startsWith('INSERT OR IGNORE INTO dompet_accounts')) { this.dompetAccounts.add(a[0]); return []; }
     if (s.startsWith('SELECT updated_at FROM dompet_transactions WHERE account_id = ? AND id = ?')) { const r = this.dompetTransactions.find(x => x.account_id === a[0] && x.id === a[1]); return r ? [{ updated_at: r.updated_at }] : []; }
@@ -1136,8 +1169,8 @@ class MockDB {
     if (s.startsWith('SELECT owner_key, user_id, device_id, device_model, last_seen, current_kind, current_target, current_season, current_no, reading_since FROM cerpen_track_users WHERE last_seen >= ? ORDER BY last_seen DESC LIMIT 20')) {
       return [...this.trackUsers.values()].filter(u => u.last_seen >= a[0]).sort((x, y) => y.last_seen - x.last_seen).slice(0, 20).map(u => ({ owner_key: u.owner_key, user_id: u.user_id, device_id: u.device_id, device_model: u.device_model, last_seen: u.last_seen, current_kind: u.current_kind, current_target: u.current_target, current_season: u.current_season, current_no: u.current_no, reading_since: u.reading_since }));
     }
-    if (s.startsWith('SELECT owner_key, user_id, device_id, device_model, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, is_rooted, is_emulator, integrity_status FROM cerpen_track_users WHERE owner_key LIKE ? OR device_id LIKE ? OR user_id LIKE ? ORDER BY last_seen DESC LIMIT ?')) {
-      const term = String(a[0] || '').replace(/%/g, '');
+    if (s.startsWith("SELECT owner_key, user_id, device_id, device_model, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, is_rooted, is_emulator, integrity_status FROM cerpen_track_users WHERE owner_key LIKE ? ESCAPE '!' OR device_id LIKE ? ESCAPE '!' OR user_id LIKE ? ESCAPE '!' ORDER BY last_seen DESC LIMIT ?")) {
+      const term = String(a[0] || '').replace(/^%|%$/g, '').replace(/!([%_!])/g, '$1');
       return [...this.trackUsers.values()].filter(u => !term || (u.owner_key || '').includes(term) || (u.device_id || '').includes(term) || (u.user_id || '').includes(term)).sort((x, y) => y.last_seen - x.last_seen).slice(0, a[3]).map(u => ({ owner_key: u.owner_key, user_id: u.user_id, device_id: u.device_id, device_model: u.device_model, app_version: u.app_version, first_seen: u.first_seen, last_seen: u.last_seen, current_kind: u.current_kind, current_target: u.current_target, current_season: u.current_season, current_no: u.current_no, reading_since: u.reading_since, is_rooted: u.is_rooted, is_emulator: u.is_emulator, integrity_status: u.integrity_status }));
     }
     if (s.startsWith('SELECT owner_key, user_id, device_id, device_model, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, is_rooted, is_emulator, integrity_status FROM cerpen_track_users ORDER BY last_seen DESC LIMIT ?')) {
@@ -1472,7 +1505,7 @@ async function call(method, path, body = null, cookie = '', extraHeaders = {}) {
 // v1.1.38: identitas aplikasi Cerpen resmi — dipakai semua panggilan tes
 // yang meniru klien aplikasi (gerbang versi menolak tanpa identitas ini).
 const CERPEN_SIGNER = '75ba028f4f9b401b3f414a2b9e63617fa35b503c692c5f6c188e3724a7a01c1d';
-const CERPEN_APP_H = { 'x-app-version': '1.1.39', 'x-app-signer-sha': CERPEN_SIGNER, 'x-device-id': 'test-device-1111' };
+const CERPEN_APP_H = { 'x-app-version': '1.1.42', 'x-app-signer-sha': CERPEN_SIGNER, 'x-device-id': 'test-device-1111' };
 function assert(cond, label) { console.log((cond ? 'OK  ' : 'GAGAL ') + label); if (!cond) process.exitCode = 1; }
 
 // 1. Beranda menampilkan post sambutan
@@ -1880,7 +1913,7 @@ r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', th
 r = await call('GET', '/'); t = await r.text();
 assert(t.includes('adsbygoogle') && t.includes('ca-pub-1234567890123456'), 'AdSense: unit tampil di beranda bila client diisi');
 assert(t.includes('class="card adsense-box"') && t.includes('data-ad-status') && t.includes('MutationObserver'), 'AdSense: unit kosong disembunyikan — wrapper adsense-box + observer data-ad-status');
-assert(t.includes('class="card adsense-box" style="text-align:center;display:none"') && t.includes("'filled'"), 'AdSense: unit mulai tersembunyi, baru tampil bila data-ad-status=filled');
+assert(t.includes('class="card adsense-box" style="text-align:center;display:none"') && (t.includes("'filled'") || t.includes('"filled"')), 'AdSense: unit mulai tersembunyi, baru tampil bila data-ad-status=filled');
 assert(r.headers.get('content-security-policy') && r.headers.get('content-security-policy').includes('pagead2.googlesyndication.com'), 'AdSense: CSP dilonggarkan hanya untuk domain Google Ads');
 // AdSense: satu kolom — tempel script lengkap diekstrak jadi ID polos
 r = await call('POST', '/kendali/settings', { csrf, site_title: 'Hozin King', theme: 'gelap', adsense_client: '<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-9999999999999999" crossorigin="anonymous"></script>' }, cookie); assert(r.status === 303, 'AdSense: tempelan script lengkap tersimpan');
@@ -2291,7 +2324,7 @@ j = await r.json();
 assert(r.status === 200 && Array.isArray(j.series) && j.series.length === 1 && j.series[0].id === 'cerpen-01', 'cerpen-api: daftar series terbaca');
 r = await callJson('GET', `/api/c/${cHash}/cerpen/episodes?series=cerpen-01&season=1`, null, CERPEN_APP_H);
 j = await r.json();
-assert(r.status === 200 && Array.isArray(j.episodes) && j.episodes.length === 2, 'cerpen-api: daftar episode terbaca');
+assert(r.status === 200 && Array.isArray(j.episodes) && j.episodes.length === 4, 'cerpen-api: daftar episode terbaca');
 r = await callJson('GET', `/api/c/${cHash}/cerpen/episode?series=cerpen-01&season=1&no=1`, null, CERPEN_APP_H);
 j = await r.json();
 assert(r.status === 200 && j.episode && j.episode.isi_cipher === 'QUJD', 'cerpen-api: isi episode terbaca (cipher)');
@@ -2313,7 +2346,7 @@ r = await callJson('GET', `/api/c/${oldHash}/cerpen/manifest`, null, CERPEN_APP_
 assert(r.status === 200, 'cerpen-api: hash jam sebelumnya masih diterima (toleransi ±1 jam)');
 r = await callJson('GET', `/api/c/${cHash}/cerpen/all`, null, CERPEN_APP_H);
 j = await r.json();
-assert(r.status === 200 && j.version === '1' && j.series.length === 1 && j.episodes.length === 2 && j.komik.length === 1 && j.komik_episodes.length === 1 && j.news.length === 1 && j.counts.cerpen_episodes === 2, 'cerpen-api: dump penuh all berisi semua koleksi + counts');
+assert(r.status === 200 && j.version === '1' && j.series.length === 1 && j.episodes.length === 6 && j.komik.length === 1 && j.komik_episodes.length === 1 && j.news.length === 1 && j.counts.cerpen_episodes === 6, 'cerpen-api: dump penuh all berisi semua koleksi + counts');
 const savedCerpenBak = env.BACKUP_DB; delete env.BACKUP_DB;
 r = await callJson('GET', `/api/c/${cHash}/cerpen/manifest`, null, CERPEN_APP_H);
 assert(r.status === 503, 'cerpen-api: tanpa BACKUP_DB -> 503');
@@ -2945,6 +2978,32 @@ const otpUser = [...env.DB.users.values()].find(u => u.username === 'otpuser');
 assert(otpUser && Number(otpUser.email_verified) === 1, 'otp: akun aktif setelah verifikasi');
 r = await call('POST', '/akun/login', { username: 'otpuser', password: 'password123' });
 assert(r.status === 303, 'otp: login setelah verifikasi lolos');
+// AUDIT 21 Nov 2026: kirim ulang OTP TIDAK reset hitungan percobaan selama
+// kode lama masih berlaku — kalau tidak, batas 5x bisa di-reset penyerang.
+env.DB.rateLimits = new Map();
+r = await call('POST', '/akun/daftar', { username: 'auditotp', password: 'password123', email: 'auditotp@example.com' });
+assert(r.status === 303, 'audit: daftar auditotp redirect (OTP diterbitkan)');
+let auditVcsrf = '';
+{
+  const t3 = await call('GET', '/akun/verifikasi?email=auditotp%40example.com');
+  auditVcsrf = ((await t3.text()).match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
+}
+assert(auditVcsrf.length > 10, 'audit: halaman verifikasi auditotp memberi CSRF');
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 2; i++) {
+  r = await call('POST', '/akun/verifikasi', { email: 'auditotp@example.com', code: '000000', csrf: auditVcsrf });
+  assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=salah'), 'audit: OTP salah ke-' + (i + 1) + ' ditolak');
+}
+assert(env.DB.otpCodes.get('auditotp@example.com').attempts === 2, 'audit: attempts=2 sebelum kirim ulang');
+r = await call('POST', '/akun/verifikasi/kirim-ulang', { email: 'auditotp@example.com', csrf: auditVcsrf });
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=terkirim'), 'audit: kirim ulang OTP lolos');
+assert(env.DB.otpCodes.get('auditotp@example.com').attempts === 2, 'audit: attempts tetap 2 setelah kirim ulang (tidak reset)');
+for (let i = 0; i < 3; i++) {
+  r = await call('POST', '/akun/verifikasi', { email: 'auditotp@example.com', code: '000000', csrf: auditVcsrf });
+  assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=salah'), 'audit: OTP salah lanjutan ke-' + (i + 3) + ' ditolak');
+}
+r = await call('POST', '/akun/verifikasi', { email: 'auditotp@example.com', code: kodeTerakhir(), csrf: auditVcsrf });
+assert(r.status === 303 && (r.headers.get('location') || '').includes('pesan=salah'), 'audit: kode benar setelah 5x salah tetap ditolak (attempts tidak reset)');
 env.DB.rateLimits = new Map();
 r = await call('POST', '/akun/daftar', { username: 'kadaluarsa', password: 'password123', email: 'kadaluarsa@example.com' });
 assert(r.status === 303, 'otp: daftar akun kadaluarsa redirect');
@@ -3031,6 +3090,25 @@ for (let i = 0; i < 10; i++) { r = await call('GET', '/api/fbm-apk'); }
 assert(r.status === 200, 'fbm-apk: 10 unduhan/jam masih lolos');
 r = await call('GET', '/api/fbm-apk');
 assert(r.status === 429, 'fbm-apk: unduhan ke-11 dalam 1 jam ditolak 429');
+// AUDIT 21 Nov 2026: proxy FBM menolak host di luar allowlist (bukan SSRF
+// ke sembarang host). Cache rilis modul sudah hangat, jadi dipakai worker
+// hasil import ulang (cache FBM segar) + mock rilis ber-host jahat.
+{
+  const fetchBeforeEvil = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes('/releases/latest')) {
+      return { ok: true, status: 200, json: async () => ({ tag_name: 'v1.0.99', body: 'x', assets: [{ name: 'HozinFBManager-1.0.99.apk', size: 100, browser_download_url: 'https://evil.example.com/x.apk' }] }), text: async () => '{}' };
+    }
+    return fetchBeforeEvil(url, init);
+  };
+  const workerEvil = (await import('./worker.js?fbm-evil=1')).default;
+  env.DB.rateLimits = new Map();
+  r = await workerEvil.fetch(new Request(base + '/api/fbm-apk', { method: 'GET' }), env);
+  assert(r.status === 502 && (await r.text()).includes('gagal mengambil APK'), 'audit: FBM proxy host di luar allowlist -> 502');
+  globalThis.fetch = fetchBeforeEvil;
+  env.DB.rateLimits = new Map();
+}
 delete env.GITHUB_PAT_READ;
 globalThis.fetch = fetchBeforeFbm;
 // v86: endpoint publik Cerpen — gambar + versi dari D1 stopwatch-db.
@@ -3303,7 +3381,7 @@ r = await call('GET', '/kendali/koin', null, cookie);
 t = await r.text();
 assert(r.status === 200 && t.includes('Koin Cerpen') && t.includes('Papan Peringkat') && t.includes('Daftar Pantauan'), 'koin panel: /kendali/koin tampil + kartu VIP/leaderboard/pantauan');
 assert(t.includes('</div></div>\n<div class="card" id="koin-user-detail"') && t.includes('height:110px'), 'koin panel: detail akun kartu sendiri (bukan bersarang) + spacer bawah anti-nav');
-const coinCsrf = (t.match(/COIN_CSRF = "([^"]+)"/) || [])[1] || '';
+const coinCsrf = (t.match(/COIN_CSRF\s*=\s*"([^"]+)"/) || [])[1] || '';
 assert(coinCsrf.length > 10, 'koin panel: token CSRF terbaca dari panel');
 r = await coinCall('GET', '/api/cerpen-coins/pricing', null);
 let pj = {};
@@ -3356,6 +3434,26 @@ r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: oneCodes[0], devi
 assert(r.status === 200, 'koin redeem: batch total_max=1, penukaran pertama lolos');
 r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: oneCodes[1], device_id: DEV_D });
 assert(r.status === 409, 'koin redeem: batch total_max=1, penukaran kedua (perangkat lain) ditolak kuota habis');
+// AUDIT 21 Nov 2026: balapan penukaran SEKALIGUS — dua kode, satu perangkat,
+// batch total_max=2: tepat satu lolos, satu 409, kuota akhir 1 (kompensasi).
+env.DB.rateLimits = new Map();
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'coins', reward_value: 5, count: 2, total_max: 2, per_device_max: 1, active: 1, note: 'uji balapan' });
+rj = JSON.parse(await r.text());
+const raceCodes = rj.codes;
+const RACE_DEV = '44444444-5555-4666-8777-999999999999';
+const [race1, race2] = await Promise.all([
+  coinCall('POST', '/api/cerpen-coins/redeem', { code: raceCodes[0], device_id: RACE_DEV }),
+  coinCall('POST', '/api/cerpen-coins/redeem', { code: raceCodes[1], device_id: RACE_DEV }),
+]);
+const raceStatuses = [race1.status, race2.status].sort();
+assert(raceStatuses[0] === 200 && raceStatuses[1] === 409, 'audit: balapan voucher — tepat satu lolos + satu 409');
+r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'GET', null);
+rj = JSON.parse(await r.text());
+const raceBatch = (rj.batches || []).find(b => b.note === 'uji balapan');
+assert(raceBatch && Number(raceBatch.redeemed_count) === 1, 'audit: balapan voucher — kuota akhir 1 (kompensasi jalan)');
+r = await coinCall('GET', '/api/cerpen-coins/me?device_id=' + RACE_DEV, null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && Number(rj.balance) === 5, 'audit: balapan voucher — saldo dompet tepat 5 (yang gagal tidak ikut kredit)');
 // Migrasi guest -> akun saat login ulang dengan device yang sama.
 env.DB.rateLimits = new Map();
 r = await coinCall('POST', '/api/cerpen-auth/login', { username: 'koinuji', password: 'password123', device_id: DEV_A, android_id: 'android-uji-001' });
@@ -3364,6 +3462,17 @@ assert(r.status === 200 && rj.balance === 50 && rj.migrated === 50, 'koin migras
 r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
 me = JSON.parse(await r.text());
 assert(me.balance === 50, 'koin me: saldo akun 50 setelah migrasi');
+// AUDIT 21 Nov 2026: migrasi SEKALI — login kedua tidak memindahkan lagi.
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-auth/login', { username: 'koinuji', password: 'password123', device_id: DEV_A, android_id: 'android-uji-001' });
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.migrated === 0 && rj.balance === 50, 'audit: login kedua -> migrasi 0 (saldo guest sudah 0)');
+// AUDIT 21 Nov 2026: beli episode yang tidak ada -> 404 (bukan 402/debit).
+env.DB.rateLimits = new Map();
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 9, no: 9, device_id: DEV_A }, { cookie: koinUserCookie });
+assert(r.status === 404, 'audit: purchase episode tidak ada -> 404');
+r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'komik', target_id: 'komik-99', season: 1, no: 1, device_id: DEV_A }, { cookie: koinUserCookie });
+assert(r.status === 404, 'audit: purchase komik tidak ada -> 404');
 // Beli episode: bayar, beli ulang, gratis, saldo kurang.
 env.DB.rateLimits = new Map();
 r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 2, device_id: DEV_A }, { cookie: koinUserCookie });
@@ -3421,6 +3530,33 @@ r = await coinAdmin('/api/admin/cerpen-koin/pricing', 'POST', { default_price: 1
 r = await coinCall('POST', '/api/cerpen-coins/purchase', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 4, device_id: DEV_A }, { cookie: koinUserCookie });
 assert(r.status === 402, 'koin VIP: setelah revoke, harga berlaku lagi -> 402');
 r = await coinAdmin('/api/admin/cerpen-koin/pricing', 'POST', { default_price: 10 });
+// AUDIT 21 Nov 2026: VIP expires_at absolut dipakai apa adanya (tanpa
+// pembulatan ke hari — pembulatan lama memberi ~24 jam gratis).
+{
+  const expS = Math.floor(Date.now() / 1000) + 3600;
+  r = await coinAdmin('/api/admin/cerpen-koin/vip', 'POST', { user_id: koinUser.id, expires_at: expS, reason: 'uji absolut' });
+  rj = JSON.parse(await r.text());
+  assert(r.status === 201 && rj.vip_until === expS * 1000, 'audit: VIP expires_at absolut dipakai verbatim (tanpa +24 jam)');
+  r = await coinAdmin('/api/admin/cerpen-koin/vip/' + koinUser.id + '/revoke', 'POST', {});
+  assert(r.status === 200, 'audit: VIP absolut dicabut lagi');
+}
+// AUDIT 21 Nov 2026 (D4): ban berwaktu (expires_at DETIK) tetap berlaku —
+// bug lama membandingkan detik dengan ms sehingga ban langsung tersapu.
+{
+  const banExpS = Math.floor(Date.now() / 1000) + 3600;
+  r = await coinAdmin('/api/admin/cerpen-koin/bans', 'POST', { user_id: koinUser.id, reason: 'uji D4', expires_at: banExpS });
+  rj = JSON.parse(await r.text());
+  assert(r.status === 201 && rj.expires_at === banExpS, 'audit D4: ban berwaktu 1 jam dibuat');
+  const banId = rj.id;
+  env.DB.rateLimits = new Map();
+  r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
+  assert(r.status === 403, 'audit D4: akun ter-ban 1 jam ditolak 403 (ban tidak tersapu)');
+  // Ban yang sudah kedaluwarsa tersapu saat request berikutnya.
+  env.DB.coinBans.find(b => b.id === banId).expires_at = Math.floor(Date.now() / 1000) - 10;
+  env.DB.rateLimits = new Map();
+  r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
+  assert(r.status === 200, 'audit D4: ban kedaluwarsa tersapu -> /me jalan lagi');
+}
 // Voucher fleksibel: episode / series / season.
 env.DB.rateLimits = new Map();
 r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'episode', reward_target_kind: 'cerpen', reward_target_id: 'cerpen-01', reward_season: 1, reward_no: 2, count: 2, total_max: 10, per_device_max: 1, active: 1 });
@@ -3437,12 +3573,12 @@ r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 's
 rj = JSON.parse(await r.text());
 r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: rj.codes[0], device_id: DEV_G });
 rj = JSON.parse(await r.text());
-assert(r.status === 200 && rj.unlocks_granted === 2 && rj.unlocks_total === 2, 'koin redeem series: 2 episode cerpen-01 terbuka sekaligus');
+assert(r.status === 200 && rj.unlocks_granted === 6 && rj.unlocks_total === 6, 'koin redeem series: 6 episode cerpen-01 terbuka sekaligus');
 r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'season', reward_target_kind: 'cerpen', reward_target_id: 'cerpen-01', reward_season: 1, count: 1, total_max: 10, per_device_max: 1, active: 1 });
 rj = JSON.parse(await r.text());
 r = await coinCall('POST', '/api/cerpen-coins/redeem', { code: rj.codes[0], device_id: DEV_H });
 rj = JSON.parse(await r.text());
-assert(r.status === 200 && rj.unlocks_granted === 2, 'koin redeem season: season 1 (2 episode) terbuka');
+assert(r.status === 200 && rj.unlocks_granted === 4, 'koin redeem season: season 1 (4 episode) terbuka');
 // Voucher VIP: guest ditolak, akun lolos.
 r = await coinAdmin('/api/admin/cerpen-koin/vouchers', 'POST', { reward_type: 'vip', reward_value: 7, count: 2, total_max: 10, per_device_max: 1, active: 1 });
 rj = JSON.parse(await r.text());
@@ -3480,7 +3616,7 @@ assert(r.status === 200, 'koin redeem: expires_at unix detik — kode belum keda
 // Targets untuk dropdown voucher.
 r = await coinAdmin('/api/admin/cerpen-koin/targets?kind=cerpen&target_id=cerpen-01', 'GET', null);
 rj = JSON.parse(await r.text());
-assert(r.status === 200 && rj.cerpen.some(x => x.id === 'cerpen-01') && JSON.stringify(rj.seasons) === '[1]' && rj.episodes.length === 2, 'koin targets: daftar series + season/episode cerpen-01');
+assert(r.status === 200 && rj.cerpen.some(x => x.id === 'cerpen-01') && JSON.stringify(rj.seasons) === '[1,2,3]' && rj.episodes.length === 6, 'koin targets: daftar series + season/episode cerpen-01');
 // Waktu baca + leaderboard + privasi.
 env.DB.rateLimits = new Map();
 r = await coinCall('POST', '/api/cerpen-coins/reading', { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 1, seconds: 60, device_id: DEV_A }, { cookie: koinUserCookie });
@@ -3588,6 +3724,16 @@ assert(r.status === 200 && rj.verified === 1, 'koin verify: admin memberi centan
 r = await coinCall('GET', '/api/cerpen-coins/me', null, { cookie: koinUserCookie });
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.verified === 1, 'koin verify: /me memuat verified 1');
+// AUDIT 21 Nov 2026: LIKE di-escape — '%'/'_' literal tidak cocok semua akun.
+r = await coinAdmin('/api/admin/cerpen-koin/users?q=koinuji', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.users.some(u => u.username === 'koinuji'), 'audit: cari user koinuji ketemu');
+r = await coinAdmin('/api/admin/cerpen-koin/users?q=%25', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.users.length === 0, 'audit: cari "%" literal -> 0 user (wildcard di-escape)');
+r = await coinAdmin('/api/admin/cerpen-koin/users?q=_', 'GET', null);
+rj = JSON.parse(await r.text());
+assert(r.status === 200 && rj.users.length === 0, 'audit: cari "_" literal -> 0 user (wildcard di-escape)');
 r = await coinCall('GET', '/api/cerpen-coins/leaderboard?period=all', null);
 rj = JSON.parse(await r.text());
 assert(rj.leaderboard.some(x => x.username === 'koinuji' && x.verified === 1), 'koin verify: leaderboard memuat verified 1');
@@ -3667,6 +3813,20 @@ assert(r.status === 200 && sj.likes === 1 && sj.dislikes === 0 && sj.my_vote ===
 r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 0, device_id: SOC_DEV }, { authorization: 'Bearer ' + koinSession });
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.likes === 0 && sj.dislikes === 0 && sj.my_vote === 0, 'social vote: vote=0 batalkan');
+// AUDIT 21 Nov 2026: socialBanCheck pakai DETIK (kembaran bug D4) — ban
+// berwaktu harus ditegakkan di endpoint social, bukan langsung tersapu.
+{
+  const nowS2 = Math.floor(Date.now() / 1000);
+  r = await coinAdmin('/api/admin/cerpen-koin/bans', 'POST', { user_id: koinUser.id, reason: 'uji social D4', expires_at: nowS2 + 3600 });
+  const banSoc = JSON.parse(await r.text());
+  assert(r.status === 201 && banSoc.id, 'audit: ban social D4 dibuat (1 jam)');
+  r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 1, device_id: SOC_DEV }, { authorization: 'Bearer ' + koinSession });
+  assert(r.status === 403 && JSON.parse(await r.text()).error === 'banned', 'audit: pengguna ter-ban berwaktu -> vote social 403 (bukan lolos)');
+  r = await coinAdmin('/api/admin/cerpen-koin/bans/' + banSoc.id + '/unban', 'POST', null);
+  assert(r.status === 200, 'audit: ban social D4 dicabut');
+  r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 0, device_id: SOC_DEV }, { authorization: 'Bearer ' + koinSession });
+  assert(r.status === 200, 'audit: setelah cabut ban, vote social lolos lagi (tanpa ubah hitungan)');
+}
 env.DB.rateLimits = new Map();
 r = await socialCall('POST', '/api/cerpen-social/report', { kind: 'cerpen', ref: SOC_REF, category: 'typo', note: 'ada salah ketik', device_id: SOC_DEV });
 sj = JSON.parse(await r.text());
@@ -4038,6 +4198,13 @@ assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap admin
 r = await tttCall('POST', '/api/taptap/integrity', { guest_id: GUEST_A, token: 'x' }, { 'x-ttt-api-key': KEY_A2 });
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.ok === true && sj.verified === false && sj.status === 'not_configured', 'taptap admin: integrity tanpa service account -> not_configured (game tetap jalan)');
+// AUDIT 21 Nov 2026: endpoint integrity dibatasi 30/10 menit.
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 30; i++) { r = await tttCall('POST', '/api/taptap/integrity', { guest_id: GUEST_A, token: 'x' }, { 'x-ttt-api-key': KEY_A2 }); }
+assert(r.status === 200, 'audit: integrity ke-30 dalam 10 menit lolos');
+r = await tttCall('POST', '/api/taptap/integrity', { guest_id: GUEST_A, token: 'x' }, { 'x-ttt-api-key': KEY_A2 });
+assert(r.status === 429, 'audit: integrity ke-31 dalam 10 menit -> 429');
+env.DB.rateLimits = new Map();
 // 4. Redeem: buat akun + guest baru, buat kode, tukar, duplikat ditolak, brute-force dibatasi.
 r = await tttCall('POST', '/api/taptap/profile', { account_id: '66666666', player_name: 'RedeemKu', score: 100, total_energy_all_time: 100, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
 assert(r.status === 200, 'taptap admin: buat akun redeem 66666666 ok');
@@ -4058,6 +4225,18 @@ sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.score === 50100 && sj.total_energy_all_time === 50100, 'taptap admin: redeem energi masuk skor + total (100 -> 50100)');
 r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: CODE1 }, { 'x-ttt-api-key': KEY_D });
 assert(r.status === 403 && JSON.parse(await r.text()).error === 'already_redeemed', 'taptap admin: redeem kode yang sama kedua kali -> 403 already_redeemed');
+// AUDIT 21 Nov 2026: double-spend — penukaran kedua ditolak DAN skor +
+// kuota tidak berubah (kredit pertama tidak ganda).
+r = await tttCall('GET', '/api/taptap/profile/66666666', null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.score === 50100 && sj.total_energy_all_time === 50100, 'audit: skor tetap 50100 setelah redeem ganda ditolak');
+r = await tttCall('GET', '/api/taptap/admin/redeem/history?code=' + CODE1, null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.total === 1, 'audit: riwayat CODE1 tetap 1 penukaran (tanpa ganda)');
+r = await tttCall('GET', '/api/taptap/admin/redeem/list', null, TTT_ADMIN_H);
+sj = JSON.parse(await r.text());
+const c1row = (sj.codes || []).find(x => x.code === CODE1);
+assert(c1row && Number(c1row.used_count) === 1, 'audit: used_count CODE1 tetap 1 (kuota dikembalikan)');
 r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: CODE1 });
 assert(r.status === 401 && JSON.parse(await r.text()).error === 'api_key_required', 'taptap admin: redeem tanpa key -> 401');
 // 4b. Redeem: edit kode, riwayat penukaran, cabut (nonaktifkan).
@@ -4163,6 +4342,16 @@ assert(r.status === 200 && sj.guest_id === GUEST_D && typeof sj.api_key === 'str
 r = await tttCall('GET', '/kendali/taptap', null, { cookie });
 t = await r.text();
 assert(r.status === 200 && t.includes('Tap Tap Tycoon') && t.includes('Ringkasan') && t.includes('Daftar pantau'), 'taptap admin: panel /kendali/taptap tampil (ringkasan + pantau)');
+// AUDIT 21 Nov 2026: CSRF admin TTT — sesi cookie wajib x-csrf, Bearer tidak.
+const tttCsrf = (t.match(/TTT_CSRF\s*=\s*"([^"]+)"/) || [])[1] || '';
+assert(tttCsrf.length > 10, 'audit: token CSRF TTT terbaca dari panel');
+r = await tttCall('POST', '/api/taptap/admin/redeem/create', { benefit_type: 'energy', benefit_value: 100, max_uses: 1 }, { cookie });
+assert(r.status === 403, 'audit: admin TTT via cookie tanpa x-csrf -> 403');
+r = await tttCall('POST', '/api/taptap/admin/redeem/create', { benefit_type: 'energy', benefit_value: 100, max_uses: 1 }, { cookie, 'x-csrf': tttCsrf });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && typeof sj.code === 'string', 'audit: admin TTT via cookie + x-csrf -> 200');
+r = await tttCall('POST', '/api/taptap/admin/redeem/create', { benefit_type: 'energy', benefit_value: 100, max_uses: 1 }, TTT_ADMIN_H);
+assert(r.status === 200, 'audit: admin TTT via Bearer tanpa x-csrf tetap 200');
 // 9. Endpoint lama TANPA key tetap jalan (kompatibel v1.1.2) — kecuali key tercabut.
 r = await tttCall('GET', '/api/taptap/leaderboard', null);
 assert(r.status === 200, 'taptap admin: leaderboard tanpa key tetap jalan (kompatibel v1.1.2)');
@@ -4174,7 +4363,7 @@ async function dompetCall(method, path, obj) {
   const req = new Request(base + path, { method, headers: { 'content-type': 'application/json' }, body: obj === null ? undefined : JSON.stringify(obj) });
   return worker.fetch(req, env);
 }
-const DOMPET_ACC = 'dompet-uji-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+const DOMPET_ACC = '55555555-6666-4777-8888-999999999999';
 r = await dompetCall('GET', '/api/dompet/version', null);
 assert(r.status === 200 && JSON.parse(await r.text()).version === '1.1.0', 'dompet: GET /version -> 1.1.0');
 r = await dompetCall('POST', '/api/dompet/sync', { account_id: '', since: 0, transactions: [], categories: [] });
@@ -4201,6 +4390,27 @@ sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.transactions.length === 0 && sj.categories.length === 1, 'dompet: backup sembunyikan baris deleted=1');
 r = await dompetCall('GET', '/api/dompet/ngaco', null);
 assert(r.status === 404, 'dompet: segmen tak dikenal -> 404');
+// AUDIT 21 Nov 2026: Dompet — UUID v4 wajib, baris masa depan ditolak,
+// rate limit 60/10 menit.
+r = await dompetCall('POST', '/api/dompet/sync', { account_id: 'bukan-uuid', since: 0, transactions: [], categories: [] });
+assert(r.status === 400, 'audit: dompet sync account_id bukan UUID -> 400');
+r = await dompetCall('GET', '/api/dompet/backup/bukan-uuid', null);
+assert(r.status === 400, 'audit: dompet backup account_id bukan UUID -> 400');
+r = await dompetCall('POST', '/api/dompet/sync', { account_id: DOMPET_ACC, since: 0, transactions: [{ id: 99, dateMillis: 1000, type: 0, category: 'Makan', method: 'Cash', amount: 12345, note: 'masa depan', updated_at: Date.now() + 24 * 3600 * 1000, deleted: 0 }], categories: [] });
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && sj.ok === true && !sj.transactions.some(x => x.id === 99), 'audit: dompet baris updated_at masa depan ditolak (tidak echo)');
+r = await dompetCall('GET', '/api/dompet/backup/' + DOMPET_ACC, null);
+sj = JSON.parse(await r.text());
+assert(r.status === 200 && !sj.transactions.some(x => x.id === 99), 'audit: dompet baris masa depan tidak tersimpan di backup');
+env.DB.rateLimits = new Map();
+for (let i = 0; i < 60; i++) { r = await dompetCall('POST', '/api/dompet/sync', { account_id: DOMPET_ACC, since: 0, transactions: [], categories: [] }); }
+assert(r.status === 200, 'audit: dompet sync ke-60 dalam 10 menit lolos');
+r = await dompetCall('POST', '/api/dompet/sync', { account_id: DOMPET_ACC, since: 0, transactions: [], categories: [] });
+assert(r.status === 429, 'audit: dompet sync ke-61 dalam 10 menit -> 429');
+env.DB.rateLimits = new Map();
+// AUDIT 21 Nov 2026: header keamanan di respons JSON (bukan cuma HTML).
+r = await dompetCall('GET', '/api/dompet/version', null);
+assert((r.headers.get('strict-transport-security') || '').includes('max-age=31536000') && r.headers.get('x-content-type-options') === 'nosniff', 'audit: HSTS + nosniff di respons JSON');
 // v1.1.40+: Paket Admin/Keamanan Cerpen — tracking + API key + perintah
 // paksa + deteksi + watchlist + ban anti-bypass + pola perilaku.
 // Semua lewat gerbang versi (coinCall membawa CERPEN_APP_H).
@@ -4213,7 +4423,7 @@ const TRK_E = 'eeeeeeee-5555-4eee-8eee-eeeeeeeeeeee';
 r = await call('GET', '/kendali/cerpen-pantau', null, cookie);
 t = await r.text();
 assert(r.status === 200 && t.includes('Pantau Cerpen') && t.includes('Live') && t.includes('Watchlist') && t.includes('Ambang deteksi'), 'track panel: /kendali/cerpen-pantau tampil + kartu ringkasan/watchlist/ambang');
-const trackCsrf = (t.match(/TRACK_CSRF = "([^"]+)"/) || [])[1] || '';
+const trackCsrf = (t.match(/TRACK_CSRF\s*=\s*"([^"]+)"/) || [])[1] || '';
 assert(trackCsrf.length > 10, 'track panel: token CSRF terbaca dari panel');
 async function trackAdmin(path, method, obj) {
   return coinCall(method, path, obj, { 'x-csrf': trackCsrf, cookie });
@@ -4314,6 +4524,21 @@ assert(r.status === 200 && rj.users.some(u => u.device_id === TRK_A), 'track use
 r = await trackAdmin('/api/admin/cerpen-track/users/' + encodeURIComponent('device:' + TRK_A), 'GET', null);
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.user.owner_key === 'device:' + TRK_A && Array.isArray(rj.sessions) && rj.sessions.length >= 1 && rj.profile.total_sessions >= 1, 'track user detail: sesi + profil perilaku tampil');
+// AUDIT 21 Nov 2026: integritas gagal SENDIRIAN tidak menambah skor (HP root
+// user sendiri), tapi jejaknya dicatat 1x/jam sebagai integrity_failed skor 0.
+{
+  const trkRow = env.DB.trackUsers.get('device:' + TRK_A);
+  trkRow.integrity_status = 'failed';
+  trkRow.last_eval_at = 0;
+  env.DB.rateLimits = new Map();
+  r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_T2 }, { 'x-cerpen-api-key': KEY_T2 });
+  assert(r.status === 200, 'audit: heartbeat integritas gagal tetap 200 (tidak diblokir)');
+  r = await trackAdmin('/api/admin/cerpen-track/users/' + encodeURIComponent('device:' + TRK_A), 'GET', null);
+  rj = JSON.parse(await r.text());
+  assert(r.status === 200 && Array.isArray(rj.detections) && rj.detections.some(d => d.kind === 'integrity_failed' && Number(d.score) === 0), 'audit: integrity_failed tercatat di detail user, skor 0');
+  trkRow.integrity_status = 'unknown';
+  trkRow.last_eval_at = 0;
+}
 r = await trackAdmin('/api/admin/cerpen-track/summary', 'GET', null);
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.top_series.some(s => s.target_id === 'cerpen-01' && s.seconds >= 90) && rj.total_seconds_7d >= 90, 'track summary: cerpen-01 terpopuler + total jam baca');
@@ -4515,5 +4740,29 @@ r = await coinCall('POST', '/api/cerpen-track/register', { device_id: '88888888-
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.key_exists === true && rj.admin === false, 'god-mode fingerprint: akun admin dari fingerprint lain -> admin:false (tanpa rebind)');
 assert(env.DB.cerpenAdmins.get(ADMIN_UID).fingerprint_hash === ADMIN_FP_HASH, 'god-mode fingerprint: ikatan admin tetap fingerprint pertama');
+
+// AUDIT 21 Nov 2026: uji unit validasi + escape + perbandingan aman.
+assert(validEmail('koinuji@example.com') === true, 'audit: validEmail email biasa lolos');
+assert(validEmail('x@ex.com<script>alert(1)</script>') === false, 'audit: validEmail tolak markup <script>');
+assert(validEmail('a"b@c.com') === false, 'audit: validEmail tolak kutip');
+assert(validEmail('a/b@c.com') === false, 'audit: validEmail tolak slash');
+assert(validEmail('') === false && validEmail('a@b') === false, 'audit: validEmail tolak kosong/tanpa TLD');
+assert(isImageMagic(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) === true, 'audit: isImageMagic PNG lolos');
+assert(isImageMagic(new Uint8Array([0xff, 0xd8, 0xff, 0xe0])) === true, 'audit: isImageMagic JPEG lolos');
+assert(isImageMagic(new Uint8Array([0x3c, 0x73, 0x76, 0x67])) === false, 'audit: isImageMagic SVG ditolak');
+assert(isImageMagic(new Uint8Array([0x25, 0x50, 0x44, 0x46])) === false, 'audit: isImageMagic PDF ditolak');
+assert(escapeLikeTerm('100%_!') === '100!%!_!!', 'audit: escapeLikeTerm escape %, _, !');
+assert(safeEqualHex('ab12', 'ab12') === true && safeEqualHex('ab12', 'ab13') === false && safeEqualHex('ab12', 'ab1') === false, 'audit: safeEqualHex sama/beda/panjang-beda');
+{
+  const th = themes.terang.render({ siteTitle: 'A & B <img>', pageTitle: 'T', content: '' });
+  assert(th.includes('A &amp; B &lt;img&gt;') && !th.includes('A & B <img>') && !th.includes('&amp;amp;'), 'audit: tema escape-on-render sekali (tanpa double-escape)');
+}
+// AUDIT 21 Nov 2026: isCerpenAdmin fail-closed — tanpa ikatan -> false.
+assert(await isCerpenAdmin(env, ADMIN_UID, ADMIN_FP_HASH) === true, 'audit: isCerpenAdmin fingerprint terikat -> true');
+assert(await isCerpenAdmin(env, ADMIN_UID, '00'.repeat(32)) === false, 'audit: isCerpenAdmin fingerprint lain -> false');
+assert(await isCerpenAdmin(env, 'u-tidakada', ADMIN_FP_HASH) === false, 'audit: isCerpenAdmin akun bukan admin -> false');
+env.DB.cerpenAdmins.get(ADMIN_UID).fingerprint_hash = '';
+assert(await isCerpenAdmin(env, ADMIN_UID, ADMIN_FP_HASH) === false, 'audit: isCerpenAdmin belum terikat -> false (fail-closed)');
+env.DB.cerpenAdmins.get(ADMIN_UID).fingerprint_hash = ADMIN_FP_HASH;
 
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

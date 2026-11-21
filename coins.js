@@ -9,7 +9,7 @@
 // Prinsip: server satu-satunya otoritas saldo & unlock. Aplikasi tidak pernah
 // dipercaya memberi saldo/unlock sendiri. Ban HANYA untuk akun (v1);
 // perangkat masuk Daftar Pantauan (bukan hukuman, tidak memblokir).
-import { esc, clientIp, randomHex, sha256Hex } from './util.js';
+import { esc, clientIp, randomHex, sha256Hex, safeEqualHex, escapeLikeTerm } from './util.js';
 import { isAdmin, csrfToken, getCommenter, userSessionCookie, hashPassword, verifyPassword, isValidCommenterPassword } from './auth.js';
 import { checkRateLimit } from './security.js';
 import { validEmail, issueOtp, verifyOtp, OTP_SEND_LIMIT, OTP_SEND_WINDOW_MS } from './otp.js';
@@ -119,7 +119,9 @@ async function coinBanCheck(env, userId) {
   // admin diabaikan di jalur koin (applyCerpenBan juga menolak membuatnya).
   if (await isCerpenAdminUser(env, userId)) return null;
   const now = Date.now();
-  await env.DB.prepare(`UPDATE cerpen_bans SET active = 0 WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?`).bind(now).run();
+  // D4: expires_at disimpan dalam DETIK — bandingkan dengan detik, bukan ms
+  // (pakai ms, ban berwaktu langsung tersapu di sini).
+  await env.DB.prepare(`UPDATE cerpen_bans SET active = 0 WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?`).bind(Math.floor(now / 1000)).run();
   const row = await env.DB.prepare(`SELECT id, reason, expires_at FROM cerpen_bans WHERE target_type = 'user' AND target_id = ? AND active = 1`).bind(userId).first();
   if (row) return { target: 'user', reason: String(row.reason || ''), expires_at: row.expires_at ? Number(row.expires_at) : null };
   return null;
@@ -151,6 +153,29 @@ async function grantVip(env, userId, days, grantedBy, reason) {
 async function revokeVip(env, userId) {
   const del = await env.DB.prepare(`DELETE FROM cerpen_vip WHERE user_id = ?`).bind(userId).run();
   return del && del.meta ? Number(del.meta.changes) || 0 : 0;
+}
+
+// Grant VIP sampai tanggal ABSOLUT (bukan jumlah hari) — dipakai endpoint
+// admin bila expires_at diisi. Kedaluwarsa tidak pernah dimajukan mundur:
+// hasil = max(VIP aktif saat ini, tanggal yang diminta).
+async function grantVipUntil(env, userId, expiresAtMs, grantedBy, reason) {
+  const now = Date.now();
+  const cur = await vipStatus(env, userId);
+  const expiresAt = Math.max(cur.active && cur.expires_at ? cur.expires_at : 0, now, Number(expiresAtMs) || 0);
+  await env.DB.prepare(`INSERT INTO cerpen_vip (user_id, expires_at, granted_by, reason, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET expires_at = ?, granted_by = ?, reason = ?, created_at = ?`).bind(userId, expiresAt, grantedBy || 'admin', String(reason || '').slice(0, 200), now, expiresAt, grantedBy || 'admin', String(reason || '').slice(0, 200), now).run();
+  return { expires_at: expiresAt };
+}
+
+// Episode harus BENAR-BENAR ada di katalog (BACKUP_DB). Fail-closed bila
+// BACKUP_DB hilang — kalau tidak, koin bisa terpotong untuk episode khayalan.
+async function episodeExists(env, kind, targetId, season, no) {
+  const B = env.BACKUP_DB;
+  if (!B) return false;
+  try {
+    if (kind === 'cerpen') return !!(await B.prepare(`SELECT series_id FROM cerpen_episodes WHERE series_id = ? AND season = ? AND no = ?`).bind(targetId, season, no).first());
+    if (kind === 'komik') return !!(await B.prepare(`SELECT komik_id FROM cerpen_komik_episodes WHERE komik_id = ? AND no = ?`).bind(targetId, no).first());
+  } catch (e) { return false; }
+  return false;
 }
 
 // ---- Papan peringkat (19:17) — pakai tabel pelacak v81, tanpa tabel baru ----
@@ -297,20 +322,26 @@ async function linkDeviceAndMigrate(env, { userId, deviceId, androidId }) {
       const gList = gUnlocks.results || [];
       const gBal = gw ? Number(gw.balance) || 0 : 0;
       if (gBal > 0 || gList.length > 0) {
-        const uw = await ensureWallet(env, userKey, 'user', userId, null);
-        const newBal = (Number(uw.balance) || 0) + gBal;
-        const stmts = [
-          env.DB.prepare(`UPDATE cerpen_wallets SET balance = ?, updated_at = ? WHERE owner_key = ?`).bind(newBal, now, userKey),
-          env.DB.prepare(`UPDATE cerpen_wallets SET balance = 0, updated_at = ? WHERE owner_key = ?`).bind(now, guestKey),
-          ...gList.map(u => env.DB.prepare(`INSERT OR IGNORE INTO cerpen_unlocks (owner_key, kind, target_id, season, no, created_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(userKey, u.kind, u.target_id, u.season, u.no, u.created_at)),
-          env.DB.prepare(`DELETE FROM cerpen_unlocks WHERE owner_key = ?`).bind(guestKey),
-        ];
-        await env.DB.batch(stmts);
-        if (gBal > 0) {
-          await addLedger(env, { ownerKey: userKey, userId, deviceId, delta: gBal, balanceAfter: newBal, reason: 'migrasi perangkat', ref: deviceId });
-          await addLedger(env, { ownerKey: guestKey, userId: null, deviceId, delta: -gBal, balanceAfter: 0, reason: 'migrasi ke akun', ref: userId });
+        // Kunci migrasi: nol-kan dompet guest secara kondisional — hanya
+        // bila saldonya masih sama seperti yang dibaca. Bila dua login
+        // bersamaan, hanya satu yang lolos (changes==1); yang lain
+        // melewati migrasi tanpa menggandakan saldo.
+        const zeroed = await env.DB.prepare(`UPDATE cerpen_wallets SET balance = 0, updated_at = ? WHERE owner_key = ? AND balance = ?`).bind(now, guestKey, gBal).run();
+        if (zeroed && zeroed.meta && Number(zeroed.meta.changes) === 1) {
+          const uw = await ensureWallet(env, userKey, 'user', userId, null);
+          const newBal = (Number(uw.balance) || 0) + gBal;
+          const stmts = [
+            env.DB.prepare(`UPDATE cerpen_wallets SET balance = ?, updated_at = ? WHERE owner_key = ?`).bind(newBal, now, userKey),
+            ...gList.map(u => env.DB.prepare(`INSERT OR IGNORE INTO cerpen_unlocks (owner_key, kind, target_id, season, no, created_at) VALUES (?, ?, ?, ?, ?, ?)`).bind(userKey, u.kind, u.target_id, u.season, u.no, u.created_at)),
+            env.DB.prepare(`DELETE FROM cerpen_unlocks WHERE owner_key = ?`).bind(guestKey),
+          ];
+          await env.DB.batch(stmts);
+          if (gBal > 0) {
+            await addLedger(env, { ownerKey: userKey, userId, deviceId, delta: gBal, balanceAfter: newBal, reason: 'migrasi perangkat', ref: deviceId });
+            await addLedger(env, { ownerKey: guestKey, userId: null, deviceId, delta: -gBal, balanceAfter: 0, reason: 'migrasi ke akun', ref: userId });
+          }
+          migrated = gBal;
         }
-        migrated = gBal;
       }
     }
   }
@@ -515,6 +546,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
     if (!ident) return aj({ ok: false, error: 'Login dulu atau kirim device_id.' }, 401);
     const banned = await bannedIfSession(env, ident);
     if (banned) return banned;
+    if (!(await episodeExists(env, kind, targetId, season, no))) return aj({ ok: false, error: 'Episode tidak ditemukan.' }, 404);
     const pricing = await getPricing(env);
     const { price, free } = priceFor(pricing, kind, targetId, season, no);
     const now = Date.now();
@@ -626,19 +658,28 @@ export async function handleCoinApi(request, env, url, adminEmail) {
     // menghitung kuota per kode, bukan per batch).
     const incBatch = await env.DB.prepare(`UPDATE cerpen_voucher_batches SET redeemed_count = redeemed_count + 1 WHERE batch_id = ? AND active = 1 AND redeemed_count < ?`).bind(v.batch_id, Number(v.total_max)).run();
     if (!incBatch || !incBatch.meta || Number(incBatch.meta.changes) !== 1) return fail('kuota habis', 409, 'Kuota penukaran batch ini sudah habis.');
-    await env.DB.prepare(`UPDATE cerpen_vouchers SET redeemed_count = redeemed_count + 1 WHERE code_hash = ? AND active = 1`).bind(codeHash).run();
+    // Pencatatan penukaran kondisional: satu baris per batch per perangkat/
+    // akun. Cek COUNT di atas tidak atomik — dua request bersamaan bisa
+    // lolos berdua; hanya INSERT pertama yang berhasil (changes==1), yang
+    // lain dibatalkan + kuota batch dikembalikan.
     const now = Date.now();
+    const insRed = await env.DB.prepare(`INSERT INTO cerpen_voucher_redemptions (id, code_hash, owner_key, device_id, user_id, created_at) SELECT ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM cerpen_voucher_redemptions r JOIN cerpen_vouchers v ON v.code_hash = r.code_hash WHERE v.batch_id = ? AND (r.device_id = ? OR r.user_id = ?))`).bind('rd-' + randomHex(8), codeHash, ident.ownerKey, ident.deviceId, ident.userId, now, v.batch_id, ident.deviceId, ident.userId).run();
+    if (!insRed || !insRed.meta || Number(insRed.meta.changes) !== 1) {
+      await env.DB.prepare(`UPDATE cerpen_voucher_batches SET redeemed_count = redeemed_count - 1 WHERE batch_id = ?`).bind(v.batch_id).run();
+      return fail('sudah ditukar (balapan)', 409, 'Kode dari batch ini sudah ditukar perangkat/akun ini.');
+    }
+    await env.DB.prepare(`UPDATE cerpen_vouchers SET redeemed_count = redeemed_count + 1 WHERE code_hash = ? AND active = 1`).bind(codeHash).run();
     const wallet = await ensureWallet(env, ident.ownerKey, ident.kind, ident.userId, ident.deviceId || null);
     const balBefore = Number(wallet.balance) || 0;
-    await env.DB.prepare(`INSERT INTO cerpen_voucher_redemptions (id, code_hash, owner_key, device_id, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`).bind('rd-' + randomHex(8), codeHash, ident.ownerKey, ident.deviceId, ident.userId, now).run();
     await touchDeviceWatch(env, ident.deviceId, ident.androidId);
     if (rewardType === 'coins') {
       const reward = Number(v.reward_coins ?? v.reward_value) || 0;
-      const balAfter = balBefore + reward;
-      await env.DB.batch([
-        env.DB.prepare(`UPDATE cerpen_wallets SET balance = ?, updated_at = ? WHERE owner_key = ?`).bind(balAfter, now, ident.ownerKey),
-        env.DB.prepare(`INSERT INTO cerpen_coin_ledger (id, owner_key, user_id, device_id, delta, balance_after, reason, ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind('lg-' + randomHex(8), ident.ownerKey, ident.userId, ident.deviceId, reward, balAfter, 'tukar kode', codeHash.slice(0, 8), now),
-      ]);
+      // Kredit atomik (balance = balance + ?): saldo tidak bisa hilang
+      // bila dua penukaran bersamaan — lalu baca ulang untuk ledger.
+      await env.DB.prepare(`UPDATE cerpen_wallets SET balance = balance + ?, updated_at = ? WHERE owner_key = ?`).bind(reward, now, ident.ownerKey).run();
+      const wAfter = await getWallet(env, ident.ownerKey);
+      const balAfter = wAfter ? Number(wAfter.balance) || 0 : balBefore + reward;
+      await env.DB.prepare(`INSERT INTO cerpen_coin_ledger (id, owner_key, user_id, device_id, delta, balance_after, reason, ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind('lg-' + randomHex(8), ident.ownerKey, ident.userId, ident.deviceId, reward, balAfter, 'tukar kode', codeHash.slice(0, 8), now).run();
       return aj({ ok: true, reward_type: 'coins', coins: reward, balance: balAfter });
     }
     if (rewardType === 'vip') {
@@ -757,7 +798,7 @@ export async function handleCoinAdmin(request, env, url, admin) {
   const method = request.method;
   if (!path.startsWith('/api/admin/cerpen-koin')) return null;
   if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
-  if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
+  if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
   if (!(await checkRateLimit(env, 'coin-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
   const q = (name) => url.searchParams.get(name) || '';
 
@@ -788,8 +829,8 @@ export async function handleCoinAdmin(request, env, url, admin) {
     const limit = Math.min(Math.max(parseInt(q('limit') || '20', 10) || 20, 1), 50);
     let rows;
     if (term) {
-      const like = '%' + term + '%';
-      rows = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked, verified FROM cms_users WHERE username LIKE ? OR email LIKE ? ORDER BY created_at DESC LIMIT ?`).bind(like, like, limit).all();
+      const like = '%' + escapeLikeTerm(term) + '%';
+      rows = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked, verified FROM cms_users WHERE username LIKE ? ESCAPE '!' OR email LIKE ? ESCAPE '!' ORDER BY created_at DESC LIMIT ?`).bind(like, like, limit).all();
     } else {
       rows = await env.DB.prepare(`SELECT id, username, email, created_at, email_verified, locked, verified FROM cms_users ORDER BY created_at DESC LIMIT ?`).bind(limit).all();
     }
@@ -1057,7 +1098,11 @@ export async function handleCoinAdmin(request, env, url, admin) {
     const expiresAt = body.expires_at == null || body.expires_at === '' ? null : Number(body.expires_at);
     if (expiresAt !== null) {
       if (!Number.isInteger(expiresAt) || expiresAt <= Math.floor(Date.now() / 1000) || expiresAt > Math.floor(Date.now() / 1000) + 2 * 365 * 86400) return aj({ ok: false, error: 'expires_at harus unix detik di masa depan (maks 2 tahun)' }, 400);
-      days = Math.max(1, Math.ceil((expiresAt * 1000 - Date.now()) / 86400000));
+      // Tanggal absolut dipakai apa adanya (tanpa dibulatkan ke hari —
+      // pembulatan ke atas memberi ~24 jam gratis yang tidak diminta).
+      const vip = await grantVipUntil(env, userId, expiresAt * 1000, 'admin', reason);
+      await coinAudit(env, 'vip_grant', 'user', userId, 'sampai ' + new Date(expiresAt * 1000).toISOString() + ' — ' + reason);
+      return aj({ ok: true, user_id: userId, username: user.username, vip_until: vip.expires_at }, 201);
     } else if (!Number.isInteger(days) || days < 1 || days > 730) {
       return aj({ ok: false, error: 'days harus 1–730 (atau isi expires_at)' }, 400);
     }
@@ -1261,8 +1306,8 @@ async function listDevicesWithFlags(env, { q: term, limit }) {
   const since24 = now - WATCH_WINDOW_MS;
   let watchRows;
   if (term) {
-    const like = '%' + term + '%';
-    watchRows = await env.DB.prepare(`SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch WHERE device_id LIKE ? OR android_id LIKE ? ORDER BY updated_at DESC LIMIT ?`).bind(like, like, limit).all();
+    const like = '%' + escapeLikeTerm(term) + '%';
+    watchRows = await env.DB.prepare(`SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch WHERE device_id LIKE ? ESCAPE '!' OR android_id LIKE ? ESCAPE '!' ORDER BY updated_at DESC LIMIT ?`).bind(like, like, limit).all();
   } else {
     watchRows = await env.DB.prepare(`SELECT device_id, android_id, watched, auto_flag, flag_reason, note, created_at, updated_at FROM cerpen_device_watch ORDER BY updated_at DESC LIMIT ?`).bind(limit).all();
   }
@@ -1390,7 +1435,8 @@ export async function renderCoinPanel(env, csrf, nav, notice) {
 const COIN_CSRF = "${csrf}";
 const V_BADGE = ' <span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:#1d9bf0;color:#fff;font-size:11px;font-weight:800;line-height:1;vertical-align:-3px" title="Akun terverifikasi">✓</span>';
 const koinMsg = document.getElementById('koin-msg');
-function koinSay(t, ok) { koinMsg.innerHTML = '<div class="card"><p>' + t + '</p></div>'; koinMsg.scrollIntoView(); }
+function koinEsc(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+function koinSay(t, ok) { koinMsg.innerHTML = '<div class="card"><p>' + koinEsc(t) + '</p></div>'; koinMsg.scrollIntoView(); }
 async function koinFetch(url, method, body) {
   const res = await fetch(url, { method: method, headers: { 'x-csrf': COIN_CSRF, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   let j = {}; try { j = await res.json(); } catch (e) {}
@@ -1415,7 +1461,7 @@ document.getElementById('koin-user-search').addEventListener('submit', async (e)
   const q = new FormData(e.target).get('q') || '';
   try {
     const j = await koinFetch('/api/admin/cerpen-koin/users?q=' + encodeURIComponent(q) + '&limit=20', 'GET');
-    document.getElementById('koin-users').innerHTML = j.users.map(u => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + u.username + (u.verified ? V_BADGE : '') + '</span><div class="adm-row-meta">' + (u.email || '') + ' · saldo <b>' + u.balance + ' koin</b>' + (u.locked ? ' · 🔒 terkunci' : '') + (u.banned ? ' · 🚫 dibanned' : '') + '</div></div><button type="button" data-koin-user="' + u.id + '">Detail</button></div>').join('') || '<p>Tidak ada akun.</p>';
+    document.getElementById('koin-users').innerHTML = j.users.map(u => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + koinEsc(u.username) + (u.verified ? V_BADGE : '') + '</span><div class="adm-row-meta">' + koinEsc(u.email || '') + ' · saldo <b>' + u.balance + ' koin</b>' + (u.locked ? ' · 🔒 terkunci' : '') + (u.banned ? ' · 🚫 dibanned' : '') + '</div></div><button type="button" data-koin-user="' + koinEsc(u.id) + '">Detail</button></div>').join('') || '<p>Tidak ada akun.</p>';
   } catch (err) { koinSay(err.message); }
 });
 document.getElementById('koin-reward-type').addEventListener('change', (e) => {
@@ -1469,11 +1515,11 @@ document.addEventListener('click', async (e) => {
     if (t.hasAttribute('data-koin-user')) {
       const j = await koinFetch('/api/admin/cerpen-koin/users/' + encodeURIComponent(t.getAttribute('data-koin-user')), 'GET');
       const u = j.user;
-      document.getElementById('koin-user-detail-body').innerHTML = '<p><b>' + u.username + '</b>' + (u.verified ? V_BADGE : '') + ' · ' + (u.email || '') + ' · saldo <b>' + j.balance + ' koin</b>' + (j.vip && j.vip.active ? ' · <b>VIP sampai ' + new Date(j.vip.expires_at).toLocaleDateString('id-ID') + '</b>' : '') + ' · perangkat: ' + j.devices.length + ' · unlock: ' + j.unlocks.length + (u.reading_private ? ' · papan peringkat: disembunyikan' : '') + '</p>'
+      document.getElementById('koin-user-detail-body').innerHTML = '<p><b>' + koinEsc(u.username) + '</b>' + (u.verified ? V_BADGE : '') + ' · ' + koinEsc(u.email || '') + ' · saldo <b>' + j.balance + ' koin</b>' + (j.vip && j.vip.active ? ' · <b>VIP sampai ' + new Date(j.vip.expires_at).toLocaleDateString('id-ID') + '</b>' : '') + ' · perangkat: ' + j.devices.length + ' · unlock: ' + j.unlocks.length + (u.reading_private ? ' · papan peringkat: disembunyikan' : '') + '</p>'
         + '<form id="koin-adjust-form"><label>Ubah saldo (delta, bisa negatif)<input name="delta" type="number" required placeholder="mis. 100 atau -50"></label><label>Alasan (wajib)<input name="reason" required maxlength="200"></label><p style="display:flex;flex-wrap:wrap;gap:8px"><button type="submit">Simpan</button> <button type="button" id="koin-lock-btn">' + (u.locked ? 'Buka Kunci Akun' : 'Kunci Akun') + '</button> <button type="button" id="koin-verify-btn">' + (u.verified ? 'Cabut verifikasi' : 'Verifikasi ✓') + '</button> <button type="button" id="koin-ban2-btn">Ban Akun Ini</button></p></form>'
-        + '<h4>Yang sudah dibeli</h4>' + (j.unlocks.map(x => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + x.kind + ':' + x.target_id + ' S' + x.season + 'E' + x.no + '</span></div></div>').join('') || '<p>Belum ada unlock.</p>')
-        + '<h4>Terakhir dibaca</h4>' + (j.reading.map(x => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + x.kind + ':' + x.target_id + ' S' + x.season + 'E' + x.no + '</span><div class="adm-row-meta">' + Math.floor(x.seconds / 60) + ' menit · terakhir ' + x.last_day + '</div></div></div>').join('') || '<p>Belum ada riwayat baca.</p>')
-        + '<h4>Ledger</h4>' + (j.ledger.map(l => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + (l.delta > 0 ? '+' : '') + l.delta + ' → ' + l.balance_after + '</span><div class="adm-row-meta">' + l.reason + '</div></div></div>').join('') || '<p>Belum ada mutasi.</p>');
+        + '<h4>Yang sudah dibeli</h4>' + (j.unlocks.map(x => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + koinEsc(x.kind) + ':' + koinEsc(x.target_id) + ' S' + x.season + 'E' + x.no + '</span></div></div>').join('') || '<p>Belum ada unlock.</p>')
+        + '<h4>Terakhir dibaca</h4>' + (j.reading.map(x => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + koinEsc(x.kind) + ':' + koinEsc(x.target_id) + ' S' + x.season + 'E' + x.no + '</span><div class="adm-row-meta">' + Math.floor(x.seconds / 60) + ' menit · terakhir ' + koinEsc(x.last_day) + '</div></div></div>').join('') || '<p>Belum ada riwayat baca.</p>')
+        + '<h4>Ledger</h4>' + (j.ledger.map(l => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + (l.delta > 0 ? '+' : '') + l.delta + ' → ' + l.balance_after + '</span><div class="adm-row-meta">' + koinEsc(l.reason) + '</div></div></div>').join('') || '<p>Belum ada mutasi.</p>');
       document.getElementById('koin-user-detail').hidden = false;
       document.getElementById('koin-user-detail').scrollIntoView({ block: 'start' });
       document.getElementById('koin-adjust-form').addEventListener('submit', async (ev) => {
@@ -1520,7 +1566,7 @@ document.addEventListener('click', async (e) => {
 (async () => {
   try {
     const j = await koinFetch('/api/admin/cerpen-koin/vouchers', 'GET');
-    document.getElementById('koin-batches').innerHTML = '<h4>Batch voucher</h4>' + j.batches.map(b => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + b.batch_id + ' · ' + b.reward_label + '</span><div class="adm-row-meta">' + b.codes.redeemed + '/' + b.codes.total + ' kode ditukar · maks total ' + b.total_max + ' · maks per akun/perangkat ' + b.per_device_max + (b.valid_from ? ' · mulai ' + new Date(b.valid_from * 1000).toLocaleString('id-ID') : '') + (b.expires_at ? ' · sampai ' + new Date(b.expires_at * 1000).toLocaleString('id-ID') : ' · tanpa kedaluwarsa') + ' · ' + (b.active ? 'aktif' : 'DRAF') + '</div></div>' + (b.active ? '<button type="button" data-koin-batch-deact="' + b.batch_id + '">Nonaktifkan</button>' : '<button type="button" data-koin-batch-act="' + b.batch_id + '">Aktifkan</button>') + '</div>').join('');
+    document.getElementById('koin-batches').innerHTML = '<h4>Batch voucher</h4>' + j.batches.map(b => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + koinEsc(b.batch_id) + ' · ' + koinEsc(b.reward_label) + '</span><div class="adm-row-meta">' + b.codes.redeemed + '/' + b.codes.total + ' kode ditukar · maks total ' + b.total_max + ' · maks per akun/perangkat ' + b.per_device_max + (b.valid_from ? ' · mulai ' + new Date(b.valid_from * 1000).toLocaleString('id-ID') : '') + (b.expires_at ? ' · sampai ' + new Date(b.expires_at * 1000).toLocaleString('id-ID') : ' · tanpa kedaluwarsa') + ' · ' + (b.active ? 'aktif' : 'DRAF') + '</div></div>' + (b.active ? '<button type="button" data-koin-batch-deact="' + koinEsc(b.batch_id) + '">Nonaktifkan</button>' : '<button type="button" data-koin-batch-act="' + koinEsc(b.batch_id) + '">Aktifkan</button>') + '</div>').join('');
     document.querySelectorAll('[data-koin-batch-deact]').forEach(btn => btn.addEventListener('click', async () => {
       try { await koinFetch('/api/admin/cerpen-koin/vouchers/' + encodeURIComponent(btn.getAttribute('data-koin-batch-deact')) + '/deactivate', 'POST', {}); koinSay('Batch dinonaktifkan.', true); } catch (err) { koinSay(err.message); }
     }));

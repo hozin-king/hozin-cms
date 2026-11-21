@@ -29,7 +29,7 @@
 //    endpoint ban koin yang sudah ada). Bandingkan SELALU dengan detik,
 //    bukan Date.now() (ms) — bug D4 yang sudah dikenal (ban berjangka
 //    tak bekerja bila dibandingkan dengan ms) TIDAK diulang di sini.
-import { esc, clientIp, randomHex, sha256Hex, b64url } from './util.js';
+import { esc, clientIp, randomHex, sha256Hex, b64url, safeEqualHex, escapeLikeTerm } from './util.js';
 import { isAdmin, csrfToken, getCommenter } from './auth.js';
 import { checkRateLimit } from './security.js';
 import { getSetting } from './store.js';
@@ -108,15 +108,16 @@ export async function isCerpenAdminUser(env, userId) {
   return !!(await getCerpenAdminRow(env, userId));
 }
 
-// true bila akun ini admin DAN fingerprint-nya cocok dengan yang
-// terikat (atau belum terikat — pengikatan terjadi di resolveCerpenAdmin
-// saat register). Dipakai untuk LEWATI ban/deteksi di jalur track.
+// true bila akun ini admin DAN fingerprint-nya cocok dengan yang terikat.
+// Akun admin yang BELUM terikat TIDAK lolos (fail-closed — pengikatan
+// terjadi di resolveCerpenAdmin saat register). Dipakai untuk LEWATI
+// ban/deteksi di jalur track.
 export async function isCerpenAdmin(env, userId, fingerprintHash) {
   const row = await getCerpenAdminRow(env, userId);
   if (!row) return false;
   const bound = String(row.fingerprint_hash || '');
-  if (!bound) return true;
-  return bound === String(fingerprintHash || '');
+  if (!bound) return false;
+  return safeEqualHex(bound, String(fingerprintHash || ''));
 }
 
 // Ikat fingerprint pertama + kembalikan status admin untuk respons.
@@ -514,6 +515,15 @@ async function evaluateDetection(env, user, settings) {
   if (abuseScore > 0) {
     if (Number(user.is_emulator) === 1) signals.push({ kind: 'emulator_with_abuse', score: 10, detail: 'perangkat emulator + pola abuse' });
     if (user.integrity_status === 'failed') signals.push({ kind: 'integrity_failed_with_abuse', score: 10, detail: 'integritas perangkat gagal + pola abuse' });
+  }
+  // Integritas gagal SENDIRIAN (tanpa abuse lain): JANGAN tambah skor
+  // (aturan keras — HP root user sendiri bisa gagal Play Integrity), tapi
+  // catat jejaknya 1x/jam supaya lonjakan bisa diaudit admin.
+  if (user.integrity_status === 'failed') {
+    try {
+      const prior = await env.DB.prepare(`SELECT COUNT(*) AS c FROM cerpen_detection_events WHERE kind = ? AND owner_key = ? AND created_at >= ?`).bind('integrity_failed', ownerKey, since1h).first();
+      if ((Number(prior?.c) || 0) === 0) await logDetection(env, 'integrity_failed', { ownerKey, deviceId, userId: userId || null, detail: 'verifikasi Play Integrity gagal', score: 0 });
+    } catch (e) { /* jejak tidak boleh menggagalkan deteksi */ }
   }
   if (!signals.length) return { evaluated: true, score: 0, signals: [] };
   // Dedup per jenis 1 jam: jenis yang sudah tercatat tidak menambah skor lagi.
@@ -941,7 +951,7 @@ export async function handleCerpenTrackAdmin(request, env, url, admin) {
   const method = request.method;
   if (!path.startsWith('/api/admin/cerpen-track')) return null;
   if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
-  if (String(request.headers.get('x-csrf') || '') !== await csrfToken(env)) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
+  if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
   if (!(await checkRateLimit(env, 'track-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
   const q = (name) => url.searchParams.get(name) || '';
   const limitQ = (dflt, max) => Math.min(Math.max(parseInt(q('limit') || String(dflt), 10) || dflt, 1), max);
@@ -986,8 +996,8 @@ export async function handleCerpenTrackAdmin(request, env, url, admin) {
     const limit = limitQ(20, 50);
     let rows;
     if (term) {
-      const like = '%' + term + '%';
-      rows = await env.DB.prepare(`SELECT owner_key, user_id, device_id, device_model, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, is_rooted, is_emulator, integrity_status FROM cerpen_track_users WHERE owner_key LIKE ? OR device_id LIKE ? OR user_id LIKE ? ORDER BY last_seen DESC LIMIT ?`).bind(like, like, like, limit).all();
+      const like = '%' + escapeLikeTerm(term) + '%';
+      rows = await env.DB.prepare(`SELECT owner_key, user_id, device_id, device_model, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, is_rooted, is_emulator, integrity_status FROM cerpen_track_users WHERE owner_key LIKE ? ESCAPE '!' OR device_id LIKE ? ESCAPE '!' OR user_id LIKE ? ESCAPE '!' ORDER BY last_seen DESC LIMIT ?`).bind(like, like, like, limit).all();
     } else {
       rows = await env.DB.prepare(`SELECT owner_key, user_id, device_id, device_model, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, is_rooted, is_emulator, integrity_status FROM cerpen_track_users ORDER BY last_seen DESC LIMIT ?`).bind(limit).all();
     }
@@ -1342,7 +1352,8 @@ export async function renderCerpenTrackPanel(env, csrf, nav, notice) {
 <script>
 const TRACK_CSRF = "${csrf}";
 const trackMsg = document.getElementById('track-msg');
-function trackSay(t) { trackMsg.innerHTML = '<div class="card"><p>' + t + '</p></div>'; trackMsg.scrollIntoView(); }
+function trackEsc(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+function trackSay(t) { trackMsg.innerHTML = '<div class="card"><p>' + trackEsc(t) + '</p></div>'; trackMsg.scrollIntoView(); }
 async function trackFetch(url, method, body) {
   const res = await fetch(url, { method: method, headers: { 'x-csrf': TRACK_CSRF, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   let j = {}; try { j = await res.json(); } catch (e) {}
@@ -1355,7 +1366,7 @@ document.getElementById('track-user-search').addEventListener('submit', async (e
   const q = new FormData(e.target).get('q') || '';
   try {
     const j = await trackFetch('/api/admin/cerpen-track/users?q=' + encodeURIComponent(q) + '&limit=20', 'GET');
-    document.getElementById('track-users').innerHTML = j.users.map(u => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + (u.username || 'guest') + '</span><div class="adm-row-meta">' + u.owner_key + ' · ' + (u.device_model || '') + ' · ' + (u.app_version || '') + (u.banned ? ' · 🚫 dibanned' : '') + (u.is_rooted ? ' · ROOT' : '') + (u.is_emulator ? ' · EMULATOR' : '') + (u.integrity_status && u.integrity_status !== 'unknown' ? ' · integritas: ' + u.integrity_status : '') + '</div></div><button type="button" data-track-user="' + u.owner_key + '">Detail</button></div>').join('') || '<p>Tidak ada pengguna.</p>';
+    document.getElementById('track-users').innerHTML = j.users.map(u => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + (trackEsc(u.username) || 'guest') + '</span><div class="adm-row-meta">' + trackEsc(u.owner_key) + ' · ' + (trackEsc(u.device_model) || '') + ' · ' + (trackEsc(u.app_version) || '') + (u.banned ? ' · 🚫 dibanned' : '') + (u.is_rooted ? ' · ROOT' : '') + (u.is_emulator ? ' · EMULATOR' : '') + (u.integrity_status && u.integrity_status !== 'unknown' ? ' · integritas: ' + trackEsc(u.integrity_status) : '') + '</div></div><button type="button" data-track-user="' + trackEsc(u.owner_key) + '">Detail</button></div>').join('') || '<p>Tidak ada pengguna.</p>';
   } catch (err) { trackSay(err.message); }
 });
 document.getElementById('track-ban-form').addEventListener('submit', async (e) => {
@@ -1390,19 +1401,19 @@ document.addEventListener('click', async (e) => {
       const j = await trackFetch('/api/admin/cerpen-track/users/' + encodeURIComponent(t.getAttribute('data-track-user')), 'GET');
       const u = j.user;
       const flags = [];
-      if (u.is_rooted) flags.push('ROOT' + (u.root_methods ? ' (' + u.root_methods + ')' : ''));
-      if (u.is_emulator) flags.push('EMULATOR' + (u.emulator_signals ? ' (' + u.emulator_signals + ')' : ''));
+      if (u.is_rooted) flags.push('ROOT' + (u.root_methods ? ' (' + trackEsc(u.root_methods) + ')' : ''));
+      if (u.is_emulator) flags.push('EMULATOR' + (u.emulator_signals ? ' (' + trackEsc(u.emulator_signals) + ')' : ''));
       if (u.bootloader_locked === 0) flags.push('bootloader tidak terkunci');
       if (u.custom_rom) flags.push('custom ROM');
-      flags.push('integritas: ' + (u.integrity_status || 'unknown') + (u.integrity_verified ? ' (terverifikasi server)' : ''));
-      document.getElementById('track-user-detail-body').innerHTML = '<p><b>' + (u.username || 'guest') + '</b> · ' + u.owner_key + ' · ' + (u.device_model || '') + ' · app ' + (u.app_version || '') + '</p>'
-        + '<p>Flag: ' + (flags.join(' · ') || 'tidak ada') + ' · fingerprint: <code>' + (u.fingerprint_prefix || '') + '…</code></p>'
-        + '<p>Profil perilaku: ' + j.profile.total_sessions + ' sesi · rata-rata ' + Math.round(j.profile.avg_session_seconds) + ' detik · series teratas: ' + (j.profile.series_top.join(', ') || '-') + '</p>'
-        + '<h4>Sesi baca terakhir</h4>' + (j.sessions.map(s => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + s.kind + ':' + s.target_id + ' S' + s.season + 'E' + s.no + '</span><div class="adm-row-meta">' + Math.floor((s.seconds || 0) / 60) + ' menit · ' + new Date(s.started_at).toLocaleString('id-ID') + '</div></div></div>').join('') || '<p>Belum ada sesi.</p>')
-        + '<h4>Perintah</h4>' + (j.commands.map(c => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + c.kind + ' · ' + c.status + '</span><div class="adm-row-meta">' + (c.note || '') + '</div></div></div>').join('') || '<p>Belum ada perintah.</p>')
-        + '<h4>Ban</h4>' + (j.bans.map(b => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + b.target_type + ': ' + b.reason + '</span><div class="adm-row-meta">' + (b.active ? 'AKTIF' : 'dicabut') + '</div></div></div>').join('') || '<p>Belum pernah dibanned.</p>')
-        + '<h4>Penukaran kode</h4>' + (j.redemptions.map(r => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + r.batch_id + ' · ' + r.code_prefix + '…</span><div class="adm-row-meta">' + new Date(r.created_at).toLocaleString('id-ID') + '</div></div></div>').join('') || '<p>Belum ada penukaran.</p>')
-        + '<h4>Kunci API</h4>' + (j.api_keys.map(k => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + k.key_id + ' · ' + k.status + '</span><div class="adm-row-meta">' + (k.revoke_reason || '') + '</div></div></div>').join('') || '<p>Belum ada kunci.</p>');
+      flags.push('integritas: ' + trackEsc(u.integrity_status || 'unknown') + (u.integrity_verified ? ' (terverifikasi server)' : ''));
+      document.getElementById('track-user-detail-body').innerHTML = '<p><b>' + (trackEsc(u.username) || 'guest') + '</b> · ' + trackEsc(u.owner_key) + ' · ' + trackEsc(u.device_model || '') + ' · app ' + trackEsc(u.app_version || '') + '</p>'
+        + '<p>Flag: ' + (flags.join(' · ') || 'tidak ada') + ' · fingerprint: <code>' + trackEsc(u.fingerprint_prefix || '') + '…</code></p>'
+        + '<p>Profil perilaku: ' + j.profile.total_sessions + ' sesi · rata-rata ' + Math.round(j.profile.avg_session_seconds) + ' detik · series teratas: ' + trackEsc(j.profile.series_top.join(', ') || '-') + '</p>'
+        + '<h4>Sesi baca terakhir</h4>' + (j.sessions.map(s => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + trackEsc(s.kind) + ':' + trackEsc(s.target_id) + ' S' + s.season + 'E' + s.no + '</span><div class="adm-row-meta">' + Math.floor((s.seconds || 0) / 60) + ' menit · ' + new Date(s.started_at).toLocaleString('id-ID') + '</div></div></div>').join('') || '<p>Belum ada sesi.</p>')
+        + '<h4>Perintah</h4>' + (j.commands.map(c => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + trackEsc(c.kind) + ' · ' + trackEsc(c.status) + '</span><div class="adm-row-meta">' + trackEsc(c.note || '') + '</div></div></div>').join('') || '<p>Belum ada perintah.</p>')
+        + '<h4>Ban</h4>' + (j.bans.map(b => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + trackEsc(b.target_type) + ': ' + trackEsc(b.reason) + '</span><div class="adm-row-meta">' + (b.active ? 'AKTIF' : 'dicabut') + '</div></div></div>').join('') || '<p>Belum pernah dibanned.</p>')
+        + '<h4>Penukaran kode</h4>' + (j.redemptions.map(r => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + trackEsc(r.batch_id) + ' · ' + trackEsc(r.code_prefix) + '…</span><div class="adm-row-meta">' + new Date(r.created_at).toLocaleString('id-ID') + '</div></div></div>').join('') || '<p>Belum ada penukaran.</p>')
+        + '<h4>Kunci API</h4>' + (j.api_keys.map(k => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + trackEsc(k.key_id) + ' · ' + trackEsc(k.status) + '</span><div class="adm-row-meta">' + trackEsc(k.revoke_reason || '') + '</div></div></div>').join('') || '<p>Belum ada kunci.</p>');
       document.getElementById('track-user-detail').hidden = false;
       document.getElementById('track-user-detail').scrollIntoView({ block: 'start' });
     }
@@ -1423,11 +1434,11 @@ document.addEventListener('click', async (e) => {
 (async () => {
   try {
     const j = await trackFetch('/api/admin/cerpen-track/redeems?limit=20', 'GET');
-    document.getElementById('track-redeems').innerHTML = j.redeems.map(r => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + (r.username || 'guest') + ' · ' + r.code_prefix + '…</span><div class="adm-row-meta">' + (r.reward || '') + ' · batch ' + r.batch_id + ' · ' + new Date(r.created_at).toLocaleString('id-ID') + '</div></div></div>').join('') || '<p>Belum ada penukaran.</p>';
+    document.getElementById('track-redeems').innerHTML = j.redeems.map(r => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + (trackEsc(r.username) || 'guest') + ' · ' + trackEsc(r.code_prefix) + '…</span><div class="adm-row-meta">' + trackEsc(r.reward || '') + ' · batch ' + trackEsc(r.batch_id) + ' · ' + new Date(r.created_at).toLocaleString('id-ID') + '</div></div></div>').join('') || '<p>Belum ada penukaran.</p>';
   } catch (err) { document.getElementById('track-redeems').innerHTML = '<p>Gagal memuat log redeem.</p>'; }
   try {
     const j = await trackFetch('/api/admin/cerpen-track/commands?status=pending&limit=10', 'GET');
-    document.getElementById('track-commands').innerHTML = '<h4>Pending</h4>' + j.commands.map(c => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + c.kind + ' → ' + c.owner_key + '</span><div class="adm-row-meta">' + (c.note || '') + '</div></div><button type="button" data-track-cmd-cancel="' + c.id + '">Batalkan</button></div>').join('') || '<p>Tidak ada perintah pending.</p>';
+    document.getElementById('track-commands').innerHTML = '<h4>Pending</h4>' + j.commands.map(c => '<div class="adm-row"><div class="adm-row-body"><span class="adm-row-title">' + trackEsc(c.kind) + ' → ' + trackEsc(c.owner_key) + '</span><div class="adm-row-meta">' + trackEsc(c.note || '') + '</div></div><button type="button" data-track-cmd-cancel="' + trackEsc(c.id) + '">Batalkan</button></div>').join('') || '<p>Tidak ada perintah pending.</p>';
     document.querySelectorAll('[data-track-cmd-cancel]').forEach(btn => btn.addEventListener('click', async () => {
       try { await trackFetch('/api/admin/cerpen-track/commands/' + encodeURIComponent(btn.getAttribute('data-track-cmd-cancel')) + '/cancel', 'POST', {}); trackSay('Perintah dibatalkan.', true); } catch (err) { trackSay(err.message); }
     }));

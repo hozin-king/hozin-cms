@@ -1,17 +1,26 @@
 // Auth WorkerCMS — sesi admin (akses HMAC 1 jam + refresh rotasi),
 // akun komentator, kunci post, dan password PBKDF2.
-import { hmacHex, parseCookies, b64url, sha256Hex, randomHex, clientIp } from './util.js';
+import { hmacHex, parseCookies, b64url, sha256Hex, randomHex, clientIp, safeEqualHex } from './util.js';
 
 const ACCESS_TTL_MS = 60 * 60 * 1000;
 const REFRESH_TTL_MS = 24 * 3600 * 1000;
 const REFRESH_REMEMBER_TTL_MS = 30 * 24 * 3600 * 1000;
+
+// Secret untuk HMAC sesi/CSRF: SESSION_SECRET bila diset, kalau tidak
+// ADMIN_TOKEN (kompatibel mundur). Memisahkan secret sesi dari token login
+// supaya bocornya satu tidak langsung membobol yang lain. Bila
+// SESSION_SECRET baru dipasang, semua sesi lama batal (HMAC berubah) —
+// admin cukup login ulang sekali.
+export function sessionSecret(env) {
+  return env.SESSION_SECRET || env.ADMIN_TOKEN || '';
+}
 
 export async function isAdmin(request, env) {
   if (!env.ADMIN_TOKEN) return false;
   const cookie = parseCookies(request).cms_access || '';
   const [exp, sig] = cookie.split('.');
   if (!exp || !sig || Number(exp) < Date.now()) return false;
-  return sig === await hmacHex(env.ADMIN_TOKEN, 'access:' + exp);
+  return safeEqualHex(sig, await hmacHex(sessionSecret(env), 'access:' + exp));
 }
 export function sessionExp(request) {
   const cookie = parseCookies(request).cms_access || '';
@@ -24,11 +33,15 @@ export function sessionExp(request) {
 // rotasi. Karena hanya ada satu admin, token CSRF tetap yang hanya diketahui
 // admin yang login sudah cukup melawan pemalsuan lintas situs.
 export async function csrfToken(env) {
-  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'csrf') : '';
+  // Sentinel bila secret belum diset: JANGAN kembalikan '' — '' === ''
+  // akan meloloskan cek CSRF di endpoint yang tidak memeriksa isAdmin dulu
+  // (mis. logout) saat ADMIN_TOKEN kosong.
+  const s = sessionSecret(env);
+  return s ? await hmacHex(s, 'csrf') : 'missing-secret';
 }
 
 export function accessCookie(env, exp) {
-  return hmacHex(env.ADMIN_TOKEN, 'access:' + exp).then(sig =>
+  return hmacHex(sessionSecret(env), 'access:' + exp).then(sig =>
     `cms_access=${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ACCESS_TTL_MS / 1000)}`);
 }
 export async function issueTokens(env, request, remember) {
@@ -165,7 +178,8 @@ export async function verifyPassword(password, saltHex, hashHex) {
   return diff === 0;
 }
 export async function userCsrf(env, userId) {
-  return env.ADMIN_TOKEN ? await hmacHex(env.ADMIN_TOKEN, 'user-csrf:' + userId) : '';
+  const s = sessionSecret(env);
+  return s ? await hmacHex(s, 'user-csrf:' + userId) : 'missing-secret';
 }
 export async function getCommenter(request, env) {
   if (!env.ADMIN_TOKEN) return null;
@@ -174,13 +188,13 @@ export async function getCommenter(request, env) {
   if (parts.length !== 3) return null;
   const [userId, exp, sig] = parts;
   if (!userId || !exp || !sig || Number(exp) < Date.now()) return null;
-  if (sig !== await hmacHex(env.ADMIN_TOKEN, 'user:' + userId + ':' + exp)) return null;
+  if (!safeEqualHex(sig, await hmacHex(sessionSecret(env), 'user:' + userId + ':' + exp))) return null;
   const row = await env.DB.prepare(`SELECT * FROM cms_users WHERE id = ?`).bind(userId).first();
   return row || null;
 }
 export async function userSessionCookie(env, userId) {
   const exp = String(Date.now() + 30 * 24 * 3600 * 1000);
-  const sig = await hmacHex(env.ADMIN_TOKEN, 'user:' + userId + ':' + exp);
+  const sig = await hmacHex(sessionSecret(env), 'user:' + userId + ':' + exp);
   return `cms_user=${userId}.${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${30 * 24 * 3600}`;
 }
 export function unlockCookieName(postId) {
@@ -193,10 +207,10 @@ export async function isPostUnlocked(request, env, postId) {
   if (parts.length !== 2) return false;
   const [exp, sig] = parts;
   if (!exp || !sig || Number(exp) < Date.now()) return false;
-  return sig === await hmacHex(env.ADMIN_TOKEN, 'post-unlock:' + postId + ':' + exp);
+  return safeEqualHex(sig, await hmacHex(sessionSecret(env), 'post-unlock:' + postId + ':' + exp));
 }
 export async function postUnlockCookie(env, postId) {
   const exp = String(Date.now() + 24 * 3600 * 1000);
-  const sig = await hmacHex(env.ADMIN_TOKEN, 'post-unlock:' + postId + ':' + exp);
+  const sig = await hmacHex(sessionSecret(env), 'post-unlock:' + postId + ':' + exp);
   return `${unlockCookieName(postId)}=${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${24 * 3600}`;
 }

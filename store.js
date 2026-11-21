@@ -366,5 +366,5 @@ export async function renderPage(env, pageTitle, content, opts = {}) {
   const pageUrl = typeof opts.pageUrl === 'string' && /^https:\/\/[^"'<\s]+$/.test(opts.pageUrl) ? opts.pageUrl : '';
   const ogType = opts.ogType === 'article' ? 'article' : 'website';
   const theme = themes[themeId] || themes.terang;
-  return theme.render({ siteTitle: esc(siteTitle), pageTitle: esc(pageTitle), content, siteAvatar, metaDesc: opts.metaDesc || '', navbar: navbarId, adsenseClient, metaImage, pageUrl, ogType });
+  return theme.render({ siteTitle, pageTitle, content, siteAvatar, metaDesc: opts.metaDesc || '', navbar: navbarId, adsenseClient, metaImage, pageUrl, ogType });
 }
