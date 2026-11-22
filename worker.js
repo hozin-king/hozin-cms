@@ -35,6 +35,7 @@ import { handleSocialApi, handleSocialAdminApi, handleBookmarksApi, renderSocial
 import { resolveCerpenRelease, enforceCerpenAppGate, CERPEN_MIN_VERSION } from './cerpen-gate.js';
 import { handleCerpenTrackApi, handleCerpenTrackAdmin, renderCerpenTrackPanel, enforceCerpenApiKeyIfPresent } from './cerpen-admin.js';
 import { handleDlRedirect, tryDlRedirect, renderDlPanel, handleDlCreate, handleDlToggle, DL_HOST, DL_WORKERS_DEV_HOST } from './dl.js';
+import { handleHubApi, renderHubPanel } from './hub.js';
 export { resetCerpenReleaseCacheForTest } from './cerpen-gate.js';
 import { isScheduled, visibilityLabel, postCard, renderCommentsTree, adBanner, viewEye, tagLinks } from './content.js';
 import { wibParts, computeReadingStats, pickFirstVisit, formatStopwatch, STOPWATCH_EVENTS, nextEventMs, readingTrackerScript, HEARTBEAT_MAX_SECONDS, READING_DAILY_CAP_SECONDS, READING_RATE_LIMIT, READING_RATE_WINDOW_MS } from './reading.js';
@@ -367,7 +368,7 @@ body.nav-modern{padding-bottom:132px}
 </style>`;
 
 function adminNav(current) {
-  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/cerpen-pantau', 'Pantau Cerpen'], ['/kendali/statistik', 'Statistik'], ['/kendali/laporan', 'Laporan'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper'], ['/kendali/taptap', 'Tap Tap'], ['/kendali/dl', 'Link Download']];
+  const items = [['/kendali', 'Dashboard'], ['/kendali/super', 'Super Panel'], ['/kendali/posts', 'Post'], ['/kendali/posts/new', 'Post Baru'], ['/kendali/comments', 'Komentar'], ['/kendali/users', 'Akun'], ['/kendali/baca', 'Waktu Baca'], ['/kendali/plugins', 'Plugin'], ['/kendali/settings', 'Pengaturan'], ['/kendali/sessions', 'Sesi'], ['/kendali/backup', 'Backup'], ['/kendali/cerpen-api', 'Cerpen API'], ['/kendali/koin', 'Koin'], ['/kendali/cerpen-pantau', 'Pantau Cerpen'], ['/kendali/statistik', 'Statistik'], ['/kendali/laporan', 'Laporan'], ['/kendali/md-backup', 'Backup .md'], ['/kendali/tamper', 'Tamper'], ['/kendali/taptap', 'Tap Tap'], ['/kendali/dl', 'Link Download'], ['/kendali/hub', 'Hub Muse']];
   return ADMIN_CSS + '<nav class="adm-nav" aria-label="Navigasi admin">' + items.map(([href, label]) => '<a href="' + href + '"' + (href === current ? ' class="on" aria-current="page"' : '') + '>' + label + '</a>').join('') + '</nav>';
 }
 
@@ -4084,6 +4085,17 @@ async function handleFetch(request, env, ctx) {
       }
     }
 
+    // ---- Hub Muse (22 Nov 2026, modul hub.js) ----
+    // /api/hub/* — tukar perintah antar-Muse (Alyaa, Sekar, dst) + panel
+    // /kendali/hub. Auth: kunci Muse (Bearer/x-hub-key) atau sesi admin +
+    // x-csrf. Ditempatkan di sini (sebelum blok POST admin yang memanggil
+    // request.formData()): body JSON akan error di formData() bila sampai
+    // ke sana.
+    if (path.startsWith('/api/hub/')) {
+      const r = await handleHubApi(request, env, url, admin);
+      if (r) return r;
+    }
+
     // ---- Publik: konten Cerpen Hozin dari D1 (aplikasi Android, v63, 12 Nov 2026) ----
     // Aplikasi Cerpen mengambil daftar + isi dari sini (dulu dari file .enc
     // di repo GitHub). Isi episode/panel TETAP terenkripsi AES-256-GCM
@@ -5230,7 +5242,7 @@ requestAnimationFrame(draw);
     // Logika: tiap urusan punya halamannya sendiri, supaya menulis post
     // tidak harus melewati Backup, Sesi, Pengaturan, Komentar, dan Plugin.
     // /kendali = ringkasan + navigasi saja. Post Baru = /kendali/posts/new.
-    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/cerpen-pantau' || path === '/kendali/statistik' || path === '/kendali/laporan' || path === '/kendali/md-backup' || path === '/kendali/tamper' || path === '/kendali/taptap' || path === '/kendali/dl')) {
+    if (admin && request.method === 'GET' && (path === '/kendali' || path === '/kendali/super' || path === '/kendali/posts' || path === '/kendali/posts/new' || path === '/kendali/comments' || path === '/kendali/users' || path === '/kendali/baca' || path === '/kendali/plugins' || path === '/kendali/settings' || path === '/kendali/sessions' || path === '/kendali/backup' || path === '/kendali/cerpen-api' || path === '/kendali/koin' || path === '/kendali/cerpen-pantau' || path === '/kendali/statistik' || path === '/kendali/laporan' || path === '/kendali/md-backup' || path === '/kendali/tamper' || path === '/kendali/taptap' || path === '/kendali/dl' || path === '/kendali/hub')) {
       const csrf = await csrfToken(env);
       const csrfField = `<input type="hidden" name="csrf" value="${csrf}">`;
       const nav = adminNav(path);
@@ -5263,6 +5275,11 @@ requestAnimationFrame(draw);
       if (path === '/kendali/dl') {
         const content = await renderDlPanel(env, csrf, nav, noticeHtml(url), url);
         return html(await renderPage(env, 'Link Download', content));
+      }
+      // ---- Admin: Hub Muse (modul hub.js) ----
+      if (path === '/kendali/hub') {
+        const content = await renderHubPanel(env, csrf, nav, noticeHtml(url), url);
+        return html(await renderPage(env, 'Hub Muse', content));
       }
       // ---- Admin: panel kontrol API Cerpen (v66) ----
       // Statistik + keys + submissions + audit, semua dari D1 stopwatch-db

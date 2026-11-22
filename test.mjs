@@ -81,6 +81,9 @@ class MockDB {
     this.securityEventSeq = 3;
     // v1.0.33: laporan tamper FB Manager (tabel app_tamper_reports)
     this.tamperReports = [];
+    // Hub Muse (22 Nov 2026): hub_muses + hub_tasks (cms-db).
+    this.hubMuses = []; // {id, name, key_hash, room, created_at, last_seen_at}
+    this.hubTasks = []; // {id, room, from_muse, to_muse, title, body, status, done_note, created_at, updated_at}
     // v86: fixture gambar + versi Cerpen (tabel cerpen_images + cerpen_version, D1 stopwatch-db)
     // data berupa Array angka — bentuk asli BLOB dari D1 (bukan string).
     this.cerpenImages = [{ path: 'covers/cover_01.jpg.enc', data: [...new TextEncoder().encode('GAMBAR-ENKRIPSI-UJI')], sha256: 'abc123', size: 20 }];
@@ -1478,6 +1481,22 @@ class MockDB {
       const u = this.users.get(a[0]);
       return u ? [{ username: u.username }] : [];
     }
+
+    // -- Hub Muse (22 Nov 2026) --
+    if (s.startsWith('SELECT id, name, room, created_at, last_seen_at FROM hub_muses WHERE key_hash = ?')) return this.hubMuses.filter(m => m.key_hash === a[0]).map(m => ({ id: m.id, name: m.name, room: m.room, created_at: m.created_at, last_seen_at: m.last_seen_at }));
+    if (s.startsWith('UPDATE hub_muses SET last_seen_at = ? WHERE id = ?')) { const m = this.hubMuses.find(x => x.id === a[1]); if (m) m.last_seen_at = a[0]; return []; }
+    if (s === 'SELECT COUNT(*) AS c FROM hub_muses') return [{ c: this.hubMuses.length }];
+    if (s === "SELECT COUNT(*) AS c FROM hub_tasks WHERE status = 'baru'") return [{ c: this.hubTasks.filter(t => t.status === 'baru').length }];
+    if (s === "SELECT COUNT(*) AS c FROM hub_tasks WHERE status = 'dikerjakan'") return [{ c: this.hubTasks.filter(t => t.status === 'dikerjakan').length }];
+    if (s === "SELECT COUNT(*) AS c FROM hub_tasks WHERE status = 'selesai'") return [{ c: this.hubTasks.filter(t => t.status === 'selesai').length }];
+    if (s.startsWith('SELECT id, room, from_muse, to_muse, title, body, status, done_note, created_at, updated_at FROM hub_tasks ORDER BY created_at DESC LIMIT 200')) return [...this.hubTasks].sort((x, y) => y.created_at - x.created_at).map(t => ({ ...t }));
+    if (s.startsWith('SELECT id, room, from_muse, to_muse, title, body, status, done_note, created_at, updated_at FROM hub_tasks ORDER BY created_at DESC LIMIT 50')) return [...this.hubTasks].sort((x, y) => y.created_at - x.created_at).slice(0, 50).map(t => ({ ...t }));
+    if (s.startsWith('SELECT id FROM hub_muses WHERE id = ?')) return this.hubMuses.filter(m => m.id === a[0]).map(m => ({ id: m.id }));
+    if (s.startsWith('INSERT INTO hub_tasks')) { this.hubTasks.push({ id: a[0], room: a[1], from_muse: a[2], to_muse: a[3], title: a[4], body: a[5], status: 'baru', done_note: '', created_at: a[6], updated_at: a[7] }); return []; }
+    if (s.startsWith('SELECT id, room, from_muse, to_muse, title, body, status, done_note, created_at, updated_at FROM hub_tasks WHERE id = ?')) return this.hubTasks.filter(t => t.id === a[0]).map(t => ({ ...t }));
+    if (s.startsWith('UPDATE hub_tasks SET status = ?, done_note = ?, updated_at = ? WHERE id = ?')) { const t = this.hubTasks.find(x => x.id === a[3]); if (t) { t.status = a[0]; t.done_note = a[1]; t.updated_at = a[2]; } return []; }
+    if (s.startsWith('SELECT id, name, room, created_at, last_seen_at FROM hub_muses ORDER BY created_at ASC')) return [...this.hubMuses].sort((x, y) => x.created_at - y.created_at).map(m => ({ id: m.id, name: m.name, room: m.room, created_at: m.created_at, last_seen_at: m.last_seen_at }));
+    if (s.startsWith('INSERT INTO hub_muses')) { this.hubMuses.push({ id: a[0], name: a[1], key_hash: a[2], room: a[3], created_at: a[4], last_seen_at: null }); return []; }
 
     throw new Error('Mock SQL tidak dikenal: ' + s);
   }
@@ -4764,5 +4783,77 @@ assert(await isCerpenAdmin(env, 'u-tidakada', ADMIN_FP_HASH) === false, 'audit: 
 env.DB.cerpenAdmins.get(ADMIN_UID).fingerprint_hash = '';
 assert(await isCerpenAdmin(env, ADMIN_UID, ADMIN_FP_HASH) === false, 'audit: isCerpenAdmin belum terikat -> false (fail-closed)');
 env.DB.cerpenAdmins.get(ADMIN_UID).fingerprint_hash = ADMIN_FP_HASH;
+
+// ---- Hub Muse (22 Nov 2026): tukar perintah antar-Muse ----
+async function hubCall(method, path, obj, headers = {}) {
+  const h = { 'content-type': 'application/json', ...headers };
+  const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
+  return worker.fetch(req, env);
+}
+// Tanpa auth -> 401 di semua endpoint hub.
+r = await hubCall('GET', '/api/hub/status', null);
+assert(r.status === 401, 'hub: status tanpa auth -> 401');
+r = await hubCall('GET', '/api/hub/tasks?to=alyaa&status=baru', null);
+assert(r.status === 401, 'hub: tasks tanpa auth -> 401');
+r = await hubCall('POST', '/api/hub/tasks', { to_muse: 'sekar', title: 'x' });
+assert(r.status === 401, 'hub: buat tugas tanpa auth -> 401');
+r = await hubCall('GET', '/api/hub/muses', null);
+assert(r.status === 401, 'hub: daftar muse tanpa auth -> 401');
+r = await hubCall('POST', '/api/hub/muses', { id: 'alyaa', name: 'Alyaa' });
+assert(r.status === 401, 'hub: daftar muse tanpa auth -> 401');
+// Login admin baru untuk rangkaian tes hub.
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' });
+const hubCookie = cookieHeader(cookiesOf(r));
+assert(hubCookie.includes('cms_access='), 'hub: login admin untuk tes hub');
+r = await call('GET', '/kendali/hub', null, hubCookie); t = await r.text();
+assert(r.status === 200 && t.includes('Hub Muse'), 'hub: panel /kendali/hub render sebagai admin');
+const hubCsrf = (t.match(/HUB_CSRF = "([^"]+)"/) || [])[1] || '';
+assert(hubCsrf.length > 10, 'hub: CSRF panel hub terbaca');
+const hubAdmH = { cookie: hubCookie, 'x-csrf': hubCsrf };
+// Daftarkan alyaa + sekar (kunci tampil sekali di respons).
+r = await hubCall('POST', '/api/hub/muses', { id: 'alyaa', name: 'Alyaa' }, hubAdmH);
+let hj = await r.json();
+assert(r.status === 201 && hj.ok && typeof hj.key === 'string' && hj.key.startsWith('hb-'), 'hub: daftar alyaa -> 201 + kunci hb-');
+const ALYAA_KEY = hj.key;
+assert(!('key_hash' in hj) && !('key_hash' in (hj.muse || {})), 'hub: respons daftar tidak membocorkan key_hash');
+const alyaaHash = await sha256Hex(ALYAA_KEY);
+assert(env.DB.hubMuses.some(m => m.id === 'alyaa' && m.key_hash === alyaaHash), 'hub: hanya hash kunci yang tersimpan di D1');
+r = await hubCall('POST', '/api/hub/muses', { id: 'alyaa', name: 'Duplikat' }, hubAdmH);
+assert(r.status === 409, 'hub: id duplikat -> 409');
+r = await hubCall('POST', '/api/hub/muses', { id: 'sekar', name: 'Sekar Larasati' }, hubAdmH);
+hj = await r.json();
+assert(r.status === 201 && hj.ok, 'hub: daftar sekar -> 201');
+const SEKAR_KEY = hj.key;
+// Daftar muse (admin) — tanpa key_hash.
+r = await hubCall('GET', '/api/hub/muses', null, hubAdmH); hj = await r.json();
+assert(r.status === 200 && hj.muses.length === 2 && !('key_hash' in hj.muses[0]), 'hub: daftar muse admin -> 2 muse, tanpa key_hash');
+// Alyaa buat tugas untuk Sekar.
+r = await hubCall('POST', '/api/hub/tasks', { to_muse: 'sekar', title: 'Tulis cerpen-140', body: 'Tema: pasar malam.' }, { authorization: 'Bearer ' + ALYAA_KEY });
+hj = await r.json();
+assert(r.status === 201 && hj.task && hj.task.from_muse === 'alyaa' && hj.task.to_muse === 'sekar' && hj.task.status === 'baru', 'hub: alyaa buat tugas untuk sekar -> 201');
+const TASK_ID = hj.task.id;
+// Sekar polling tugas baru.
+r = await hubCall('GET', '/api/hub/tasks?to=sekar&status=baru', null, { authorization: 'Bearer ' + SEKAR_KEY }); hj = await r.json();
+assert(r.status === 200 && hj.tasks.length === 1 && hj.tasks[0].id === TASK_ID, 'hub: sekar polling tugas baru -> 1 tugas');
+// Alyaa tidak boleh mengintip antrean Sekar.
+r = await hubCall('GET', '/api/hub/tasks?to=sekar&status=baru', null, { authorization: 'Bearer ' + ALYAA_KEY });
+assert(r.status === 403, 'hub: alyaa intip antrean sekar -> 403');
+// Kunci salah -> 401.
+r = await hubCall('GET', '/api/hub/tasks?to=sekar', null, { authorization: 'Bearer hb-0000000000000000000000000000000000000000000000000000000000000000' });
+assert(r.status === 401, 'hub: kunci salah -> 401');
+// Sekar ubah status + catatan.
+r = await hubCall('POST', '/api/hub/tasks/' + TASK_ID + '/status', { status: 'dikerjakan', note: 'mulai menulis' }, { authorization: 'Bearer ' + SEKAR_KEY }); hj = await r.json();
+assert(r.status === 200 && hj.task.status === 'dikerjakan' && hj.task.done_note === 'mulai menulis', 'hub: sekar ubah status -> dikerjakan');
+// Alyaa tidak boleh ubah status tugas Sekar; status tidak valid -> 400.
+r = await hubCall('POST', '/api/hub/tasks/' + TASK_ID + '/status', { status: 'selesai' }, { authorization: 'Bearer ' + ALYAA_KEY });
+assert(r.status === 403, 'hub: alyaa ubah status tugas sekar -> 403');
+r = await hubCall('POST', '/api/hub/tasks/' + TASK_ID + '/status', { status: 'ngaco' }, { authorization: 'Bearer ' + SEKAR_KEY });
+assert(r.status === 400, 'hub: status tidak valid -> 400');
+// Health dengan kunci Muse.
+r = await hubCall('GET', '/api/hub/status', null, { authorization: 'Bearer ' + SEKAR_KEY }); hj = await r.json();
+assert(r.status === 200 && hj.ok && hj.muses === 2 && hj.tasks_baru === 0 && hj.tasks_dikerjakan === 1, 'hub: status health -> muses 2, baru 0, dikerjakan 1');
+// Panel tanpa admin -> dialihkan ke login.
+r = await call('GET', '/kendali/hub');
+assert(r.status === 303 || r.status === 302, 'hub: panel tanpa admin -> redirect login');
 
 console.log('Selesai, exitCode=' + (process.exitCode || 0));

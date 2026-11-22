@@ -127,6 +127,13 @@ export async function ensureSchema(env) {
         `CREATE TABLE IF NOT EXISTS dl_clicks (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, code TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '', referer TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '')`,
         `CREATE INDEX IF NOT EXISTS idx_dl_clicks_code_ts ON dl_clicks (code, ts)`,
         `CREATE INDEX IF NOT EXISTS idx_dl_clicks_ts ON dl_clicks (ts)`,
+        // 22 Nov 2026: Hub Muse — tukar perintah antar-Muse (Office
+        // Online). Kunci Muse disimpan HANYA sebagai hash SHA-256.
+        `CREATE TABLE IF NOT EXISTS hub_muses (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL, room TEXT NOT NULL DEFAULT 'kantor', created_at INTEGER NOT NULL, last_seen_at INTEGER)`,
+        `CREATE TABLE IF NOT EXISTS hub_tasks (id TEXT PRIMARY KEY, room TEXT NOT NULL DEFAULT 'kantor', from_muse TEXT NOT NULL, to_muse TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'baru', done_note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+        `CREATE INDEX IF NOT EXISTS idx_hub_tasks_to_status ON hub_tasks (to_muse, status, created_at)`,
+        `CREATE INDEX IF NOT EXISTS idx_hub_tasks_room ON hub_tasks (room, created_at)`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_hub_muses_key_hash ON hub_muses (key_hash)`,
       ];
       // 11 Nov 2026 (performa): DDL dieksekusi via SATU batch, bukan
       // ~30 round-trip D1 berurutan — di isolate dingin tiap round-trip

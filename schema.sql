@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS dl_links (code TEXT PRIMARY KEY, target_url TEXT NOT 
 CREATE TABLE IF NOT EXISTS dl_clicks (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, code TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '', referer TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS idx_dl_clicks_code_ts ON dl_clicks (code, ts);
 CREATE INDEX IF NOT EXISTS idx_dl_clicks_ts ON dl_clicks (ts);
+-- Hub Muse (22 Nov 2026) — tukar perintah antar-Muse (Office Online).
+-- Kunci Muse disimpan HANYA sebagai hash SHA-256 (key_hash).
+CREATE TABLE IF NOT EXISTS hub_muses (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL, room TEXT NOT NULL DEFAULT 'kantor', created_at INTEGER NOT NULL, last_seen_at INTEGER);
+CREATE TABLE IF NOT EXISTS hub_tasks (id TEXT PRIMARY KEY, room TEXT NOT NULL DEFAULT 'kantor', from_muse TEXT NOT NULL, to_muse TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'baru', done_note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_hub_tasks_to_status ON hub_tasks (to_muse, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_hub_tasks_room ON hub_tasks (room, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hub_muses_key_hash ON hub_muses (key_hash);
 
 CREATE TABLE IF NOT EXISTS dracin_catalog (platform TEXT NOT NULL, title_id TEXT NOT NULL, title TEXT NOT NULL, cover_url TEXT NOT NULL DEFAULT '', synopsis TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT '', episode_count INTEGER NOT NULL DEFAULT 0, free_count INTEGER NOT NULL DEFAULT 0, locked_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (platform, title_id));
 CREATE TABLE IF NOT EXISTS dracin_episodes (platform TEXT NOT NULL, title_id TEXT NOT NULL, idx INTEGER NOT NULL, item_id TEXT NOT NULL, duration_s REAL NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (platform, title_id, idx));
