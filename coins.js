@@ -488,14 +488,14 @@ export async function handleCoinApi(request, env, url, adminEmail) {
   // ---- Auth aplikasi: logout (sesi stateless — aplikasi hapus sesinya sendiri) ----
   if (method === 'POST' && path === '/api/cerpen-auth/logout') {
     const ident = await resolveCoinIdentity(request, env, null);
-    if (!ident || ident.kind !== 'user') return aj({ ok: false, error: 'unauthorized' }, 401);
+    if (!ident || ident.kind !== 'user') return aj({ ok: false, error: 'not found' }, 404);
     return aj({ ok: true });
   }
 
   // ---- Koin: profil + saldo + unlock + harga (sync aplikasi) ----
   if (method === 'GET' && path === '/api/cerpen-coins/me') {
     const ident = await resolveCoinIdentity(request, env, null);
-    if (!ident) return aj({ ok: false, error: 'Login dulu atau kirim device_id.' }, 401);
+    if (!ident) return aj({ ok: false, error: 'not found' }, 404);
     const banned = await bannedIfSession(env, ident);
     if (banned) return banned;
     const w = await getWallet(env, ident.ownerKey);
@@ -543,7 +543,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
       return aj({ ok: false, error: 'Parameter tidak valid.' }, 400);
     }
     const ident = await resolveCoinIdentity(request, env, body);
-    if (!ident) return aj({ ok: false, error: 'Login dulu atau kirim device_id.' }, 401);
+    if (!ident) return aj({ ok: false, error: 'not found' }, 404);
     const banned = await bannedIfSession(env, ident);
     if (banned) return banned;
     if (!(await episodeExists(env, kind, targetId, season, no))) return aj({ ok: false, error: 'Episode tidak ditemukan.' }, 404);
@@ -619,7 +619,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
     const code = normVoucherCode(body.code);
     if (!code || code.length < 8 || code.length > 32) return aj({ ok: false, error: 'Kode tidak valid.' }, 400);
     const ident = await resolveCoinIdentity(request, env, body);
-    if (!ident) return aj({ ok: false, error: 'Login dulu atau kirim device_id.' }, 401);
+    if (!ident) return aj({ ok: false, error: 'not found' }, 404);
     const banned = await bannedIfSession(env, ident);
     if (banned) return banned;
     if (!(await checkRateLimit(env, 'coin-redeem-owner:' + ident.ownerKey, 5, 60 * 1000))) return aj({ ok: false, error: 'Terlalu banyak permintaan. Coba lagi sebentar.' }, 429);
@@ -718,7 +718,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
     }
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > HEARTBEAT_MAX_SECONDS) return aj({ ok: false, error: 'detik tidak valid' }, 400);
     const ident = await resolveCoinIdentity(request, env, body);
-    if (!ident) return aj({ ok: false, error: 'Login dulu atau kirim device_id.' }, 401);
+    if (!ident) return aj({ ok: false, error: 'not found' }, 404);
     const banned = await bannedIfSession(env, ident);
     if (banned) return banned;
     if (!(await checkRateLimit(env, 'coin-reading:' + ident.ownerKey, READING_RATE_LIMIT, READING_RATE_WINDOW_MS))) return aj({ ok: false, error: 'terlalu sering' }, 429);
@@ -757,7 +757,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
   // maks 200) & ?offset= (default 0); respons membawa total unlock akun.
   if (method === 'GET' && path === '/api/cerpen-coins/history') {
     const ident = await resolveCoinIdentity(request, env, null);
-    if (!ident) return aj({ ok: false, error: 'Login dulu atau kirim device_id.' }, 401);
+    if (!ident) return aj({ ok: false, error: 'not found' }, 404);
     const banned = await bannedIfSession(env, ident);
     if (banned) return banned;
     const limitRaw = Number(url.searchParams.get('limit'));
@@ -779,7 +779,7 @@ export async function handleCoinApi(request, env, url, adminEmail) {
   // ---- Privasi papan peringkat (19:17) — sembunyikan diri ----
   if (method === 'POST' && path === '/api/cerpen-auth/reading-privacy') {
     const ident = await resolveCoinIdentity(request, env, null);
-    if (!ident || ident.kind !== 'user') return aj({ ok: false, error: 'Butuh login akun.' }, 401);
+    if (!ident || ident.kind !== 'user') return aj({ ok: false, error: 'not found' }, 404);
     const banned = await bannedIfSession(env, ident);
     if (banned) return banned;
     const { body, err } = await readJsonBody(request);
@@ -797,7 +797,7 @@ export async function handleCoinAdmin(request, env, url, admin) {
   const path = url.pathname;
   const method = request.method;
   if (!path.startsWith('/api/admin/cerpen-koin')) return null;
-  if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
+  if (!admin) return aj({ ok: false, error: 'not found' }, 404);
   if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
   if (!(await checkRateLimit(env, 'coin-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
   const q = (name) => url.searchParams.get(name) || '';
@@ -1297,7 +1297,7 @@ export async function handleCoinAdmin(request, env, url, admin) {
     return aj({ ok: true, device_id: deviceId, watched });
   }
 
-  return aj({ ok: false, error: 'endpoint tidak dikenal' }, 404);
+  return aj({ ok: false, error: 'not found' }, 404);
 }
 
 // ---- Daftar pantauan: agregat aktivitas + penanda otomatis ----

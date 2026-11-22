@@ -12,7 +12,7 @@
 //
 // Aturan kunci (dari kontrak): view 1× per viewer-key per hari WIB;
 // like boleh guest (kunci device) atau login (kunci user); dislike WAJIB
-// sesi akun valid (401 login_required); vote sama 2× = batalkan, ganti
+// sesi akun valid (404 bila belum login); vote sama 2× = batalkan, ganti
 // 1↔-1 diizinkan; report guest boleh, maks 1 per (kind, ref,
 // reporter_key) per hari + maks 10 per reporter_key per hari (429
 // already_reported). Dislike count DIKEMBALIKAN server — aplikasi yang
@@ -223,7 +223,7 @@ export async function handleSocialApi(request, env, url) {
     const v = await validContent(env, kind, ref);
     if (v.err) return v.err;
     const user = await resolveSocialUser(request, env);
-    if (vote === -1 && !user) return aj({ ok: false, error: 'login_required' }, 401);
+    if (vote === -1 && !user) return aj({ ok: false, error: 'not found' }, 404);
     if (user) { const ban = await socialBanCheck(env, user.id); if (ban) return aj(ban, 403); }
     const deviceId = deviceFrom(request, body);
     const voterKey = user ? 'user:' + user.id : (deviceId ? 'device:' + deviceId : '');
@@ -321,7 +321,7 @@ export async function handleSocialApi(request, env, url) {
 // GET / POST / DELETE /api/cerpen-bookmarks — sinkron bookmark series
 // (cerpen/komik/berita) ke akun. WAJIB sesi akun (resolveSocialUser,
 // cookie cms_user ATAU Bearer — sama seperti vote/dislike); guest
-// ditolak 401 login_required (guest tetap simpan lokal di aplikasi).
+// ditolak 404 (guest tetap simpan lokal di aplikasi).
 // content_id = id series/komik/berita — untuk berita, judul juga
 // diterima (fallback aplikasi untuk data lama tanpa id baris).
 // Tabel cerpen_bookmarks tinggal di D1 cms-db (env.DB); keberadaan
@@ -345,7 +345,7 @@ export async function handleBookmarksApi(request, env, url) {
   if (path !== '/api/cerpen-bookmarks') return null;
   if (!env.DB) return aj({ ok: false, error: 'database_unavailable' }, 503);
   const user = await resolveSocialUser(request, env);
-  if (!user) return aj({ ok: false, error: 'login_required' }, 401);
+  if (!user) return aj({ ok: false, error: 'not found' }, 404);
   const ban = await socialBanCheck(env, user.id);
   if (ban) return aj(ban, 403);
 
@@ -495,7 +495,7 @@ export async function getSocialDashboardSummary(env) {
 export async function handleSocialAdminApi(request, env, url, admin) {
   const path = url.pathname;
   const method = request.method;
-  if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
+  if (!admin) return aj({ ok: false, error: 'not found' }, 404);
   if (!(await checkRateLimit(env, 'social-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'too_many_requests' }, 429);
   if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
   if (method === 'GET' && path === '/api/admin/cerpen-social/stats-overview') {

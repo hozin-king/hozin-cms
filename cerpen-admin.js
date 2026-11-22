@@ -222,7 +222,7 @@ export async function enforceCerpenApiKeyIfPresent(request, env) {
   const plain = String(request.headers.get('x-cerpen-api-key') || '').trim();
   if (!plain) return null;
   const key = await lookupApiKey(env, plain);
-  if (!key) return aj({ ok: false, error: 'api_key_tidak_valid' }, 401);
+  if (!key) return aj({ ok: false, error: 'not found' }, 404);
   if (key.status !== 'active') return aj({ ok: false, error: 'banned', target: 'api_key', reason: 'Kunci API dicabut.', expires_at: null }, 403);
   // God-mode admin: lewati cek ban (kunci admin tidak pernah dicabut
   // oleh deteksi — applyCerpenBan menolak ban admin).
@@ -660,9 +660,9 @@ async function upsertTrackUser(env, { ownerKey, userId, deviceId, androidId, dev
 // x-cerpen-api-key (atau body.api_key untuk heartbeat/status).
 async function resolveTrackKey(request, env, body) {
   const plain = String(request.headers.get('x-cerpen-api-key') || (body && body.api_key) || '').trim();
-  if (!plain) return { err: aj({ ok: false, error: 'api_key_wajib' }, 401) };
+  if (!plain) return { err: aj({ ok: false, error: 'not found' }, 404) };
   const key = await lookupApiKey(env, plain);
-  if (!key) return { err: aj({ ok: false, error: 'api_key_tidak_valid' }, 401) };
+  if (!key) return { err: aj({ ok: false, error: 'not found' }, 404) };
   if (key.status !== 'active') return { err: aj({ ok: false, error: 'banned', target: 'api_key', reason: 'Kunci API dicabut.', expires_at: null }, 403) };
   return { key };
 }
@@ -751,7 +751,7 @@ export async function handleCerpenTrackApi(request, env, url) {
     if (resolved.err) return resolved.err;
     const key = resolved.key;
     const user = await loadTrackUserByKey(env, key);
-    if (!user) return aj({ ok: false, error: 'api_key_tidak_valid' }, 401);
+    if (!user) return aj({ ok: false, error: 'not found' }, 404);
     const ownerKey = user.owner_key;
     const deviceId = user.device_id || '';
     const userId = user.user_id || '';
@@ -860,12 +860,12 @@ export async function handleCerpenTrackApi(request, env, url) {
   // ---- GET /api/cerpen-track/status — cek banned + perintah (saat buka aplikasi) ----
   if (method === 'GET' && path === '/api/cerpen-track/status') {
     const plain = String(request.headers.get('x-cerpen-api-key') || url.searchParams.get('api_key') || '').trim();
-    if (!plain) return aj({ ok: false, error: 'api_key_wajib' }, 401);
+    if (!plain) return aj({ ok: false, error: 'not found' }, 404);
     const key = await lookupApiKey(env, plain);
-    if (!key) return aj({ ok: false, error: 'api_key_tidak_valid' }, 401);
+    if (!key) return aj({ ok: false, error: 'not found' }, 404);
     if (key.status !== 'active') return aj({ ok: false, error: 'banned', target: 'api_key', reason: 'Kunci API dicabut.', expires_at: null }, 403);
     const user = await loadTrackUserByKey(env, key);
-    if (!user) return aj({ ok: false, error: 'api_key_tidak_valid' }, 401);
+    if (!user) return aj({ ok: false, error: 'not found' }, 404);
     const adminSt = user.user_id ? await resolveCerpenAdmin(env, user.user_id, user.fingerprint_hash || '') : { admin: false, admin_expires_at: 0 };
     if (!adminSt.admin) {
       const ban = await cerpenTrackBanCheck(env, { userId: user.user_id || '', deviceId: user.device_id || '', fingerprintHash: user.fingerprint_hash || '' });
@@ -884,7 +884,7 @@ export async function handleCerpenTrackApi(request, env, url) {
     if (resolved.err) return resolved.err;
     const key = resolved.key;
     const user = await loadTrackUserByKey(env, key);
-    if (!user) return aj({ ok: false, error: 'api_key_tidak_valid' }, 401);
+    if (!user) return aj({ ok: false, error: 'not found' }, 404);
     const adminEnd = user.user_id ? await isCerpenAdmin(env, user.user_id, user.fingerprint_hash || '') : false;
     if (!adminEnd) {
       const ban = await cerpenTrackBanCheck(env, { userId: user.user_id || '', deviceId: user.device_id || '', fingerprintHash: user.fingerprint_hash || '' });
@@ -915,7 +915,7 @@ export async function handleCerpenTrackApi(request, env, url) {
     let fingerprintHash = '';
     if (oldPlain) {
       const old = await lookupApiKey(env, oldPlain);
-      if (!old || old.status !== 'active') return aj({ ok: false, error: 'api_key_tidak_valid' }, 401);
+      if (!old || old.status !== 'active') return aj({ ok: false, error: 'not found' }, 404);
       ownerKey = old.owner_key;
       deviceId = old.device_id || '';
       fingerprintHash = old.fingerprint_hash || '';
@@ -927,7 +927,7 @@ export async function handleCerpenTrackApi(request, env, url) {
       if (!isUuid(did) || !fp) return aj({ ok: false, error: 'device_id + fingerprint wajib (atau kirim kunci lama)' }, 400);
       const fpHash = await sha256Hex(fp);
       const row = await env.DB.prepare(`SELECT owner_key, user_id, device_id, android_id, device_model, android_version, app_version, first_seen, last_seen, current_kind, current_target, current_season, current_no, reading_since, fingerprint_hash, is_rooted, root_methods, is_emulator, emulator_signals, bootloader_locked, verified_boot, custom_rom, integrity_status, integrity_verified, integrity_checked_at, last_eval_at FROM cerpen_track_users WHERE device_id = ?`).bind(did).first();
-      if (!row || String(row.fingerprint_hash || '') !== fpHash) return aj({ ok: false, error: 'fingerprint tidak cocok' }, 401);
+      if (!row || String(row.fingerprint_hash || '') !== fpHash) return aj({ ok: false, error: 'not found' }, 404);
       ownerKey = row.owner_key;
       deviceId = row.device_id || '';
       fingerprintHash = fpHash;
@@ -942,7 +942,7 @@ export async function handleCerpenTrackApi(request, env, url) {
     return aj({ ok: true, user_id: ownerKey, api_key: issued.api_key, key_id: issued.key_id });
   }
 
-  return aj({ ok: false, error: 'endpoint tidak dikenal' }, 404);
+  return aj({ ok: false, error: 'not found' }, 404);
 }
 
 // ===================== Endpoint admin =====================
@@ -950,7 +950,7 @@ export async function handleCerpenTrackAdmin(request, env, url, admin) {
   const path = url.pathname;
   const method = request.method;
   if (!path.startsWith('/api/admin/cerpen-track')) return null;
-  if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
+  if (!admin) return aj({ ok: false, error: 'not found' }, 404);
   if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) return aj({ ok: false, error: 'csrf tidak valid' }, 403);
   if (!(await checkRateLimit(env, 'track-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
   const q = (name) => url.searchParams.get(name) || '';
@@ -1293,7 +1293,7 @@ export async function handleCerpenTrackAdmin(request, env, url, admin) {
     return aj({ ok: true, settings: s });
   }
 
-  return aj({ ok: false, error: 'endpoint tidak dikenal' }, 404);
+  return aj({ ok: false, error: 'not found' }, 404);
 }
 
 // ===================== Panel admin /kendali/cerpen-pantau =====================

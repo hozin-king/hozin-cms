@@ -42,10 +42,10 @@ export async function handleHubApi(request, env, url, admin) {
   try {
     await ensureSchema(env);
     const path = url.pathname;
-    // Auth: kunci Muse ATAU sesi admin. Tanpa keduanya -> 401.
+    // Auth: kunci Muse ATAU sesi admin. Tanpa keduanya -> 404 (sama seperti path tidak ada).
     const muse = await authHubMuse(request, env);
     const isAdm = !!admin;
-    if (!muse && !isAdm) return hj({ ok: false, error: 'unauthorized' }, 401);
+    if (!muse && !isAdm) return hj({ ok: false, error: 'not found' }, 404);
     // Sesi admin wajib membawa x-csrf (pola cerpen-admin); kunci Muse
     // tidak butuh CSRF karena bukan sesi cookie.
     if (isAdm && !muse) {
@@ -73,7 +73,7 @@ export async function handleHubApi(request, env, url, admin) {
     if (path === '/api/hub/tasks' && request.method === 'GET') {
       const qTo = String(url.searchParams.get('to') || '');
       const qStatus = String(url.searchParams.get('status') || '');
-      if (muse && qTo && qTo !== muse.id) return hj({ ok: false, error: 'hanya boleh melihat tugas untuk Muse sendiri' }, 403);
+      if (muse && qTo && qTo !== muse.id) return hj({ ok: false, error: 'not found' }, 404);
       if (qStatus && !HUB_STATUSES.includes(qStatus)) return hj({ ok: false, error: 'status tidak valid' }, 400);
       const rows = await env.DB.prepare(`SELECT id, room, from_muse, to_muse, title, body, status, done_note, created_at, updated_at FROM hub_tasks ORDER BY created_at DESC LIMIT 200`).all();
       let tasks = rows.results || [];
@@ -116,7 +116,7 @@ export async function handleHubApi(request, env, url, admin) {
       if (!HUB_STATUSES.includes(status)) return hj({ ok: false, error: 'status tidak valid' }, 400);
       const row = await env.DB.prepare(`SELECT id, room, from_muse, to_muse, title, body, status, done_note, created_at, updated_at FROM hub_tasks WHERE id = ?`).bind(taskId).first();
       if (!row) return hj({ ok: false, error: 'tugas tidak ditemukan' }, 404);
-      if (muse && row.to_muse !== muse.id) return hj({ ok: false, error: 'hanya Muse yang ditugasi yang boleh mengubah status' }, 403);
+      if (muse && row.to_muse !== muse.id) return hj({ ok: false, error: 'not found' }, 404);
       const now = Date.now();
       await env.DB.prepare(`UPDATE hub_tasks SET status = ?, done_note = ?, updated_at = ? WHERE id = ?`).bind(status, note, now, taskId).run();
       return hj({ ok: true, task: { ...row, status, done_note: note, updated_at: now } });
@@ -124,7 +124,7 @@ export async function handleHubApi(request, env, url, admin) {
 
     // GET /api/hub/muses — daftar Muse (admin saja; tanpa key_hash).
     if (path === '/api/hub/muses' && request.method === 'GET') {
-      if (!isAdm) return hj({ ok: false, error: 'hanya admin' }, 403);
+      if (!isAdm) return hj({ ok: false, error: 'not found' }, 404);
       const rows = await env.DB.prepare(`SELECT id, name, room, created_at, last_seen_at FROM hub_muses ORDER BY created_at ASC`).all();
       return hj({ ok: true, muses: rows.results || [] });
     }
@@ -134,7 +134,7 @@ export async function handleHubApi(request, env, url, admin) {
     // kunci dikembalikan SEKALI di respons ini — panel menampilkannya
     // sekali + tombol salin, lalu tidak pernah bisa dilihat lagi.
     if (path === '/api/hub/muses' && request.method === 'POST') {
-      if (!isAdm) return hj({ ok: false, error: 'hanya admin' }, 403);
+      if (!isAdm) return hj({ ok: false, error: 'not found' }, 404);
       const { body, err } = await readJsonBody();
       if (err) return hj({ ok: false, error: err }, 400);
       const id = String(body.id || '').trim().toLowerCase();
@@ -152,7 +152,7 @@ export async function handleHubApi(request, env, url, admin) {
       return hj({ ok: true, muse: { id, name, room, created_at: now, last_seen_at: null }, key }, 201);
     }
 
-    return hj({ ok: false, error: 'endpoint tidak ditemukan' }, 404);
+    return hj({ ok: false, error: 'not found' }, 404);
   } catch (e) {
     return hj({ ok: false, error: 'kesalahan server' }, 500);
   }

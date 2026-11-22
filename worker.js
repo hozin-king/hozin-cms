@@ -177,14 +177,14 @@ async function upsertDracinTitle(env, v, now) {
   return v.episodes ? v.episodes.length : 0;
 }
 // Satu-satunya jalur /api/dracin/*: mengembalikan { res, keyId } supaya
-// pemanggil bisa mencatat usage SEKALI untuk semua cabang (termasuk 401/
-// 403/429/404) — tidak ada cabang yang lolos tanpa tercatat.
+// pemanggil bisa mencatat usage SEKALI untuk semua cabang (termasuk 404/
+// 429) — tidak ada cabang yang lolos tanpa tercatat.
 async function routeDracin(request, env, url) {
   const path = url.pathname;
   const needKey = async scopes => {
     const k = await dracinKey(request, env);
-    if (!k) return { err: dracinJson({ ok: false, error: 'unauthorized' }, 401), key: null };
-    if (!scopes.includes(k.scope)) return { err: dracinJson({ ok: false, error: 'forbidden' }, 403), key: k };
+    if (!k) return { err: dracinJson({ ok: false, error: 'not found' }, 404), key: null };
+    if (!scopes.includes(k.scope)) return { err: dracinJson({ ok: false, error: 'not found' }, 404), key: k };
     return { err: null, key: k };
   };
   // Baca publik: kunci valid -> bucket per kunci; tanpa kunci / kunci
@@ -216,7 +216,7 @@ async function routeDracin(request, env, url) {
     return { res: dracinJson({ ok: true, seeds: rows.results || [] }), keyId: k ? k.id : '' };
   }
   if (path === '/api/dracin/sync' || path === '/api/dracin/titles' || path === '/api/dracin/seeds') {
-    if ((path === '/api/dracin/sync' && request.method !== 'POST') || ((path === '/api/dracin/titles' || path === '/api/dracin/seeds') && !['POST', 'PUT', 'DELETE'].includes(request.method))) return { res: dracinJson({ ok: false, error: 'tidak ditemukan' }, 404), keyId: '' };
+    if ((path === '/api/dracin/sync' && request.method !== 'POST') || ((path === '/api/dracin/titles' || path === '/api/dracin/seeds') && !['POST', 'PUT', 'DELETE'].includes(request.method))) return { res: dracinJson({ ok: false, error: 'not found' }, 404), keyId: '' };
     const scopes = path === '/api/dracin/sync' ? ['sync', 'admin'] : ['admin'];
     const auth = await needKey(scopes);
     if (auth.err) return { res: auth.err, keyId: auth.key ? auth.key.id : '' };
@@ -253,7 +253,7 @@ async function routeDracin(request, env, url) {
       if (request.method === 'PUT') {
         if (typeof data.platform !== 'string' || !data.platform || typeof data.title_id !== 'string' || !data.title_id) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
         const old = await env.DB.prepare(`SELECT * FROM dracin_catalog WHERE platform = ? AND title_id = ?`).bind(data.platform, data.title_id).first();
-        if (!old) return { res: dracinJson({ ok: false, error: 'tidak ditemukan' }, 404), keyId: key.id };
+        if (!old) return { res: dracinJson({ ok: false, error: 'not found' }, 404), keyId: key.id };
         const merged = validDracinTitle({ ...old, ...data, platform: old.platform, title_id: old.title_id, episodes: data.episodes });
         if (!merged) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
         await upsertDracinTitle(env, merged, Date.now());
@@ -276,7 +276,7 @@ async function routeDracin(request, env, url) {
       if (request.method === 'PUT') {
         if (typeof data.platform !== 'string' || !data.platform || typeof data.query !== 'string' || !data.query || !(data.enabled === 0 || data.enabled === 1 || data.enabled === true || data.enabled === false)) return { res: dracinJson({ ok: false, error: 'payload tidak valid' }, 400), keyId: key.id };
         const old = await env.DB.prepare(`SELECT * FROM dracin_seeds WHERE platform = ? AND query = ?`).bind(data.platform, data.query).first();
-        if (!old) return { res: dracinJson({ ok: false, error: 'tidak ditemukan' }, 404), keyId: key.id };
+        if (!old) return { res: dracinJson({ ok: false, error: 'not found' }, 404), keyId: key.id };
         await env.DB.prepare(`UPDATE dracin_seeds SET enabled = ? WHERE platform = ? AND query = ?`).bind(data.enabled === 1 || data.enabled === true ? 1 : 0, data.platform, data.query).run();
         return { res: dracinJson({ ok: true }), keyId: key.id };
       }
@@ -287,7 +287,7 @@ async function routeDracin(request, env, url) {
       }
     }
   }
-  return { res: dracinJson({ ok: false, error: 'tidak ditemukan' }, 404), keyId: '' };
+  return { res: dracinJson({ ok: false, error: 'not found' }, 404), keyId: '' };
 }
 
 // 11 Nov 2026 — redesign visual admin: CSS admin (hanya halaman /kendali,
@@ -1098,7 +1098,7 @@ async function tttDeviceByKey(db, key) {
 /**
  * Gate API key untuk endpoint LAMA (profile/claim/chat/savings/like/
  * region): key OPSIONAL (kompatibel dengan v1.1.2 yang belum punya key),
- * tapi bila key dikirim dan statusnya revoked -> 403 banned. Return
+ * tapi bila key dikirim dan statusnya revoked -> 404 not_found. Return
  * Response bila diblokir, null bila lolos.
  */
 async function tttCheckApiKey(request, db) {
@@ -1107,10 +1107,7 @@ async function tttCheckApiKey(request, db) {
   const dev = await tttDeviceByKey(db, key);
   if (!dev) return null; // key tak dikenal -> abaikan, jangan putuskan client
   if (dev.key_status === 'revoked') {
-    return taptapJson({
-      error: 'banned', ban_type: 'key_revoked',
-      ban_reason: dev.key_revoked_reason || 'kunci API dicabut admin', ban_until: '',
-    }, 403);
+    return taptapJson({ error: 'not_found' }, 404);
   }
   return null;
 }
@@ -1118,14 +1115,11 @@ async function tttCheckApiKey(request, db) {
 /** Wajib key (endpoint admin baru): return {device} atau Response error. */
 async function tttRequireKey(request, db) {
   const key = (request.headers.get('x-ttt-api-key') || '').trim();
-  if (!key) return taptapJson({ error: 'api_key_required' }, 401);
+  if (!key) return taptapJson({ error: 'not_found' }, 404);
   const dev = await tttDeviceByKey(db, key);
-  if (!dev) return taptapJson({ error: 'invalid_api_key' }, 401);
+  if (!dev) return taptapJson({ error: 'not_found' }, 404);
   if (dev.key_status === 'revoked') {
-    return taptapJson({
-      error: 'banned', ban_type: 'key_revoked',
-      ban_reason: dev.key_revoked_reason || 'kunci API dicabut admin', ban_until: '',
-    }, 403);
+    return taptapJson({ error: 'not_found' }, 404);
   }
   return { device: dev };
 }
@@ -2006,7 +2000,7 @@ async function handleTapTap(request, env, url) {
     // warning). Riwayat ditulis ke ttt_bans.
     if (request.method === 'POST' && sub === 'ban') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const b = await request.json().catch(() => null);
       if (!b || !taptapValidAccountId(b.account_id) || !TAPTAP_BAN_TYPES.includes(b.ban_type)) {
         return taptapJson({ error: 'bad_request' }, 400);
@@ -2037,7 +2031,7 @@ async function handleTapTap(request, env, url) {
     // set revoked_at pada baris ttt_bans terbaru yang belum revoked.
     if (request.method === 'POST' && sub === 'unban') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const b = await request.json().catch(() => null);
       if (!b || !taptapValidAccountId(b.account_id)) {
         return taptapJson({ error: 'bad_request' }, 400);
@@ -2062,7 +2056,7 @@ async function handleTapTap(request, env, url) {
     // GET /api/taptap/admin/flags — daftar ttt_flags yang belum direview.
     if (request.method === 'GET' && sub === 'flags') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const { results } = await db.prepare(
         'SELECT id, account_id, reason, details, created_at, reviewed FROM ttt_flags WHERE reviewed = 0 ORDER BY id DESC LIMIT 100'
       ).all();
@@ -2073,7 +2067,7 @@ async function handleTapTap(request, env, url) {
     // POST /api/taptap/admin/redeem/create {benefit_type, benefit_value, max_uses, expires_at?, code?}
     if (request.method === 'POST' && sub === 'redeem' && parts[4] === 'create') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const b = await request.json().catch(() => null);
       if (!b || !TTT_REDEEM_TYPES.includes(b.benefit_type)) {
         return taptapJson({ error: 'bad_request' }, 400);
@@ -2101,7 +2095,7 @@ async function handleTapTap(request, env, url) {
     // GET /api/taptap/admin/redeem/list — semua kode + pemakaian.
     if (request.method === 'GET' && sub === 'redeem' && parts[4] === 'list') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const { results } = await db.prepare(
         'SELECT code, benefit_type, benefit_value, max_uses, used_count, expires_at, active, created_by, created_at FROM ttt_redeem_codes ORDER BY created_at DESC LIMIT 100'
       ).all();
@@ -2110,7 +2104,7 @@ async function handleTapTap(request, env, url) {
     // POST /api/taptap/admin/redeem/deactivate {code}
     if (request.method === 'POST' && sub === 'redeem' && parts[4] === 'deactivate') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const b = await request.json().catch(() => null);
       if (!b || !b.code) return taptapJson({ error: 'bad_request' }, 400);
       await db.prepare(
@@ -2125,7 +2119,7 @@ async function handleTapTap(request, env, url) {
     // tidak boleh di bawah jumlah yang sudah terpakai.
     if (request.method === 'POST' && sub === 'redeem' && parts[4] === 'update') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const b = await request.json().catch(() => null);
       const code = String(b && b.code || '').trim().toUpperCase();
       if (!code || !TTT_REDEEM_TYPES.includes(b.benefit_type)) {
@@ -2159,7 +2153,7 @@ async function handleTapTap(request, env, url) {
     // ttt_redeem_log sejak fitur redeem diluncurkan).
     if (request.method === 'GET' && sub === 'redeem' && parts[4] === 'history') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const code = String(url.searchParams.get('code') || '').trim().toUpperCase();
       if (!code) return taptapJson({ error: 'bad_request' }, 400);
       const { results } = await db.prepare(
@@ -2175,7 +2169,7 @@ async function handleTapTap(request, env, url) {
     // Dieksekusi aplikasi saat register/heartbeat/status berikutnya.
     if (request.method === 'POST' && sub === 'command') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const b = await request.json().catch(() => null);
       if (!b || !['guest', 'account'].includes(b.target_type) || !b.target_id || !['kick', 'crash'].includes(b.command)) {
         return taptapJson({ error: 'bad_request' }, 400);
@@ -2195,7 +2189,7 @@ async function handleTapTap(request, env, url) {
     // GET /api/taptap/admin/commands?status=pending|delivered
     if (request.method === 'GET' && sub === 'commands') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const status = url.searchParams.get('status') || 'pending';
       if (!['pending', 'delivered'].includes(status)) return taptapJson({ error: 'bad_status' }, 400);
       const { results } = await db.prepare(
@@ -2207,7 +2201,7 @@ async function handleTapTap(request, env, url) {
     // GET /api/taptap/admin/live — perangkat online (< 3 menit) + sesi aktif.
     if (request.method === 'GET' && sub === 'live') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const since = new Date(Date.now() - TTT_ONLINE_WINDOW_MS).toISOString();
       const { results } = await db.prepare(
         'SELECT d.guest_id, d.account_id, d.device_model, d.app_version, d.is_rooted, d.is_emulator, d.integrity_status, d.last_seen, p.player_name, p.total_energy_all_time, p.ban_type, p.ban_until FROM ttt_devices d LEFT JOIN ttt_players p ON p.account_id = d.account_id WHERE d.last_seen > ? ORDER BY d.last_seen DESC LIMIT 100'
@@ -2229,7 +2223,7 @@ async function handleTapTap(request, env, url) {
     // GET /api/taptap/admin/summary — angka ringkas panel.
     if (request.method === 'GET' && sub === 'summary') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const since = new Date(Date.now() - TTT_ONLINE_WINDOW_MS).toISOString();
       const dayAgo = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
       const total = await db.prepare('SELECT COUNT(*) AS c FROM ttt_players').first();
@@ -2252,7 +2246,7 @@ async function handleTapTap(request, env, url) {
     // GET /api/taptap/admin/users/:id — riwayat lengkap satu pengguna.
     if (request.method === 'GET' && sub === 'users' && parts[4]) {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const id = parts[4];
       const player = await db.prepare('SELECT * FROM ttt_players WHERE account_id = ?').bind(id).first();
       if (!player) return taptapJson({ error: 'not_found' }, 404);
@@ -2302,7 +2296,7 @@ async function handleTapTap(request, env, url) {
     // GET /api/taptap/admin/watchlist — entri status 'watching'.
     if (request.method === 'GET' && sub === 'watchlist') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const { results } = await db.prepare(
         "SELECT id, target_type, target_id, reason, score, evidence, status, created_at, updated_at FROM ttt_watchlist WHERE status = 'watching' ORDER BY score DESC, id DESC LIMIT 100"
       ).all();
@@ -2311,7 +2305,7 @@ async function handleTapTap(request, env, url) {
     // POST /api/taptap/admin/watchlist/clear {id, note?} — "bukan orang yang sama".
     if (request.method === 'POST' && sub === 'watchlist' && parts[4] === 'clear') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const b = await request.json().catch(() => null);
       if (!b || !b.id) return taptapJson({ error: 'bad_request' }, 400);
       await db.prepare(
@@ -2322,10 +2316,10 @@ async function handleTapTap(request, env, url) {
     // ---- Paket admin: cabut / pulihkan API key (admin-batch) ----
     // POST /api/taptap/admin/revoke-key {guest_id, reason} — perangkat
     // tidak bisa lagi memakai key lama DAN tidak bisa register ulang
-    // (register mengembalikan 403 key_revoked) sampai di-unrevoke.
+    // (register mengembalikan 404 not_found) sampai di-unrevoke.
     if (request.method === 'POST' && sub === 'revoke-key') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const b = await request.json().catch(() => null);
       if (!b || !tttValidGuestId(b.guest_id)) return taptapJson({ error: 'bad_request' }, 400);
       await db.prepare(
@@ -2336,7 +2330,7 @@ async function handleTapTap(request, env, url) {
     // POST /api/taptap/admin/unrevoke-key {guest_id}
     if (request.method === 'POST' && sub === 'unrevoke-key') {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const b = await request.json().catch(() => null);
       if (!b || !tttValidGuestId(b.guest_id)) return taptapJson({ error: 'bad_request' }, 400);
       await db.prepare(
@@ -2347,7 +2341,7 @@ async function handleTapTap(request, env, url) {
     // GET /api/taptap/admin/behavior/:id — profil perilaku + kemiripan vs banned.
     if (request.method === 'GET' && sub === 'behavior' && parts[4]) {
       if (!(await checkRateLimit(env, 'taptap-admin:' + clientIp(request), 60, 600 * 1000))) return taptapJson({ error: 'terlalu banyak permintaan' }, 429);
-      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'unauthorized' }, 401);
+      if (!(await taptapIsAdmin(request, env))) return taptapJson({ error: 'not_found' }, 404);
       const id = parts[4];
       const row = await db.prepare(
         'SELECT profile_json, updated_at FROM ttt_behavior WHERE target_id = ?'
@@ -2523,7 +2517,7 @@ async function handleTapTap(request, env, url) {
         });
       }
       if (device.key_status === 'revoked') {
-        return taptapJson({ error: 'key_revoked', reason: device.key_revoked_reason || '' }, 403);
+        return taptapJson({ error: 'not_found' }, 404);
       }
     }
     // Rotasi key: kunci baru tiap register; kunci lama langsung mati.
@@ -2611,7 +2605,7 @@ async function handleTapTap(request, env, url) {
     if (!keyed.device) return keyed;
     const device = keyed.device;
     if (b.guest_id && b.guest_id !== device.guest_id) {
-      return taptapJson({ error: 'guest_mismatch' }, 403);
+      return taptapJson({ error: 'not_found' }, 404);
     }
     const nowMs = Date.now();
     const ban = await tttBanForDevice(db, device, nowMs);
@@ -2768,7 +2762,7 @@ async function handleTapTap(request, env, url) {
     const keyed = await tttRequireKey(request, db);
     if (!keyed.device) return keyed;
     if (keyed.device.guest_id !== guestId) {
-      return taptapJson({ error: 'guest_mismatch' }, 403);
+      return taptapJson({ error: 'not_found' }, 404);
     }
     const nowMs = Date.now();
     const ban = await tttBanForDevice(db, keyed.device, nowMs);
@@ -3284,13 +3278,13 @@ async function handleFetch(request, env, ctx) {
       if (!env.BACKUP_DB) return csJson({ ok: false, error: 'database tidak tersedia' }, 503);
       const rawKey = String(request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '').trim()
         || String(request.headers.get('x-api-key') || '').trim();
-      if (!rawKey) return csJson({ ok: false, error: 'unauthorized' }, 401);
+      if (!rawKey) return csJson({ ok: false, error: 'not found' }, 404);
       let keyRow = null;
       try {
         const hash = await sha256Hex(rawKey);
         keyRow = await env.BACKUP_DB.prepare(`SELECT key_id, key_hash, name, revoked, daily_limit, auto_approve_mode, auto_approve_until FROM cerpen_api_keys WHERE key_hash = ?`).bind(hash).first();
-        if (!keyRow || Number(keyRow.revoked) !== 0) return csJson({ ok: false, error: 'unauthorized' }, 401);
-        if (!timingSafeHexEqual(String(keyRow.key_hash), hash)) return csJson({ ok: false, error: 'unauthorized' }, 401);
+        if (!keyRow || Number(keyRow.revoked) !== 0) return csJson({ ok: false, error: 'not found' }, 404);
+        if (!timingSafeHexEqual(String(keyRow.key_hash), hash)) return csJson({ ok: false, error: 'not found' }, 404);
       } catch (e) {
         return csJson({ ok: false, error: 'gagal memeriksa kunci' }, 500);
       }
@@ -3466,13 +3460,13 @@ async function handleFetch(request, env, ctx) {
       if (!env.BACKUP_DB) return mbJson({ ok: false, error: 'database tidak tersedia' }, 503);
       const rawKey = String(request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '').trim()
         || String(request.headers.get('x-api-key') || '').trim();
-      if (!rawKey) return mbJson({ ok: false, error: 'unauthorized' }, 401);
+      if (!rawKey) return mbJson({ ok: false, error: 'not found' }, 404);
       let keyRow = null;
       try {
         const hash = await sha256Hex(rawKey);
         keyRow = await env.BACKUP_DB.prepare(`SELECT key_id, key_hash, name, revoked, daily_limit FROM md_backup_keys WHERE key_hash = ?`).bind(hash).first();
-        if (!keyRow || Number(keyRow.revoked) !== 0) return mbJson({ ok: false, error: 'unauthorized' }, 401);
-        if (!timingSafeHexEqual(String(keyRow.key_hash), hash)) return mbJson({ ok: false, error: 'unauthorized' }, 401);
+        if (!keyRow || Number(keyRow.revoked) !== 0) return mbJson({ ok: false, error: 'not found' }, 404);
+        if (!timingSafeHexEqual(String(keyRow.key_hash), hash)) return mbJson({ ok: false, error: 'not found' }, 404);
       } catch (e) {
         return mbJson({ ok: false, error: 'gagal memeriksa kunci' }, 500);
       }
@@ -3567,14 +3561,14 @@ async function handleFetch(request, env, ctx) {
       if (!env.BACKUP_DB) return shJson({ ok: false, error: 'database tidak tersedia' }, 503);
       if (!(await checkRateLimit(env, 'share-resolve:' + clientIp(request), 30, 10 * 60 * 1000))) return shJson({ ok: false, error: 'terlalu banyak permintaan' }, 429);
       const payload = await shareDecryptToken(env, url.searchParams.get('token') || '');
-      if (!payload) return shJson({ ok: false, error: 'tidak ditemukan' }, 404);
+      if (!payload) return shJson({ ok: false, error: 'not found' }, 404);
       let row = null;
       try {
         row = await env.BACKUP_DB.prepare(`SELECT id, content_type, content_id, season, episode_no, revoked FROM cerpen_share_links WHERE id = ?`).bind(payload.share_id).first();
       } catch (e) {
         return shJson({ ok: false, error: 'gagal memeriksa link' }, 500);
       }
-      if (!row || Number(row.revoked) !== 0) return shJson({ ok: false, error: 'tidak ditemukan' }, 404);
+      if (!row || Number(row.revoked) !== 0) return shJson({ ok: false, error: 'not found' }, 404);
       await shareLogOpen(env.BACKUP_DB, payload.share_id, request, 'app');
       return shJson({ ok: true, content_type: payload.content_type, content_id: payload.content_id, season: payload.season, episode_no: payload.episode_no });
     }
@@ -3700,7 +3694,7 @@ async function handleFetch(request, env, ctx) {
     // (review_submissions.py apply-approved) ke konten kanonis + D1.
     if (path.startsWith('/api/admin/cerpen-')) {
       const aj = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
-      if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
+      if (!admin) return aj({ ok: false, error: 'not found' }, 404);
       if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) { await logSecurityEvent(env, 'csrf_gagal', request); return aj({ ok: false, error: 'csrf tidak valid' }, 403); }
       if (!env.BACKUP_DB) return aj({ ok: false, error: 'database tidak tersedia' }, 503);
       if (!(await checkRateLimit(env, 'cerpen-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
@@ -3928,7 +3922,7 @@ async function handleFetch(request, env, ctx) {
           await cerpenAudit(action === 'revoke' ? 'share_revoke' : 'share_unrevoke', 'share', shareId, '');
           return aj({ ok: true, id: shareId, revoked });
         }
-        return aj({ ok: false, error: 'endpoint tidak ditemukan' }, 404);
+        return aj({ ok: false, error: 'not found' }, 404);
       } catch (e) {
         return aj({ ok: false, error: 'kesalahan server' }, 500);
       }
@@ -3941,7 +3935,7 @@ async function handleFetch(request, env, ctx) {
     // sampai ke sana.
     if (path.startsWith('/api/admin/md-backup')) {
       const aj = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
-      if (!admin) return aj({ ok: false, error: 'unauthorized' }, 401);
+      if (!admin) return aj({ ok: false, error: 'not found' }, 404);
       if (!safeEqualHex(String(request.headers.get('x-csrf') || ''), await csrfToken(env))) { await logSecurityEvent(env, 'csrf_gagal', request); return aj({ ok: false, error: 'csrf tidak valid' }, 403); }
       if (!env.BACKUP_DB) return aj({ ok: false, error: 'database tidak tersedia' }, 503);
       if (!(await checkRateLimit(env, 'md-backup-admin:' + clientIp(request), 60, 10 * 60 * 1000))) return aj({ ok: false, error: 'terlalu banyak permintaan' }, 429);
@@ -4079,7 +4073,7 @@ async function handleFetch(request, env, ctx) {
           await mdAudit('md_delete', 'md_backup', id, 'path=' + row.path + ' v' + row.version);
           return aj({ ok: true, id });
         }
-        return aj({ ok: false, error: 'endpoint tidak ditemukan' }, 404);
+        return aj({ ok: false, error: 'not found' }, 404);
       } catch (e) {
         return aj({ ok: false, error: 'kesalahan server' }, 500);
       }
@@ -4251,12 +4245,12 @@ async function handleFetch(request, env, ctx) {
     // Pengirim: aplikasi load test. Auth HANYA Bearer LOADTEST_TOKEN
     // (secret Worker, bukan ADMIN_TOKEN): token ini tidak bisa login
     // admin, tidak bisa ubah post, hanya bisa menitipkan hasil tes.
-    // Fail-closed: secret belum diset -> 503; token salah -> 401.
+    // Fail-closed: secret belum diset -> 503; token salah -> 404 (sama seperti path tidak ada).
     // Batas: body maks 20 KB, paths maks 20, path maks 200 karakter.
     if (request.method === 'POST' && path === '/api/loadtest-results') {
       const ltJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
       if (!env.LOADTEST_TOKEN) return ltJson({ ok: false, error: 'loadtest tidak dikonfigurasi' }, 503);
-      if (String(request.headers.get('authorization') || '') !== 'Bearer ' + env.LOADTEST_TOKEN) return ltJson({ ok: false, error: 'unauthorized' }, 401);
+      if (String(request.headers.get('authorization') || '') !== 'Bearer ' + env.LOADTEST_TOKEN) return ltJson({ ok: false, error: 'not found' }, 404);
       if (Number(request.headers.get('content-length') || '0') > 20480) return ltJson({ ok: false, error: 'payload terlalu besar' }, 413);
       let data = null;
       try {
@@ -4288,7 +4282,7 @@ async function handleFetch(request, env, ctx) {
     }
 
     // ---- API Dracin: semua /api/dracin/* lewat satu pintu ini, supaya
-    // usage tercatat untuk SETIAP request (termasuk 401/403/429/404).
+    // usage tercatat untuk SETIAP request (termasuk 404/429).
     // Pengecualian spek "halaman statistik itu sendiri": kartu statistik
     // di Super Panel bukan endpoint /api/dracin/*, jadi tidak tercatat
     // sebagai hit API (ia membaca tabel usage, bukan menambahnya).
@@ -4714,7 +4708,7 @@ requestAnimationFrame(draw);
 
     // ---- Waktu baca: heartbeat + statistik (v81) ----
     // Algoritma lengkap di reading.js. Heartbeat hanya dari akun
-    // komentator (anonim 401, admin tidak dilacak). Statistik hanya untuk
+    // komentator (anonim 404, admin tidak dilacak). Statistik hanya untuk
     // pemilik akun + super admin (fase 1; tampilan publik fase 2).
     async function getReadingStats(env, userId) {
       const [dayRows, hourRows] = await Promise.all([
@@ -4727,7 +4721,7 @@ requestAnimationFrame(draw);
     }
     if (request.method === 'POST' && path === '/api/reading/heartbeat') {
       const hbJson = (obj, status) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
-      if (!commenter) return hbJson({ ok: false, error: 'butuh akun komentator' }, 401);
+      if (!commenter) return hbJson({ ok: false, error: 'not found' }, 404);
       let data = null;
       try { data = await request.json(); } catch (e) { return hbJson({ ok: false, error: 'body tidak valid' }, 400); }
       const csrfNeed = await userCsrf(env, commenter.id);
@@ -4764,10 +4758,10 @@ requestAnimationFrame(draw);
           return stJson({ ok: false, error: 'parameter user wajib untuk admin' }, 400);
         }
       } else if (commenter) {
-        if (wantId && wantId !== commenter.id) return stJson({ ok: false, error: 'bukan statistikmu' }, 403);
+        if (wantId && wantId !== commenter.id) return stJson({ ok: false, error: 'not found' }, 404);
         targetId = commenter.id; targetName = commenter.username;
       } else {
-        return stJson({ ok: false, error: 'butuh login' }, 401);
+        return stJson({ ok: false, error: 'not found' }, 404);
       }
       const stats = await getReadingStats(env, targetId);
       return stJson({ ok: true, user_id: targetId, username: targetName, ...stats });
@@ -5942,7 +5936,7 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
     }
     if (path === '/kendali' || path.startsWith('/kendali/')) {
       if (request.method === 'GET' && !admin) {
-        return redirect('/akun?pesan=login');
+        return html(await renderPage(env, 'Tidak ditemukan', '<div class="card"><p>Halaman tidak ditemukan.</p></div>'), 404);
       }
       // Halaman edit ada di bawah blok ini, jangan dialihkan duluan.
       if (request.method === 'GET' && admin && path !== '/kendali/posts/edit') {
@@ -6336,8 +6330,14 @@ document.querySelectorAll('[data-md-delete]').forEach(function (btn) {
     if (path === '/admin' || path.startsWith('/admin/')) {
       return redirect('/akun');
     }
+    // Jalur /api/* yang tidak dikenal (termasuk yang butuh auth tapi
+    // gagal di atas) menjawab sama seperti path yang memang tidak ada —
+    // JSON 404 seragam, supaya tidak bisa dibedakan dari path yang tidak ada.
+    if (path.startsWith('/api/')) {
+      return new Response(JSON.stringify({ ok: false, error: 'not found' }), { status: 404, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+    }
     if (path.startsWith('/kendali')) {
-      return redirect('/akun?pesan=login');
+      return html(await renderPage(env, 'Tidak ditemukan', '<div class="card"><p>Halaman tidak ditemukan.</p></div>'), 404);
     }
     return html(await renderPage(env, 'Tidak ditemukan', '<div class="card"><p>Halaman tidak ditemukan.</p></div>'), 404);
 }

@@ -1647,7 +1647,7 @@ assert(env.DB.refreshTokens.some(x => x.revoked === 0), 'refresh dalam jeda teng
 // semua sesi dicabut (tuakan created_at semua pengganti supaya lewat 10 detik)
 for (const rt of env.DB.refreshTokens) rt.created_at = '2026-01-01T00:00:00.000Z';
 r = await call('GET', '/kendali', null, refreshOnly); t = await r.text();
-assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'refresh lama di luar jeda tenggang dialihkan ke /akun');
+assert(r.status === 404 && t.includes('Tidak ditemukan'), 'refresh lama di luar jeda tenggang -> 404 (bukan dialihkan ke /akun)');
 assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'pakai ulang refresh di luar jeda mencabut semua sesi');
 // Login ulang + daftar sesi + logout-all
 // (Simulasi lewat 15 menit: rate-limit dari tes sebelumnya harus sudah lewat.)
@@ -1661,7 +1661,7 @@ const csrf2 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 r = await call('POST', '/kendali/logout-all', { csrf: csrf2 }, cookie); assert(r.status === 303, 'logout semua perangkat redirect');
 assert(env.DB.refreshTokens.every(x => x.revoked === 1), 'logout semua mencabut semua refresh');
 r = await call('GET', '/kendali', null, refreshOnly2); t = await r.text();
-assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'setelah logout semua, refresh lama dialihkan ke /akun');
+assert(r.status === 404 && t.includes('Tidak ditemukan'), 'setelah logout semua, refresh lama -> 404 (bukan dialihkan ke /akun)');
 // Logout satu perangkat
 r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' });
 cookie = cookieHeader(cookiesOf(r));
@@ -1670,7 +1670,7 @@ r = await call('GET', '/kendali', null, cookie); t = await r.text();
 const csrf3 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 r = await call('POST', '/kendali/logout', { csrf: csrf3 }, cookie); assert(r.status === 303, 'logout satu perangkat redirect');
 r = await call('GET', '/kendali', null, refreshOnly3); t = await r.text();
-assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'setelah logout, refresh perangkat itu dialihkan ke /akun');
+assert(r.status === 404 && t.includes('Tidak ditemukan'), 'setelah logout, refresh perangkat itu -> 404 (bukan dialihkan ke /akun)');
 // 8a. Sesi admin di luar /kendali: refresh Path=/ + tryRefresh di /akun & /post/
 // (Bug: cookie refresh Path=/kendali tidak dikirim browser ke /akun/post,
 // dan tryRefresh hanya jalan di /kendali — admin diminta login lagi tiap
@@ -1709,9 +1709,10 @@ async function callDown(method, path) {
 r = await callDown('GET', '/'); t = await r.text();
 assert(r.status === 503 && t.includes('Under Maintenance') && t.includes('currently under maintenance') && !t.includes('Selamat Datang di WorkerCMS') && !t.includes('D1') && !t.includes('kuota'), 'failsafe beranda: halaman pemeliharaan Inggris, tanpa detail teknis');
 r = await callDown('GET', '/kendali'); t = await r.text();
-// Dashboard tanpa sesi tidak butuh DB (token akses stateless), jadi saat
-// DB mati pun ia tetap dialihkan ke form biasa /akun, bukan 503.
-assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'failsafe kendali tanpa sesi: dialihkan ke /akun, bukan halaman admin');
+// Dashboard tanpa sesi tidak butuh DB (token akses stateless) — tapi
+// halaman 404-nya dirender lewat renderPage yang butuh setelan dari D1,
+// jadi saat DB mati ia ikut failsafe 503 seperti semua jalur lain.
+assert(r.status === 503 && t.includes('Under Maintenance'), 'failsafe kendali tanpa sesi: 503 seperti jalur lain (halaman 404 butuh DB)');
 r = await callDown('GET', '/post/post-uji'); t = await r.text();
 assert(r.status === 503 && t.includes('Under Maintenance') && !t.includes('D1'), 'failsafe halaman lain: halaman pemeliharaan Inggris, tanpa detail teknis');
 
@@ -1984,7 +1985,7 @@ assert(t.includes('togel'), 'blokir judol: komentar admin tetap tampil');
 r = await call('GET', '/kendali/plugins', null, cookie); t = await r.text();
 assert(t.includes('Blokir Komentar Berlink') && t.includes('Blokir Kata Kotor') && t.includes('Blokir Judol Otomatis'), 'plugin blokir: 3 plugin baru tampil di panel');
 // 23. Upload gambar via ImgBB (perintah pemilik 30 Okt 2026 13:04, "tidak ribet")
-r = await call('POST', '/kendali/upload-image', { csrf }, userCookie); assert(r.status === 303, 'upload imgbb: non-admin dialihkan ke /akun');
+r = await call('POST', '/kendali/upload-image', { csrf }, userCookie); t = await r.text(); assert(r.status === 404 && t.includes('Tidak ditemukan'), 'upload imgbb: non-admin -> 404 (bukan dialihkan ke /akun)');
 r = await call('POST', '/kendali/upload-image', {}, cookie); assert(r.status === 403, 'upload imgbb: admin tanpa CSRF ditolak');
 r = await call('POST', '/kendali/upload-image', { csrf }, cookie); t = await r.text(); assert(r.status === 400 && t.includes('Kunci API ImgBB belum diset'), 'upload imgbb: tanpa kunci di Pengaturan ditolak 400, tidak panggil ImgBB');
 r = await call('POST', '/kendali/imgbb/add', { csrf, new_key: 'testimgbbkey123456' }, cookie); assert(r.status === 303, 'pengaturan: tambah kunci ImgBB redirect');
@@ -1994,7 +1995,7 @@ r = await call('POST', '/kendali/upload-image', { csrf }, cookie); t = await r.t
 r = await call('GET', '/kendali/posts/new', null, cookie); t = await r.text();
 assert(t.includes('Upload Gambar (ImgBB)') && t.includes('imgbbFile'), 'editor: tombol upload ImgBB tampil di post baru');
 // 24. Super Panel untuk semuanya (perintah pemilik 30 Okt 2026 13:11, "untuk semuanya")
-r = await call('GET', '/kendali/super', null, userCookie); assert(r.status === 303, 'super panel: non-admin dialihkan');
+r = await call('GET', '/kendali/super', null, userCookie); t = await r.text(); assert(r.status === 404 && t.includes('Tidak ditemukan'), 'super panel: non-admin -> 404');
 r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('Super Panel') && t.includes('Komentar & Keamanan') && t.includes('Event PC Builder'), 'super panel: admin melihat situs + komentar + PC Builder');
 assert(t.includes('Traffic Lengkap') && t.includes('views total') && t.includes('Per Hari') && t.includes('Per Post'), 'super panel: traffic lengkap tampil (total, per-hari, per-post)');
@@ -2096,10 +2097,10 @@ assert(r.status === 503, 'loadtest: secret belum diset ditolak 503 (fail-closed)
 assert(env.DB.loadtestRuns.length === 0, 'loadtest: 503 tidak menyimpan run');
 env.LOADTEST_TOKEN = 'test-loadtest-token';
 r = await callJson('POST', '/api/loadtest-results', ltGood);
-assert(r.status === 401, 'loadtest: tanpa token ditolak 401');
+assert(r.status === 404, 'loadtest: tanpa token ditolak 404');
 r = await callJson('POST', '/api/loadtest-results', ltGood, { authorization: 'Bearer salah' });
-assert(r.status === 401, 'loadtest: token salah ditolak 401');
-assert(env.DB.loadtestRuns.length === 0, 'loadtest: 401 tidak menyimpan run');
+assert(r.status === 404, 'loadtest: token salah ditolak 404');
+assert(env.DB.loadtestRuns.length === 0, 'loadtest: 404 tidak menyimpan run');
 r = await callJson('POST', '/api/loadtest-results', { ...ltGood, vu: 'sepuluh' }, { authorization: 'Bearer test-loadtest-token' });
 assert(r.status === 400, 'loadtest: vu bukan angka ditolak 400');
 r = await callJson('POST', '/api/loadtest-results', { ...ltGood, failed_rate: 1.5 }, { authorization: 'Bearer test-loadtest-token' });
@@ -2119,7 +2120,7 @@ assert(env.DB.loadtestRuns.length === 1 && env.DB.loadtestRuns[0].vu === 10, 'lo
 r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
 assert(t.includes('Hasil Load Test') && t.includes('Lulus') && t.includes('10 VU') && t.includes('320.5 ms') && t.includes('gagal 2%') && t.includes('WIB'), 'loadtest: run muncul di Super Panel (Lulus, VU, p95, gagal%, WIB)');
 assert(t.includes('status 200') && t.includes('checks lulus'), 'loadtest: per-jalur tampil di Super Panel');
-r = await call('GET', '/kendali/super', null, userCookie); assert(r.status === 303, 'loadtest: Super Panel tetap hanya admin');
+r = await call('GET', '/kendali/super', null, userCookie); t = await r.text(); assert(r.status === 404 && t.includes('Tidak ditemukan'), 'loadtest: Super Panel tetap hanya admin -> 404 tanpa sesi');
 // Token load test tidak bisa dipakai login admin
 r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-loadtest-token' }); assert(r.status === 403, 'loadtest: token khusus tidak bisa login admin');
 // Detail post dengan header X-Load-Test tidak menambah views
@@ -2374,7 +2375,7 @@ r = await callJson('GET', '/api/dracin/catalog', null);
 j = await r.json();
 assert(r.status === 200 && j.ok === true && Array.isArray(j.titles), 'dracin: katalog publik bisa dibaca tanpa kunci');
 r = await callJson('POST', '/api/dracin/sync', { titles: [] });
-assert(r.status === 401, 'dracin: sync tanpa kunci ditolak 401');
+assert(r.status === 404, 'dracin: sync tanpa kunci ditolak 404');
 r = await call('GET', '/kendali/super', null, cookie); t = await r.text();
 assert(t.includes('API Dracin') && t.includes('Buat Kunci Baru'), 'super panel: kartu API Dracin tampil');
 const csrf37 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
@@ -2484,10 +2485,10 @@ r = await call('GET', '/kendali', null, cookie); t = await r.text();
 const csrf39 = (t.match(/name="csrf" value="([^"]+)"/) || [])[1] || '';
 assert(csrf39.length > 10, 'cerpen-admin: token CSRF untuk tes API admin');
 const admH = { cookie, 'x-csrf': csrf39 };
-// Tanpa auth -> 401
-r = await callJson('GET', '/api/admin/cerpen-keys', null, {}); assert(r.status === 401, 'cerpen-admin: daftar key tanpa auth ditolak 401');
-r = await callJson('GET', '/api/admin/cerpen-submissions/stats', null, {}); assert(r.status === 401, 'cerpen-admin: stats tanpa auth ditolak 401');
-r = await callJson('POST', '/api/admin/cerpen-keys', { key_hash: 'c'.repeat(64), name: 'x', daily_limit: 10 }, {}); assert(r.status === 401, 'cerpen-admin: daftar key tanpa auth ditolak 401');
+// Tanpa auth -> 404
+r = await callJson('GET', '/api/admin/cerpen-keys', null, {}); assert(r.status === 404, 'cerpen-admin: daftar key tanpa auth ditolak 404');
+r = await callJson('GET', '/api/admin/cerpen-submissions/stats', null, {}); assert(r.status === 404, 'cerpen-admin: stats tanpa auth ditolak 404');
+r = await callJson('POST', '/api/admin/cerpen-keys', { key_hash: 'c'.repeat(64), name: 'x', daily_limit: 10 }, {}); assert(r.status === 404, 'cerpen-admin: daftar key tanpa auth ditolak 404');
 // Dengan auth tapi tanpa CSRF -> 403
 r = await callJson('GET', '/api/admin/cerpen-keys', null, { cookie }); assert(r.status === 403, 'cerpen-admin: daftar key tanpa CSRF ditolak 403');
 // Daftar key: hash hanya 8 karakter pertama, tidak pernah utuh
@@ -2538,7 +2539,7 @@ assert(r.status === 200 && jj.status === 'approved', 'cerpen-admin: approve pend
 assert(env.BACKUP_DB.cerpenAdminAudit.some(a => a.action === 'submission_approve' && a.target_id === 'sub-aaaaaaaaaaaa'), 'cerpen-admin: approve menulis audit');
 r = await callJson('POST', '/api/admin/cerpen-submissions/sub-aaaaaaaaaaaa/approve', {}, admH); assert(r.status === 409, 'cerpen-admin: approve kedua ditolak 409');
 // Halaman panel: tanpa auth -> redirect /akun; dengan auth -> tampil + masuk nav
-r = await call('GET', '/kendali/cerpen-api'); assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun'), 'cerpen-admin: halaman panel tanpa auth dialihkan ke /akun');
+r = await call('GET', '/kendali/cerpen-api'); t = await r.text(); assert(r.status === 404 && t.includes('Tidak ditemukan'), 'cerpen-admin: halaman panel tanpa auth -> 404');
 r = await call('GET', '/kendali/cerpen-api', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('Cerpen API') && t.includes('Cerpen Uji Pending') && t.includes('key-be663fc2') && t.includes('Riwayat admin'), 'cerpen-admin: halaman panel tampil (statistik + keys + submissions + audit)');
 assert(t.includes('href="/kendali/cerpen-api"'), 'cerpen-admin: panel masuk nav admin');
@@ -2617,8 +2618,8 @@ r = await callJson('POST', '/api/share/create', { content_type: 'komik', content
 assert(r.status === 201, 'share: create komik -> 201');
 r = await callJson('POST', '/api/share/create', { content_type: 'berita', content_id: 'news-1' });
 assert(r.status === 201, 'share: create berita -> 201');
-// Admin: tanpa auth 401, tanpa CSRF 403, daftar + filter + detail
-r = await callJson('GET', '/api/admin/cerpen-shares', null, {}); assert(r.status === 401, 'share-admin: daftar tanpa auth ditolak 401');
+// Admin: tanpa auth 404, tanpa CSRF 403, daftar + filter + detail
+r = await callJson('GET', '/api/admin/cerpen-shares', null, {}); assert(r.status === 404, 'share-admin: daftar tanpa auth ditolak 404');
 r = await callJson('GET', '/api/admin/cerpen-shares', null, { cookie }); assert(r.status === 403, 'share-admin: daftar tanpa CSRF ditolak 403');
 r = await callJson('GET', '/api/admin/cerpen-shares', null, admH); jj = await r.json();
 assert(r.status === 200 && jj.ok && jj.shares.length === 4 && jj.shares.some(s => s.id === shareRow.id) && Array.isArray(jj.top) && jj.top.some(s => s.content_id === 'cerpen-01'), 'share-admin: daftar 4 link + top shared berisi cerpen-01');
@@ -2669,8 +2670,8 @@ r = await callJson('POST', '/api/admin/cerpen-keys', { key_hash: aaKeyHash, name
 assert(r.status === 201 && jj.ok && jj.auto_approve_mode === 'off' && jj.auto_approve_until === null, 'auto-approve: key baru default mati (off)');
 const aaKeyId = jj.key_id;
 const aaSubmit = (n) => callJson('POST', '/api/cerpen-submit', { kind: 'cerpen', id: 'cerpen-aa-' + n, judul: 'Cerpen AA Uji ' + n, genre: 'Misteri', deskripsi: '', seasons: [{ season: 1, episodes: [{ no: 1, judul: 'Ep 1', isi: 'x'.repeat(300) }] }] }, { Authorization: 'Bearer ' + aaKeyPlain });
-// Tanpa auth -> 401; tanpa CSRF -> 403
-r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'always' }, {}); assert(r.status === 401, 'auto-approve: set mode tanpa auth ditolak 401');
+// Tanpa auth -> 404; tanpa CSRF -> 403
+r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'always' }, {}); assert(r.status === 404, 'auto-approve: set mode tanpa auth ditolak 404');
 r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'always' }, { cookie }); assert(r.status === 403, 'auto-approve: set mode tanpa CSRF ditolak 403');
 // Validasi mode + until
 r = await callJson('POST', '/api/admin/cerpen-keys/' + aaKeyId + '/auto-approve', { mode: 'bogus' }, admH); assert(r.status === 400, 'auto-approve: mode tidak valid ditolak 400');
@@ -2729,9 +2730,9 @@ const mdLimitHash = await sha256Hex(mdLimitPlain);
 env.BACKUP_DB.mdBackupKeys.push({ key_id: 'mdk-dddddddd', key_hash: mdLimitHash, name: 'kunci-limit', created_at: Date.now(), revoked: 0, daily_limit: 1 });
 const mdAuth = { Authorization: 'Bearer ' + mdPlain };
 const mdCall = (p, c) => callJson('POST', '/api/md-backup', p, c);
-// Tanpa key / key salah -> 401
-r = await mdCall({ path: 'a.md', content: 'x' }, {}); assert(r.status === 401, 'md-backup: tanpa key ditolak 401');
-r = await mdCall({ path: 'a.md', content: 'x' }, { Authorization: 'Bearer salah' }); assert(r.status === 401, 'md-backup: key salah ditolak 401');
+// Tanpa key / key salah -> 404
+r = await mdCall({ path: 'a.md', content: 'x' }, {}); assert(r.status === 404, 'md-backup: tanpa key ditolak 404');
+r = await mdCall({ path: 'a.md', content: 'x' }, { Authorization: 'Bearer salah' }); assert(r.status === 404, 'md-backup: key salah ditolak 404');
 // Path tidak valid -> 400
 r = await mdCall({ path: '../jahat.md', content: 'x' }, mdAuth); assert(r.status === 400, 'md-backup: path .. ditolak 400');
 r = await mdCall({ path: '/absolut.md', content: 'x' }, mdAuth); assert(r.status === 400, 'md-backup: path absolut ditolak 400');
@@ -2748,8 +2749,8 @@ const mdIdV2 = jj.id;
 // Rate limit harian: key limit 1 -> kirim ke-2 ditolak 429
 r = await mdCall({ path: 'data/limit.md', content: 'satu' }, { Authorization: 'Bearer ' + mdLimitPlain }); assert(r.status === 201, 'md-backup: key limit 1 kirim pertama 201');
 r = await mdCall({ path: 'data/limit.md', content: 'dua' }, { Authorization: 'Bearer ' + mdLimitPlain }); assert(r.status === 429, 'md-backup: key limit 1 kirim kedua 429');
-// Admin tanpa auth -> 401; tanpa CSRF -> 403
-r = await callJson('GET', '/api/admin/md-backups', null, {}); assert(r.status === 401, 'md-backup-admin: daftar tanpa auth ditolak 401');
+// Admin tanpa auth -> 404; tanpa CSRF -> 403
+r = await callJson('GET', '/api/admin/md-backups', null, {}); assert(r.status === 404, 'md-backup-admin: daftar tanpa auth ditolak 404');
 r = await callJson('GET', '/api/admin/md-backup-keys', null, { cookie }); assert(r.status === 403, 'md-backup-admin: daftar key tanpa CSRF ditolak 403');
 // Daftar file: tanpa content, path + jumlah versi tampil
 r = await callJson('GET', '/api/admin/md-backups', null, admH); jj = await r.json();
@@ -2774,21 +2775,21 @@ r = await callJson('GET', '/api/admin/md-backup-keys', null, admH); jj = await r
 assert(r.status === 200 && jj.keys.some(k => k.key_id === 'mdk-cccccccc' && k.key_hash_prefix.length === 8 && !('key_hash' in k)), 'md-backup-admin: daftar key, hash hanya 8 karakter');
 r = await callJson('POST', '/api/admin/md-backup-keys/mdk-cccccccc/revoke', {}, admH); jj = await r.json();
 assert(r.status === 200 && jj.revoked === 1, 'md-backup-admin: revoke key');
-r = await mdCall({ path: 'data/uji.md', content: 'x baru' }, mdAuth); assert(r.status === 401, 'md-backup: key dicabut -> submit 401');
+r = await mdCall({ path: 'data/uji.md', content: 'x baru' }, mdAuth); assert(r.status === 404, 'md-backup: key dicabut -> submit 401');
 r = await callJson('POST', '/api/admin/md-backup-keys/mdk-cccccccc/unrevoke', {}, admH); assert(r.status === 200, 'md-backup-admin: unrevoke key');
 r = await callJson('POST', '/api/admin/md-backup-keys/mdk-cccccccc/limit', { daily_limit: 101 }, admH); assert(r.status === 400, 'md-backup-admin: limit 101 ditolak 400');
 r = await callJson('POST', '/api/admin/md-backup-keys/mdk-00000000/revoke', {}, admH); assert(r.status === 404, 'md-backup-admin: key hilang -> 404');
-// Daftarkan kunci baru dari plaintext (v73): tanpa auth -> 401;
+// Daftarkan kunci baru dari plaintext (v73): tanpa auth -> 404;
 // kunci pendek -> 400; berhasil -> key_id mdk-... dan plaintext TIDAK
 // kembali; kunci sama -> 409; kunci baru langsung bisa submit.
-r = await callJson('POST', '/api/admin/md-backup-keys', { name: 'uji-baru', key: 'kunci-rahasia-uji-1234', daily_limit: 50 }, {}); assert(r.status === 401, 'md-backup-admin: daftar kunci tanpa auth ditolak 401');
+r = await callJson('POST', '/api/admin/md-backup-keys', { name: 'uji-baru', key: 'kunci-rahasia-uji-1234', daily_limit: 50 }, {}); assert(r.status === 404, 'md-backup-admin: daftar kunci tanpa auth ditolak 404');
 r = await callJson('POST', '/api/admin/md-backup-keys', { name: 'uji-baru', key: 'pendek', daily_limit: 50 }, admH); assert(r.status === 400, 'md-backup-admin: kunci pendek ditolak 400');
 r = await callJson('POST', '/api/admin/md-backup-keys', { name: 'uji-baru', key: 'kunci-rahasia-uji-1234', daily_limit: 50 }, admH); jj = await r.json();
 assert(r.status === 200 && jj.ok && /^mdk-[0-9a-f]{8}$/.test(jj.key_id) && !('key_hash' in jj) && !('key' in jj), 'md-backup-admin: daftar kunci baru, plaintext tidak kembali');
 r = await callJson('POST', '/api/admin/md-backup-keys', { name: 'duplikat', key: 'kunci-rahasia-uji-1234', daily_limit: 50 }, admH); assert(r.status === 409, 'md-backup-admin: kunci sama ditolak 409');
 r = await mdCall({ path: 'data/baru.md', content: 'dari kunci baru' }, { Authorization: 'Bearer kunci-rahasia-uji-1234' }); assert(r.status === 201, 'md-backup: kunci baru terdaftar bisa submit');
 // Halaman admin + viewer render ala GitHub
-r = await call('GET', '/kendali/md-backup'); assert(r.status === 303 && (r.headers.get('location') || '') === '/akun?pesan=login', 'md-backup: halaman tanpa auth dialihkan ke login');
+r = await call('GET', '/kendali/md-backup'); t = await r.text(); assert(r.status === 404 && t.includes('Tidak ditemukan'), 'md-backup: halaman tanpa auth -> 404');
 r = await call('GET', '/kendali/md-backup', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('Backup .md') && t.includes('data/uji.md'), 'md-backup: halaman admin memuat daftar file');
 r = await call('GET', '/kendali/md-backup?view=mdb-111111111111', null, cookie); t = await r.text();
@@ -2813,7 +2814,7 @@ assert(r.status === 400, 'app-tamper: body array ditolak 400');
   r = await worker.fetch(req, env);
   assert(r.status === 400, 'app-tamper: body bukan JSON ditolak 400');
 }
-r = await call('GET', '/kendali/tamper'); assert(r.status === 303 && (r.headers.get('location') || '') === '/akun?pesan=login', 'app-tamper: halaman tanpa auth dialihkan ke login');
+r = await call('GET', '/kendali/tamper'); t = await r.text(); assert(r.status === 404 && t.includes('Tidak ditemukan'), 'app-tamper: halaman tanpa auth -> 404');
 r = await call('GET', '/kendali/tamper', null, cookie); t = await r.text();
 assert(r.status === 200 && t.includes('Laporan Tamper') && t.includes('com.palsu.fbmanager') && t.includes('POCO X6 Pro') && t.includes('Tamper'), 'app-tamper: halaman admin memuat laporan terbaru + nav Tamper');
 // 43. Layout mobile panel admin (v70, 12 Nov 2026): baris .adm-row
@@ -2896,7 +2897,7 @@ assert(r.status === 200 && t.includes('.adm-nav{display:flex;flex-wrap:wrap') &&
 }
 // 46. Waktu baca end-to-end (v81): heartbeat -> statistik -> panel admin.
 r = await callJson('POST', '/api/reading/heartbeat', { seconds: 120, post_id: 'post-uji', max_scroll: 500, csrf: userCsrf });
-assert(r.status === 401, 'reading: heartbeat anonim ditolak 401');
+assert(r.status === 404, 'reading: heartbeat anonim ditolak 404');
 r = await callJson('POST', '/api/reading/heartbeat', { seconds: 120, post_id: 'post-uji', max_scroll: 500, csrf: userCsrf }, { cookie: userCookie });
 let hb = await r.json();
 assert(r.status === 200 && hb.ok && hb.stored === 120, 'reading: heartbeat akun tersimpan 120 detik');
@@ -2910,7 +2911,7 @@ assert(r.status === 400, 'reading: heartbeat >120 detik ditolak 400');
 r = await callJson('POST', '/api/reading/heartbeat', { seconds: 30, post_id: 'post-uji', max_scroll: 0, csrf: 'salah' }, { cookie: userCookie });
 assert(r.status === 403, 'reading: heartbeat CSRF salah ditolak 403');
 r = await call('GET', '/api/reading/stats');
-assert(r.status === 401, 'reading: statistik tanpa login ditolak 401');
+assert(r.status === 404, 'reading: statistik tanpa login ditolak 404');
 r = await call('GET', '/api/reading/stats', null, userCookie);
 const st1 = await r.json();
 assert(r.status === 200 && st1.totalSeconds === 180 && st1.totalMinutes === 3 && st1.daysActive === 1, 'reading: statistik pemilik = 180 detik / 3 menit / 1 hari');
@@ -2921,7 +2922,7 @@ r = await call('POST', '/akun/daftar', { username: 'siti', password: 'password12
 const sitiCookie = await verifikasiKode('siti@example.com');
 const budi = [...env.DB.users.values()].find(u => u.username === 'budi');
 r = await call('GET', '/api/reading/stats?user=' + budi.id, null, sitiCookie);
-assert(r.status === 403, 'reading: akun lain tidak boleh lihat statistik budi');
+assert(r.status === 404, 'reading: akun lain tidak boleh lihat statistik budi -> 404');
 r = await call('GET', '/api/reading/stats?user=' + budi.id, null, cookie);
 const stAdmin = await r.json();
 assert(r.status === 200 && stAdmin.username === 'budi' && stAdmin.totalSeconds === 180, 'reading: admin bisa lihat statistik akun mana pun');
@@ -3736,7 +3737,7 @@ assert(r.status === 200, 'koin lock: akun dibuka lagi');
 
 // Verifikasi centang (v87.2): toggle admin-only, /me + leaderboard memuat verified.
 r = await coinCall('POST', '/api/admin/cerpen-koin/users/' + koinUser.id + '/verify', null, {});
-assert(r.status === 401, 'koin verify: tanpa sesi admin ditolak 401');
+assert(r.status === 404, 'koin verify: tanpa sesi admin ditolak 404');
 r = await coinAdmin('/api/admin/cerpen-koin/users/' + koinUser.id + '/verify', 'POST', {});
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.verified === 1, 'koin verify: admin memberi centang');
@@ -3821,7 +3822,7 @@ r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: S
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.likes === 0 && sj.my_vote === 0, 'social vote: like kedua = batalkan');
 r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: -1, device_id: SOC_DEV });
-assert(r.status === 401 && JSON.parse(await r.text()).error === 'login_required', 'social vote: dislike guest -> 401 login_required');
+assert(r.status === 404 && JSON.parse(await r.text()).error === 'not found', 'social vote: dislike guest -> 404 not found');
 env.DB.rateLimits = new Map();
 r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: -1, device_id: SOC_DEV }, { authorization: 'Bearer ' + koinSession });
 sj = JSON.parse(await r.text());
@@ -3883,7 +3884,7 @@ assert(r.status === 200 && JSON.parse(await r.text()).likes === 1, 'social liker
 r = await socialCall('POST', '/api/cerpen-social/vote', { kind: 'cerpen', ref: SOC_REF, vote: 1, device_id: SOC_DEV }, { authorization: 'Bearer ' + koinSession });
 assert(r.status === 200 && JSON.parse(await r.text()).likes === 2, 'social likers v87.4: like login dulu (persiapan)');
 r = await socialCall('GET', '/api/admin/cerpen-social/likes?kind=cerpen&ref=' + SOC_REF, null);
-assert(r.status === 401, 'social likers v87.4: tanpa sesi admin -> 401');
+assert(r.status === 404, 'social likers v87.4: tanpa sesi admin -> 404');
 r = await socialCall('GET', '/api/admin/cerpen-social/likes?kind=cerpen&ref=' + SOC_REF, null, { 'x-csrf': coinCsrf, cookie });
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.ok === true && sj.total === 2 && sj.likers.length === 2, 'social likers v87.4: total 2 pemberi like');
@@ -3912,11 +3913,11 @@ async function bmCall(method, path, obj, headers = {}) {
   return worker.fetch(req, env);
 }
 r = await bmCall('GET', '/api/cerpen-bookmarks', null);
-assert(r.status === 401 && JSON.parse(await r.text()).error === 'login_required', 'bookmark v87.5: tanpa sesi -> 401 login_required');
+assert(r.status === 404 && JSON.parse(await r.text()).error === 'not found', 'bookmark v87.5: tanpa sesi -> 404 not found');
 r = await bmCall('POST', '/api/cerpen-bookmarks', { kind: 'cerpen', content_id: 'cerpen-01' });
-assert(r.status === 401, 'bookmark v87.5: POST tanpa sesi -> 401');
+assert(r.status === 404, 'bookmark v87.5: POST tanpa sesi -> 404');
 r = await bmCall('DELETE', '/api/cerpen-bookmarks?kind=cerpen&content_id=cerpen-01', null);
-assert(r.status === 401, 'bookmark v87.5: DELETE tanpa sesi -> 401');
+assert(r.status === 404, 'bookmark v87.5: DELETE tanpa sesi -> 404');
 env.DB.rateLimits = new Map();
 r = await bmCall('POST', '/api/cerpen-bookmarks', { kind: 'cerpen', content_id: 'cerpen-01' }, { authorization: 'Bearer ' + koinSession });
 sj = JSON.parse(await r.text());
@@ -4068,7 +4069,7 @@ assert(r.status === 200, 'taptap v1.1.0: buat akun 99999999 ok');
 r = await tttCall('POST', '/api/taptap/profile', { account_id: '99999999', player_name: 'Base', score: 2001000, total_energy_all_time: 2001000, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
 assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap v1.1.0: pertumbuhan mencurigakan (+2jt) tetap diterima');
 r = await tttCall('GET', '/api/taptap/admin/flags', null);
-assert(r.status === 401, 'taptap v1.1.0: GET /admin/flags tanpa token -> 401');
+assert(r.status === 404 && JSON.parse(await r.text()).error === 'not_found', 'taptap v1.1.0: GET /admin/flags tanpa token -> 404 not_found');
 r = await tttCall('GET', '/api/taptap/admin/flags', null, TTT_ADMIN_H);
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.flags.some(f => f.account_id === '99999999' && f.reason === 'score_growth_suspicious'), 'taptap v1.1.0: flag pertumbuhan tercatat + terbaca admin');
@@ -4076,7 +4077,7 @@ assert(r.status === 200 && sj.flags.some(f => f.account_id === '99999999' && f.r
 r = await tttCall('POST', '/api/taptap/chat', { sender_id: '33333333', sender_name: 'TeboDua', message: 'halo tebo' });
 assert(r.status === 200, 'taptap v1.1.0: chat 33333333 sebelum ban ok');
 r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '22222222', ban_type: 'temp7', reason: 'skor curang' });
-assert(r.status === 401, 'taptap v1.1.0: admin/ban tanpa token -> 401');
+assert(r.status === 404 && JSON.parse(await r.text()).error === 'not_found', 'taptap v1.1.0: admin/ban tanpa token -> 404 not_found');
 r = await tttCall('POST', '/api/taptap/admin/ban', { account_id: '22222222', ban_type: 'temp7', reason: 'skor curang' }, TTT_ADMIN_H);
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.ok === true && sj.ban.type === 'temp7' && Date.parse(sj.ban.until) > Date.now() + 6 * 24 * 3600 * 1000, 'taptap v1.1.0: admin ban temp7 ok, ban_until ~7 hari');
@@ -4194,10 +4195,10 @@ sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.ok === true && sj.guest_id === GUEST_A && sj.api_key !== KEY_A1, 'taptap admin: register ulang ROTASI key (key baru != key lama, guest_id sama)');
 const KEY_A2 = sj.api_key;
 r = await tttCall('POST', '/api/taptap/heartbeat', { guest_id: GUEST_A, session_id: 'sess-a1', taps_last_60s: 10, max_taps_per_sec: 2, total_taps: 10, session_started_at: new Date().toISOString(), app_version: '1.1.2' }, { 'x-ttt-api-key': KEY_A1 });
-assert(r.status === 401 && JSON.parse(await r.text()).error === 'invalid_api_key', 'taptap admin: key lama (terotasi) ditolak 401 invalid_api_key');
+assert(r.status === 404 && JSON.parse(await r.text()).error === 'not_found', 'taptap admin: key lama (terotasi) ditolak 404 not_found');
 // Heartbeat tanpa key -> 401; heartbeat normal -> ok + sesi dimulai.
 r = await tttCall('POST', '/api/taptap/heartbeat', { guest_id: GUEST_A, session_id: 'sess-a1', taps_last_60s: 10, max_taps_per_sec: 2, total_taps: 10, session_started_at: new Date().toISOString(), app_version: '1.1.2' });
-assert(r.status === 401 && JSON.parse(await r.text()).error === 'api_key_required', 'taptap admin: heartbeat tanpa key -> 401');
+assert(r.status === 404 && JSON.parse(await r.text()).error === 'not_found', 'taptap admin: heartbeat tanpa key -> 404 not_found');
 r = await tttCall('POST', '/api/taptap/heartbeat', { guest_id: GUEST_A, session_id: 'sess-a1', taps_last_60s: 10, max_taps_per_sec: 2, total_taps: 10, session_started_at: new Date().toISOString(), app_version: '1.1.2', is_rooted: true, root_methods: ['magisk'], is_emulator: false, bootloader_locked: false }, { 'x-ttt-api-key': KEY_A2 });
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.ok === true && Array.isArray(sj.commands) && sj.commands.length === 0 && sj.banned === false, 'taptap admin: heartbeat key baru ok, sesi dimulai, tidak diblokir');
@@ -4257,7 +4258,7 @@ sj = JSON.parse(await r.text());
 const c1row = (sj.codes || []).find(x => x.code === CODE1);
 assert(c1row && Number(c1row.used_count) === 1, 'audit: used_count CODE1 tetap 1 (kuota dikembalikan)');
 r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_D, account_id: '66666666', code: CODE1 });
-assert(r.status === 401 && JSON.parse(await r.text()).error === 'api_key_required', 'taptap admin: redeem tanpa key -> 401');
+assert(r.status === 404 && JSON.parse(await r.text()).error === 'not_found', 'taptap admin: redeem tanpa key -> 404 not_found');
 // 4b. Redeem: edit kode, riwayat penukaran, cabut (nonaktifkan).
 r = await tttCall('POST', '/api/taptap/admin/redeem/create', { benefit_type: 'energy', benefit_value: 1000, max_uses: 2 }, TTT_ADMIN_H);
 sj = JSON.parse(await r.text());
@@ -4288,7 +4289,7 @@ assert(r.status === 200 && sj.codes.some(x => x.code === CODE2 && x.benefit_type
 r = await tttCall('POST', '/api/taptap/admin/redeem/update', { code: 'TTT-TIDAK-ADA', benefit_type: 'energy', benefit_value: 100, max_uses: 1 }, TTT_ADMIN_H);
 assert(r.status === 404 && JSON.parse(await r.text()).error === 'code_not_found', 'taptap admin: edit kode tak ada -> 404');
 r = await tttCall('POST', '/api/taptap/admin/redeem/update', { code: CODE2, benefit_type: 'energy', benefit_value: 100, max_uses: 1 });
-assert(r.status === 401, 'taptap admin: edit kode tanpa admin -> 401');
+assert(r.status === 404 && JSON.parse(await r.text()).error === 'not_found', 'taptap admin: edit kode tanpa admin -> 404 not_found');
 r = await tttCall('POST', '/api/taptap/admin/redeem/deactivate', { code: CODE2 }, TTT_ADMIN_H);
 assert(r.status === 200 && JSON.parse(await r.text()).ok === true, 'taptap admin: cabut CODE2 ok');
 r = await tttCall('POST', '/api/taptap/redeem', { guest_id: GUEST_R2, account_id: '77777777', code: CODE2 }, { 'x-ttt-api-key': KEY_R2 });
@@ -4346,7 +4347,7 @@ sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.banned === true && sj.ban_type === 'temp30', 'taptap admin: heartbeat saat diblokir -> 200 banned:true (meski key dicabut)');
 r = await tttCall('POST', '/api/taptap/profile', { account_id: '66666666', player_name: 'RedeemKu', score: 50100, total_energy_all_time: 50100, levels: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, { 'x-ttt-api-key': KEY_D });
 sj = JSON.parse(await r.text());
-assert(r.status === 403 && sj.error === 'banned' && sj.ban_type === 'key_revoked', 'taptap admin: endpoint lama dengan key tercabut -> 403 banned/key_revoked');
+assert(r.status === 404 && sj.error === 'not_found', 'taptap admin: endpoint lama dengan key tercabut -> 404 not_found');
 r = await tttCall('POST', '/api/taptap/register', { account_id: '66666666', fingerprint: FP_D, device_model: 'POCO X6 Pro', android_version: '16', app_version: '1.1.2' });
 sj = JSON.parse(await r.text());
 assert(r.status === 200 && sj.banned === true && sj.ban_type === 'temp30', 'taptap admin: register fingerprint sama saat diblokir -> 200 banned:true');
@@ -4449,7 +4450,7 @@ async function trackAdmin(path, method, obj) {
 }
 // Admin tanpa sesi / CSRF salah.
 r = await coinCall('GET', '/api/admin/cerpen-track/overview', null);
-assert(r.status === 401, 'track admin: tanpa sesi admin -> 401');
+assert(r.status === 404, 'track admin: tanpa sesi admin -> 404');
 r = await coinCall('GET', '/api/admin/cerpen-track/overview', null, { 'x-csrf': 'salah', cookie });
 assert(r.status === 403, 'track admin: CSRF salah -> 403');
 // Validasi register.
@@ -4472,9 +4473,9 @@ rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.key_exists === true && !rj.api_key, 'track register: kunci aktif sudah ada -> key_exists, tanpa plaintext lagi');
 // Heartbeat: tanpa kunci / kunci salah / kunci benar + sesi baca.
 r = await coinCall('POST', '/api/cerpen-track/heartbeat', { reading_seconds: 30 });
-assert(r.status === 401, 'track heartbeat: tanpa kunci -> 401');
+assert(r.status === 404, 'track heartbeat: tanpa kunci -> 404');
 r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: 'ck-' + '0'.repeat(32), reading_seconds: 30 });
-assert(r.status === 401, 'track heartbeat: kunci tidak dikenal -> 401');
+assert(r.status === 404, 'track heartbeat: kunci tidak dikenal -> 404');
 env.DB.rateLimits = new Map();
 r = await coinCall('POST', '/api/cerpen-track/heartbeat', { api_key: KEY_A, reading: { kind: 'cerpen', target_id: 'cerpen-01', season: 1, no: 1 }, reading_seconds: 60 }, { 'x-cerpen-api-key': KEY_A });
 rj = JSON.parse(await r.text());
@@ -4487,7 +4488,7 @@ rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.closed === true && rj.seconds === 90, 'track session/end: sesi ditutup, detik terakumulasi 60+30');
 // Status: wajib kunci, kunci valid -> 200.
 r = await coinCall('GET', '/api/cerpen-track/status', null);
-assert(r.status === 401, 'track status: tanpa kunci -> 401');
+assert(r.status === 404, 'track status: tanpa kunci -> 404');
 r = await coinCall('GET', '/api/cerpen-track/status?api_key=' + encodeURIComponent(KEY_A), null);
 rj = JSON.parse(await r.text());
 assert(r.status === 200 && rj.ok === true && rj.banned === false, 'track status: kunci valid -> 200');
@@ -4790,24 +4791,24 @@ async function hubCall(method, path, obj, headers = {}) {
   const req = new Request(base + path, { method, headers: h, body: obj === null ? undefined : JSON.stringify(obj) });
   return worker.fetch(req, env);
 }
-// Tanpa auth -> 401 di semua endpoint hub.
+// Tanpa auth -> 404 di semua endpoint hub.
 r = await hubCall('GET', '/api/hub/status', null);
-assert(r.status === 401, 'hub: status tanpa auth -> 401');
+assert(r.status === 404, 'hub: status tanpa auth -> 404');
 r = await hubCall('GET', '/api/hub/tasks?to=alyaa&status=baru', null);
-assert(r.status === 401, 'hub: tasks tanpa auth -> 401');
+assert(r.status === 404, 'hub: tasks tanpa auth -> 404');
 r = await hubCall('POST', '/api/hub/tasks', { to_muse: 'sekar', title: 'x' });
-assert(r.status === 401, 'hub: buat tugas tanpa auth -> 401');
+assert(r.status === 404, 'hub: buat tugas tanpa auth -> 404');
 r = await hubCall('GET', '/api/hub/muses', null);
-assert(r.status === 401, 'hub: daftar muse tanpa auth -> 401');
+assert(r.status === 404, 'hub: daftar muse tanpa auth -> 404');
 r = await hubCall('POST', '/api/hub/muses', { id: 'alyaa', name: 'Alyaa' });
-assert(r.status === 401, 'hub: daftar muse tanpa auth -> 401');
+assert(r.status === 404, 'hub: daftar muse tanpa auth -> 404');
 // Login admin baru untuk rangkaian tes hub.
 r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' });
 const hubCookie = cookieHeader(cookiesOf(r));
 assert(hubCookie.includes('cms_access='), 'hub: login admin untuk tes hub');
 r = await call('GET', '/kendali/hub', null, hubCookie); t = await r.text();
 assert(r.status === 200 && t.includes('Hub Muse'), 'hub: panel /kendali/hub render sebagai admin');
-const hubCsrf = (t.match(/HUB_CSRF = "([^"]+)"/) || [])[1] || '';
+const hubCsrf = (t.match(/HUB_CSRF\s*=\s*"([^"]+)"/) || [])[1] || '';
 assert(hubCsrf.length > 10, 'hub: CSRF panel hub terbaca');
 const hubAdmH = { cookie: hubCookie, 'x-csrf': hubCsrf };
 // Daftarkan alyaa + sekar (kunci tampil sekali di respons).
@@ -4837,23 +4838,51 @@ r = await hubCall('GET', '/api/hub/tasks?to=sekar&status=baru', null, { authoriz
 assert(r.status === 200 && hj.tasks.length === 1 && hj.tasks[0].id === TASK_ID, 'hub: sekar polling tugas baru -> 1 tugas');
 // Alyaa tidak boleh mengintip antrean Sekar.
 r = await hubCall('GET', '/api/hub/tasks?to=sekar&status=baru', null, { authorization: 'Bearer ' + ALYAA_KEY });
-assert(r.status === 403, 'hub: alyaa intip antrean sekar -> 403');
-// Kunci salah -> 401.
+assert(r.status === 404, 'hub: alyaa intip antrean sekar -> 404');
+// Kunci salah -> 404.
 r = await hubCall('GET', '/api/hub/tasks?to=sekar', null, { authorization: 'Bearer hb-0000000000000000000000000000000000000000000000000000000000000000' });
-assert(r.status === 401, 'hub: kunci salah -> 401');
+assert(r.status === 404, 'hub: kunci salah -> 404');
 // Sekar ubah status + catatan.
 r = await hubCall('POST', '/api/hub/tasks/' + TASK_ID + '/status', { status: 'dikerjakan', note: 'mulai menulis' }, { authorization: 'Bearer ' + SEKAR_KEY }); hj = await r.json();
 assert(r.status === 200 && hj.task.status === 'dikerjakan' && hj.task.done_note === 'mulai menulis', 'hub: sekar ubah status -> dikerjakan');
 // Alyaa tidak boleh ubah status tugas Sekar; status tidak valid -> 400.
 r = await hubCall('POST', '/api/hub/tasks/' + TASK_ID + '/status', { status: 'selesai' }, { authorization: 'Bearer ' + ALYAA_KEY });
-assert(r.status === 403, 'hub: alyaa ubah status tugas sekar -> 403');
+assert(r.status === 404, 'hub: alyaa ubah status tugas sekar -> 404');
 r = await hubCall('POST', '/api/hub/tasks/' + TASK_ID + '/status', { status: 'ngaco' }, { authorization: 'Bearer ' + SEKAR_KEY });
 assert(r.status === 400, 'hub: status tidak valid -> 400');
 // Health dengan kunci Muse.
 r = await hubCall('GET', '/api/hub/status', null, { authorization: 'Bearer ' + SEKAR_KEY }); hj = await r.json();
 assert(r.status === 200 && hj.ok && hj.muses === 2 && hj.tasks_baru === 0 && hj.tasks_dikerjakan === 1, 'hub: status health -> muses 2, baru 0, dikerjakan 1');
-// Panel tanpa admin -> dialihkan ke login.
+// Panel tanpa admin -> 404 standar (bukan dialihkan ke login).
 r = await call('GET', '/kendali/hub');
-assert(r.status === 303 || r.status === 302, 'hub: panel tanpa admin -> redirect login');
+t = await r.text(); assert(r.status === 404 && t.includes('Tidak ditemukan'), 'hub: panel tanpa admin -> 404');
+
+// Uniform-404 (22 Nov 2026): jawaban auth-gagal SAMA PERSIS dengan path
+// yang memang tidak ada — status + body tidak bisa dibedakan.
+// Hub tanpa kunci -> 404 dengan body JSON standar (persis, bukan kira-kira).
+r = await hubCall('GET', '/api/hub/status', null);
+const hubNoKeyBody = await r.text();
+assert(r.status === 404 && hubNoKeyBody === '{"ok":false,"error":"not found"}', 'hub: tanpa kunci -> 404 body standar persis');
+// Hub kunci salah -> 404 dengan body yang SAMA PERSIS dengan tanpa kunci.
+r = await hubCall('GET', '/api/hub/status', null, { authorization: 'Bearer hb-0000000000000000000000000000000000000000000000000000000000000000' });
+const hubWrongKeyBody = await r.text();
+assert(r.status === 404 && hubWrongKeyBody === hubNoKeyBody, 'hub: kunci salah -> 404 body sama persis dengan tanpa kunci');
+// Path ngawur di /api/* -> 404 dengan body yang SAMA PERSIS dengan hub tanpa kunci.
+r = await call('GET', '/api/jalur-yang-tidak-ada-xyz');
+const garbageApiBody = await r.text();
+assert(r.status === 404 && garbageApiBody === hubNoKeyBody, '404: path api ngawur -> body sama persis dengan hub tanpa kunci');
+// Path ngawur di luar /api/* -> halaman 404 standar (bukan redirect login).
+r = await call('GET', '/halaman-yang-tidak-ada-xyz'); t = await r.text();
+assert(r.status === 404 && t.includes('Tidak ditemukan'), '404: path halaman ngawur -> halaman 404 standar');
+// Route publik tetap 200: beranda + versi cerpen + halaman login.
+r = await call('GET', '/'); t = await r.text();
+assert(r.status === 200, 'publik: beranda tetap 200');
+r = await call('GET', '/api/cerpen-version');
+assert(r.status === 200, 'publik: /api/cerpen-version tetap 200');
+r = await call('GET', '/akun'); t = await r.text();
+assert(r.status === 200 && t.includes('Masuk'), 'publik: /akun tetap 200 (login bisa dibuka)');
+// Admin login tetap bisa masuk panel (sesi admin valid -> 200, bukan 404).
+r = await call('GET', '/kendali/hub', null, hubCookie); t = await r.text();
+assert(r.status === 200 && t.includes('Hub Muse'), 'hub: admin login tetap bisa masuk panel /kendali/hub');
 
 console.log('Selesai, exitCode=' + (process.exitCode || 0));
