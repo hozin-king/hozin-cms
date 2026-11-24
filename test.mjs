@@ -1532,6 +1532,12 @@ let r = await call('GET', '/'); let t = await r.text();
 assert(t.includes('Selamat Datang di WorkerCMS'), 'beranda: post sambutan tampil');
 assert(t.includes('menit baca'), 'beranda: plugin waktu baca aktif');
 assert(t.includes('id="copyr"') && t.includes('<a href="/uptime">Uptime</a>') && !t.includes('id="uptime"'), 'beranda: footer copyright + tautan Uptime (tanpa detik berjalan)');
+// Open Graph beranda (24 Nov 2026 — perbaikan preview WhatsApp: sebelumnya
+// beranda tanpa deskripsi + og:image di ImgBB, preview WA hanya judul+domain).
+assert(t.includes('og:description') && t.includes('Blog Hozin King'), 'OG beranda: deskripsi default tampil (bukan kosong)');
+assert(t.includes('property="og:image" content="https://raw.githubusercontent.com/hozin-king/hozin-cms/main/public/logo/og-image-1200x630.png"'), 'OG beranda: og:image dari repo sendiri (bukan ImgBB)');
+assert(t.includes('property="og:image:width" content="1200"') && t.includes('property="og:image:height" content="630"'), 'OG beranda: ukuran gambar 1200x630 diklaim');
+assert(t.includes('property="og:site_name" content="WorkerCMS"'), 'OG beranda: og:site_name tampil (= judul situs)');
 
 // 2. Login terpadu di form biasa /akun: nama 'admin' + token admin
 // (salah -> 403 generik, benar -> token akses + refresh + dashboard super-admin)
@@ -1862,6 +1868,14 @@ const sampul = env.DB.posts.find(x => x.title === 'Post Sampul Uji');
 assert(sampul && sampul.slug, 'post sampul tersimpan dengan slug');
 r = await call('GET', '/', null, cookie); t = await r.text();
 assert(t.includes('class="post-cover"') && t.includes('https://x.test/cover.png'), 'kartu beranda: sampul gambar pertama tampil');
+// OG post bergambar (24 Nov 2026): og:image = gambar pertama body, dan
+// ukuran 1200x630 TIDAK diklaim (dimensi gambar postingan tidak diketahui).
+// Pakai variabel terpisah supaya `t` (HTML beranda) tetap utuh untuk assert
+// kartu di bawah.
+const tp = await (await call('GET', '/post/' + sampul.slug)).text();
+assert(tp.includes('property="og:image" content="https://x.test/cover.png"'), 'OG post: og:image = gambar pertama body');
+assert(!tp.includes('property="og:image:width"'), 'OG post: ukuran gambar tidak diklaim untuk gambar postingan');
+assert(tp.includes('property="og:type" content="article"'), 'OG post: tipe article');
 assert(t.includes('Selengkapnya'), 'kartu beranda: tombol Selengkapnya tampil');
 assert(t.includes('id="fabPost"') && t.includes('/kendali/posts/new'), 'beranda admin: FAB posting tampil ke halaman Post Baru');
 assert(t.includes('/kendali/posts/edit?id=' + sampul.id), 'kartu beranda admin: link Edit tampil');

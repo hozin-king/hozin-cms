@@ -102,7 +102,16 @@ export function adsenseHead(client) {
 const SITE_FAVICON_16 = 'https://i.ibb.co/LyL3Tt3/favicon-16.png';
 const SITE_FAVICON_32 = 'https://i.ibb.co/Mxj5MjDD/favicon-32.png';
 const SITE_APPLE_TOUCH_ICON = 'https://raw.githubusercontent.com/hozin-king/hozin-cms/main/public/logo/apple-touch-180.png';
-const SITE_OG_LOGO = 'https://i.ibb.co/PsWLn47z/og-logo-1200x630.png';
+// 24 Nov 2026 — og:image DIPINDAH dari ImgBB ke repo sendiri
+// (public/logo/og-image-1200x630.png, file yang sama persis, md5 cocok).
+// Alasan: WhatsApp menampilkan preview tanpa gambar (cache crawler +
+// host pihak ketiga); gambar dari domain/repo sendiri paling andal
+// diambil crawler. URL ImgBB lama: https://i.ibb.co/PsWLn47z/og-logo-1200x630.png
+const SITE_OG_LOGO = 'https://raw.githubusercontent.com/hozin-king/hozin-cms/main/public/logo/og-image-1200x630.png';
+// Deskripsi default situs (24 Nov 2026): dipakai halaman tanpa deskripsi
+// sendiri (mis. Beranda) — tanpanya WhatsApp hanya menampilkan judul +
+// domain, tanpa baris deskripsi.
+const SITE_DEFAULT_DESC = 'Blog Hozin King — tutorial Android, mod game, dan proyek aplikasi, ditulis langsung oleh pemiliknya.';
 // Logo baru (18 Nov 2026) — isi URL PNG hasil upload ke ImgBB setelah
 // varian logo dipilih. Kosong = tag ukuran itu tidak dirender (fallback
 // ke 16/32 lama). 48px adalah ukuran rekomendasi Google Search.
@@ -120,7 +129,7 @@ function shell(css, def, siteTitle, pageTitle, content, siteAvatar, metaDesc = '
   const mark = esc(String(siteTitle || 'W').trim().charAt(0).toUpperCase() || 'W');
   siteTitle = esc(String(siteTitle ?? ''));
   pageTitle = esc(String(pageTitle ?? ''));
-  const desc = metaDesc ? esc(String(metaDesc).slice(0, 155)) : '';
+  const desc = metaDesc ? esc(String(metaDesc).slice(0, 155)) : esc(SITE_DEFAULT_DESC);
   const avatarHtml = siteAvatar ? `<img src="${siteAvatar}" alt="" style="width:26px;height:26px;flex:0 0 26px;margin-right:9px;border-radius:50%;object-fit:cover">` : '';
   const accent = def.accent;
   const markSvg = SITE_LOGO_MARK_SVG || `<svg viewBox="0 0 48 48" aria-hidden="true"><rect width="48" height="48" rx="11" fill="${accent}"/><text x="24" y="33" text-anchor="middle" font-size="26" font-weight="700" fill="#fff" font-family="Inter,system-ui,sans-serif">${mark}</text></svg>`;
@@ -129,7 +138,11 @@ function shell(css, def, siteTitle, pageTitle, content, siteAvatar, metaDesc = '
   // supaya nilai yang lolos hanya https tanpa kutip/spasi.
   const ogImage = /^https:\/\/[^"'<\s]+$/.test(String(metaImage || '')) ? String(metaImage) : SITE_OG_LOGO;
   const canonical = /^https:\/\/[^"'<\s]+$/.test(String(pageUrl || '')) ? String(pageUrl) : '';
-  const metaTags = `<meta property="og:title" content="${pageTitle} — ${siteTitle}"><meta property="og:type" content="${ogType === 'article' ? 'article' : 'website'}">${canonical ? `<meta property="og:url" content="${canonical}">` : ''}${desc ? `<meta name="description" content="${desc}"><meta property="og:description" content="${desc}">` : ''}<meta property="og:image" content="${ogImage}"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${pageTitle} — ${siteTitle}">${desc ? `<meta name="twitter:description" content="${desc}">` : ''}<meta name="twitter:image" content="${ogImage}">`;
+  // Ukuran gambar hanya diklaim untuk logo default (1200x630 PNG di repo);
+  // gambar postingan dimensinya tidak diketahui, jadi jangan klaim.
+  const isDefaultOg = ogImage === SITE_OG_LOGO;
+  const ogImageSize = isDefaultOg ? `<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:type" content="image/png"><meta property="og:image:alt" content="${pageTitle} — ${siteTitle}">` : '';
+  const metaTags = `<meta property="og:title" content="${pageTitle} — ${siteTitle}"><meta property="og:type" content="${ogType === 'article' ? 'article' : 'website'}"><meta property="og:site_name" content="${siteTitle}"><meta property="og:locale" content="id_ID">${canonical ? `<meta property="og:url" content="${canonical}">` : ''}<meta name="description" content="${desc}"><meta property="og:description" content="${desc}"><meta property="og:image" content="${ogImage}">${ogImageSize}<meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${pageTitle} — ${siteTitle}"><meta name="twitter:description" content="${desc}"><meta name="twitter:image" content="${ogImage}">`;
   const faviconTags = `<link rel="icon" type="image/png" sizes="16x16" href="${SITE_FAVICON_16}"><link rel="icon" type="image/png" sizes="32x32" href="${SITE_FAVICON_32}">` +
     (SITE_FAVICON_48 ? `<link rel="icon" type="image/png" sizes="48x48" href="${SITE_FAVICON_48}">` : '') +
     (SITE_FAVICON_96 ? `<link rel="icon" type="image/png" sizes="96x96" href="${SITE_FAVICON_96}">` : '') +
