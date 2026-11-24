@@ -15,6 +15,18 @@ export const DL_WORKERS_DEV_HOST = 'hozin-cms.muchammadhozin.workers.dev';
 export const DL_CLICK_RETENTION_DAYS = 90;
 export const DL_PRUNE_BATCH = 500;
 
+// Header keamanan untuk semua respons link-dl (koreksi audit 24 Nov 2026:
+// sebelumnya hanya content-type + cache-control). CSP disamakan dengan
+// halaman utama (util.html) supaya skrip tantangan Cloudflare tetap jalan;
+// halaman dl sendiri tidak punya skrip, hanya <style> inline.
+export const DL_SECURITY_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'strict-origin-when-cross-origin',
+  'strict-transport-security': 'max-age=31536000; includeSubDomains',
+  'content-security-policy': "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; frame-src https://www.youtube-nocookie.com https://player.vimeo.com; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+};
+
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 const B62 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 // ID acak 7 karakter base62 (huruf+angka) untuk link baru tanpa kode
@@ -109,21 +121,21 @@ function dlHtml(title, body) {
 // tanpa ctx (tes lokal), pencatatan di-await supaya teruji.
 export async function handleDlRedirect(request, env, ctx, url) {
   try {
-    if (request.method !== 'GET') return new Response('Method tidak diizinkan', { status: 405 });
+    if (request.method !== 'GET') return new Response('Method tidak diizinkan', { status: 405, headers: { ...DL_SECURITY_HEADERS } });
     await ensureSchema(env);
     const code = decodeURIComponent(url.pathname.replace(/^\/+|\/+$/g, ''));
     if (!code) {
-      return new Response(dlHtml('Link Download', `<h1>Link Download</h1><p>Layanan short link unduhan <a href="https://hozinking.my.id/">hozinking.my.id</a>. Buka tautan unduhan dari postingan untuk diarahkan ke file aslinya.</p>`), { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=300' } });
+      return new Response(dlHtml('Link Download', `<h1>Link Download</h1><p>Layanan short link unduhan <a href="https://hozinking.my.id/">hozinking.my.id</a>. Buka tautan unduhan dari postingan untuk diarahkan ke file aslinya.</p>`), { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=300', ...DL_SECURITY_HEADERS } });
     }
-    if (!validDlCode(code)) return new Response(dlHtml('Tidak ditemukan', `<h1>Link tidak ditemukan</h1><p>Kode tautan tidak dikenal. <a href="https://hozinking.my.id/">Kembali ke hozinking.my.id</a></p>`), { status: 404, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+    if (!validDlCode(code)) return new Response(dlHtml('Tidak ditemukan', `<h1>Link tidak ditemukan</h1><p>Kode tautan tidak dikenal. <a href="https://hozinking.my.id/">Kembali ke hozinking.my.id</a></p>`), { status: 404, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...DL_SECURITY_HEADERS } });
     const link = await env.DB.prepare(`SELECT target_url FROM dl_links WHERE code = ? AND active = 1`).bind(code).first();
-    if (!link || !link.target_url) return new Response(dlHtml('Tidak ditemukan', `<h1>Link tidak ditemukan</h1><p>Kode tautan tidak dikenal atau sudah nonaktif. <a href="https://hozinking.my.id/">Kembali ke hozinking.my.id</a></p>`), { status: 404, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+    if (!link || !link.target_url) return new Response(dlHtml('Tidak ditemukan', `<h1>Link tidak ditemukan</h1><p>Kode tautan tidak dikenal atau sudah nonaktif. <a href="https://hozinking.my.id/">Kembali ke hozinking.my.id</a></p>`), { status: 404, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...DL_SECURITY_HEADERS } });
     const p = logDlClick(env, request, code);
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(p);
     else await p;
-    return new Response(null, { status: 302, headers: { location: link.target_url, 'cache-control': 'no-store' } });
+    return new Response(null, { status: 302, headers: { location: link.target_url, 'cache-control': 'no-store', ...DL_SECURITY_HEADERS } });
   } catch (e) {
-    return new Response('Layanan sedang bermasalah, coba lagi sebentar lagi.', { status: 503, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
+    return new Response('Layanan sedang bermasalah, coba lagi sebentar lagi.', { status: 503, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...DL_SECURITY_HEADERS } });
   }
 }
 
@@ -144,7 +156,7 @@ export async function tryDlRedirect(request, env, ctx, url) {
     const p = logDlClick(env, request, code);
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(p);
     else await p;
-    return new Response(null, { status: 302, headers: { location: link.target_url, 'cache-control': 'no-store' } });
+    return new Response(null, { status: 302, headers: { location: link.target_url, 'cache-control': 'no-store', ...DL_SECURITY_HEADERS } });
   } catch (e) { return null; }
 }
 

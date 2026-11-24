@@ -1580,6 +1580,39 @@ env.DB.attempts = [];
 for (let i = 0; i < 5; i++) await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'salah' });
 r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'salah' }); assert(r.status === 403, 'login admin ke-6 setelah 5 gagal tetap ditolak');
 env.DB.attempts = [];
+// Koreksi audit 24 Nov 2026: batas per-akun (kunci 'acct:') — 5 gagal
+// dari IP BERBEDA tetap mengunci akun admin; token benar dari IP baru
+// ditolak sampai jejak direset / 15 menit berlalu.
+for (let i = 0; i < 5; i++) await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'salah' }, '', { 'cf-connecting-ip': '10.0.0.' + (i + 1) });
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' }, '', { 'cf-connecting-ip': '10.0.0.99' });
+assert(r.status === 403, 'login admin: 5 gagal dari IP berbeda mengunci akun (token benar dari IP baru ditolak)');
+env.DB.attempts = [];
+r = await call('POST', '/akun/login', { username: 'muchammadhozin@gmail.com', password: 'test-admin-token' }, '', { 'cf-connecting-ip': '10.0.0.99' });
+assert(r.status === 303, 'login admin: setelah reset jejak, token benar lolos lagi');
+// Komentator: 10 gagal dari IP berbeda -> login benar dari IP baru 429.
+r = await call('POST', '/akun/daftar', { username: 'ratelimit', password: 'password123', email: 'ratelimit@example.com' });
+assert(r.status === 303 && (r.headers.get('location') || '').startsWith('/akun/verifikasi'), 'daftar akun ratelimit redirect ke verifikasi');
+await verifikasiKode('ratelimit@example.com');
+for (let i = 0; i < 10; i++) await call('POST', '/akun/login', { username: 'ratelimit', password: 'salahsalah' }, '', { 'cf-connecting-ip': '10.1.0.' + (i + 1) });
+r = await call('POST', '/akun/login', { username: 'ratelimit', password: 'password123' }, '', { 'cf-connecting-ip': '10.1.0.99' });
+assert(r.status === 429, 'login komentator: 10 gagal dari IP berbeda mengunci akun (429 dari IP baru)');
+env.DB.attempts = [];
+r = await call('POST', '/akun/login', { username: 'ratelimit', password: 'password123' }, '', { 'cf-connecting-ip': '10.1.0.99' });
+assert(r.status === 303, 'login komentator: setelah reset jejak, password benar lolos lagi');
+const rlCookie = cookieHeader(cookiesOf(r));
+// Logout komentator wajib CSRF (koreksi audit 24 Nov 2026).
+r = await call('GET', '/akun', null, rlCookie); t = await r.text();
+const logoutCsrf = (t.match(/action="\/akun\/logout"><input type="hidden" name="csrf" value="([^"]+)"/) || [])[1] || '';
+assert(logoutCsrf.length > 10, 'halaman akun memberi CSRF logout komentator');
+r = await call('POST', '/akun/logout', {}, rlCookie); assert(r.status === 403, 'logout komentator tanpa CSRF ditolak');
+r = await call('POST', '/akun/logout', { csrf: logoutCsrf }, rlCookie); assert(r.status === 303, 'logout komentator dengan CSRF lolos');
+// security.txt (koreksi audit 24 Nov 2026).
+r = await call('GET', '/.well-known/security.txt'); t = await r.text();
+assert(r.status === 200 && t.includes('Contact: mailto:contact@hozinking.my.id'), 'security.txt tampil + kontak');
+r = await call('GET', '/security.txt'); assert(r.status === 200, 'security.txt alias /security.txt tampil');
+// Header keamanan link-dl (koreksi audit 24 Nov 2026).
+r = await callHost('https://link-dl.hozinking.my.id', 'GET', '/');
+assert(r.status === 200 && (r.headers.get('content-security-policy') || '').includes("frame-ancestors 'none'") && r.headers.get('x-frame-options') === 'DENY', 'link-dl: root membawa CSP + X-Frame-Options');
 
 // 3. Admin buat post baru
 r = await call('POST', '/kendali/posts', { csrf, title: 'Post Uji', category: 'Tekno', body: 'Isi post uji kedua.' }, cookie);

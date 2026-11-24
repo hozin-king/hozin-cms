@@ -4675,6 +4675,12 @@ requestAnimationFrame(draw);
       const txt = `User-agent: *\nAllow: /\nDisallow: /kendali/\nDisallow: /akun/\nDisallow: /admin/\nSitemap: ${url.origin}/sitemap.xml\n`;
       return new Response(txt, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
     }
+    // ---- security.txt (koreksi audit 24 Nov 2026): saluran pelaporan
+    // kerentanan, supaya peneliti keamanan tidak perlu menebak kontak.
+    if ((path === '/.well-known/security.txt' || path === '/security.txt') && request.method === 'GET') {
+      const txt = `Contact: mailto:contact@hozinking.my.id\nExpires: 2027-11-24T00:00:00+07:00\nPreferred-Languages: id, en\n`;
+      return new Response(txt, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'public, max-age=3600' } });
+    }
     // ---- ads.txt Google AdSense (satu setting adsense_client) ----
     // Baris persis dari akun AdSense pemilik; ID publisher diambil dari
     // setting, bukan hardcode. Setting kosong = 404 (AdSense tidak aktif).
@@ -5046,7 +5052,7 @@ requestAnimationFrame(draw);
         const statsHtml = stats.totalSeconds > 0
           ? `<div class="card"><h3>Waktu Baca</h3><p>Total membaca: <b>${stats.totalMinutes} menit</b> (${stats.daysActive} hari aktif).</p><p>Hari paling sering baca: <b>${stats.topDay ? esc(stats.topDay.name) + ' (' + esc(stats.topDay.date) + ') · ' + stats.topDay.minutes + ' menit' : '—'}</b></p><p>Jam biasa baca: <b>${stats.hourRange ? esc(stats.hourRange.label) : '—'}</b></p><p class="meta">Waktu baca hanya terhitung saat kamu scroll ke bawah sambil membaca; diam lebih dari 15 detik tidak dihitung.</p></div>`
           : `<div class="card"><h3>Waktu Baca</h3><p>Belum ada waktu baca tercatat. Baca post sambil scroll ke bawah saat login — menitmu tercatat di sini.</p></div>`;
-        return html(await renderPage(env, 'Akun', `<div class="card"><h2>Akun Saya</h2><p>Login sebagai <b>${esc(commenter.username)}</b>.</p><form method="post" action="/akun/logout"><button type="submit">Keluar</button></form></div>${statsHtml}`));
+        return html(await renderPage(env, 'Akun', `<div class="card"><h2>Akun Saya</h2><p>Login sebagai <b>${esc(commenter.username)}</b>.</p><form method="post" action="/akun/logout"><input type="hidden" name="csrf" value="${await userCsrf(env, commenter.id)}"><button type="submit">Keluar</button></form></div>${statsHtml}`));
       }
       const pesan = url.searchParams.get('pesan') === 'login' ? '<div class="card"><p>Login dulu atau buat akun untuk berkomentar.</p></div>' : '';
       // Halaman akun dibuat profesional dan tidak ramai: satu kartu sempit
@@ -5177,17 +5183,36 @@ requestAnimationFrame(draw);
         if (fails && Number(fails.n) >= 5) {
           return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
         }
+        // Koreksi audit 24 Nov 2026: batas per-IP saja tidak cukup —
+        // penyerang dengan IP berotasi (proxy/VPN) mendapat jatah 5 baru
+        // tiap IP. Batas kedua diikat ke AKUN (kunci 'acct:' di tabel yang
+        // sama, tidak peduli IP darimana). Pesan gagal tetap generik.
+        const acctFails = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_login_attempts WHERE ip = ? AND created_at > ?`).bind('acct:' + username, since).first();
+        if (acctFails && Number(acctFails.n) >= 5) {
+          return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
+        }
         if (env.ADMIN_TOKEN && safeEqualHex(password, env.ADMIN_TOKEN)) {
           await env.DB.prepare(`DELETE FROM cms_login_attempts WHERE ip = ?`).bind(ip).run();
+          await env.DB.prepare(`DELETE FROM cms_login_attempts WHERE ip = ?`).bind('acct:' + username).run();
           const remember = form.get('remember') === '1';
           const cookies = await issueTokens(env, request, remember);
           return redirectWithCookies('/kendali', [...cookies, 'cms_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0']);
         }
         await env.DB.prepare(`INSERT INTO cms_login_attempts (ip, created_at) VALUES (?, ?)`).bind(ip, new Date().toISOString()).run();
+        await env.DB.prepare(`INSERT INTO cms_login_attempts (ip, created_at) VALUES (?, ?)`).bind('acct:' + username, new Date().toISOString()).run();
         await logSecurityEvent(env, 'login_gagal', request);
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
       }
       if (!(await checkRateLimit(env, 'akun:' + ip, 5, 15 * 60 * 1000))) {
+        return html(await renderPage(env, 'Akun', '<div class="card"><p>Terlalu banyak percobaan. Coba lagi 15 menit.</p></div>'), 429);
+      }
+      // Koreksi audit 24 Nov 2026: batas per-IP saja lolos bila penyerang
+      // ganti IP tiap percobaan. Batas kedua diikat ke AKUN (10 gagal /
+      // 15 menit, dihitung dari kegagalan SAJA — login benar tidak memakan
+      // jatah, supaya pengguna sah tidak terkunci oleh loginnya sendiri).
+      const acctSince = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      const acctFails = await env.DB.prepare(`SELECT COUNT(*) AS n FROM cms_login_attempts WHERE ip = ? AND created_at > ?`).bind('acct:' + username, acctSince).first();
+      if (acctFails && Number(acctFails.n) >= 10) {
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Terlalu banyak percobaan. Coba lagi 15 menit.</p></div>'), 429);
       }
       // Batas panjang hanya untuk komentator, SETELAH cabang admin di atas
@@ -5200,6 +5225,7 @@ requestAnimationFrame(draw);
       const user = await env.DB.prepare(`SELECT * FROM cms_users WHERE username = ?`).bind(username).first();
       const ok = user && await verifyPassword(password, user.salt, user.password_hash);
       if (!ok) {
+        await env.DB.prepare(`INSERT INTO cms_login_attempts (ip, created_at) VALUES (?, ?)`).bind('acct:' + username, new Date().toISOString()).run();
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Nama pengguna atau password salah.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
       }
       // (v83) Akun belum verifikasi email tidak boleh login. Akun lama
@@ -5207,12 +5233,25 @@ requestAnimationFrame(draw);
       if (Number(user.email_verified) === 0) {
         return html(await renderPage(env, 'Akun', '<div class="card"><p>Akun ini belum diverifikasi. Cek email kamu untuk kode verifikasi, atau <a href="/akun/verifikasi?email=' + encodeURIComponent(user.email || '') + '">minta kode baru</a>.</p><p><a href="/akun">Kembali</a></p></div>'), 403);
       }
+      // Login benar: bersihkan jejak gagal akun ini (jangan hukum pengguna
+      // sah yang sempat salah ketik lalu berhasil masuk).
+      await env.DB.prepare(`DELETE FROM cms_login_attempts WHERE ip = ?`).bind('acct:' + username).run();
       const cookie = await userSessionCookie(env, user.id);
       const headers = new Headers({ location: '/' });
       headers.append('set-cookie', cookie);
       return new Response(null, { status: 303, headers });
     }
     if (path === '/akun/logout' && request.method === 'POST') {
+      // Logout CSRF (koreksi audit 24 Nov 2026): tanpa token, situs lain
+      // bisa mengeluarkan komentator yang sedang login. Bila tidak ada
+      // sesi komentator, logout adalah no-op — bersihkan cookie saja.
+      const commenter = await getCommenter(request, env);
+      if (commenter) {
+        const form = await request.formData();
+        if (String(form.get('csrf') || '') !== await userCsrf(env, commenter.id)) {
+          return html(await renderPage(env, 'Akun', '<div class="card"><p>Token CSRF tidak valid.</p></div>'), 403);
+        }
+      }
       const headers = new Headers({ location: '/' });
       headers.append('set-cookie', 'cms_user=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');
       return new Response(null, { status: 303, headers });
