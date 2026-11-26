@@ -1538,6 +1538,9 @@ assert(t.includes('og:description') && t.includes('Blog Hozin King'), 'OG berand
 assert(t.includes('property="og:image" content="https://raw.githubusercontent.com/hozin-king/hozin-cms/main/public/logo/og-image-1200x630.png"'), 'OG beranda: og:image dari repo sendiri (bukan ImgBB)');
 assert(t.includes('property="og:image:width" content="1200"') && t.includes('property="og:image:height" content="630"'), 'OG beranda: ukuran gambar 1200x630 diklaim');
 assert(t.includes('property="og:site_name" content="WorkerCMS"'), 'OG beranda: og:site_name tampil (= judul situs)');
+// hreflang beranda (26 Nov 2026 — situs hanya berbahasa Indonesia:
+// tiap halaman menunjuk ke dirinya sendiri sebagai id + x-default).
+assert(t.includes('<link rel="alternate" hreflang="id" href="https://cms.test/">') && t.includes('<link rel="alternate" hreflang="x-default" href="https://cms.test/">'), 'hreflang beranda: id + x-default self-referencing');
 
 // 2. Login terpadu di form biasa /akun: nama 'admin' + token admin
 // (salah -> 403 generik, benar -> token akses + refresh + dashboard super-admin)
@@ -1955,11 +1958,13 @@ assert(!t.includes('👁'), 'mata: tidak ada emoji mata di halaman mana pun');
 // 20. URL post profesional + sitemap + AdSense + plugin keamanan
 r = await call('GET', '/post/selamat-datang'); t = await r.text();
 assert(t.includes('Selamat Datang di WorkerCMS'), 'URL post baru /post/<slug> tampil');
+assert(t.includes('<link rel="alternate" hreflang="id" href="https://cms.test/post/selamat-datang">') && t.includes('<link rel="alternate" hreflang="x-default" href="https://cms.test/post/selamat-datang">'), 'hreflang post: id + x-default self-referencing');
 assert(r.headers.get('strict-transport-security') === 'max-age=31536000; includeSubDomains', 'HSTS Worker: max-age 1 tahun + includeSubDomains');
 r = await call('GET', '/p/selamat-datang'); assert(r.status === 301 && (r.headers.get('location') || '') === '/post/selamat-datang', 'URL lama /p/ dialihkan permanen 301 ke /post/');
 r = await call('GET', '/sitemap.xml'); t = await r.text();
 assert(r.headers.get('content-type') && r.headers.get('content-type').includes('application/xml'), 'sitemap: content-type XML');
 assert(t.includes('/post/selamat-datang') && !t.includes('/post/post-private') && !t.includes('/post/post-kunci'), 'sitemap: hanya post publik, bukan private/password');
+assert(t.includes('xmlns:xhtml="http://www.w3.org/1999/xhtml"') && t.includes('<xhtml:link rel="alternate" hreflang="id" href="https://cms.test/post/selamat-datang"/>') && t.includes('<xhtml:link rel="alternate" hreflang="x-default" href="https://cms.test/post/selamat-datang"/>'), 'sitemap: hreflang id + x-default per URL');
 r = await call('GET', '/robots.txt'); t = await r.text();
 assert(t.includes('Disallow: /kendali/') && t.includes('/sitemap.xml'), 'robots: larang admin + tunjuk sitemap');
 r = await call('GET', '/api/nav-posts'); t = await r.text();

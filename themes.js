@@ -142,7 +142,12 @@ function shell(css, def, siteTitle, pageTitle, content, siteAvatar, metaDesc = '
   // gambar postingan dimensinya tidak diketahui, jadi jangan klaim.
   const isDefaultOg = ogImage === SITE_OG_LOGO;
   const ogImageSize = isDefaultOg ? `<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:type" content="image/png"><meta property="og:image:alt" content="${pageTitle} — ${siteTitle}">` : '';
-  const metaTags = `<meta property="og:title" content="${pageTitle} — ${siteTitle}"><meta property="og:type" content="${ogType === 'article' ? 'article' : 'website'}"><meta property="og:site_name" content="${siteTitle}"><meta property="og:locale" content="id_ID">${canonical ? `<meta property="og:url" content="${canonical}">` : ''}<meta name="description" content="${desc}"><meta property="og:description" content="${desc}"><meta property="og:image" content="${ogImage}">${ogImageSize}<meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${pageTitle} — ${siteTitle}"><meta name="twitter:description" content="${desc}"><meta name="twitter:image" content="${ogImage}">`;
+  // 26 Nov 2026 — hreflang self-referencing: situs hanya berbahasa
+  // Indonesia, jadi tiap halaman menunjuk ke dirinya sendiri sebagai
+  // id + x-default. Hanya tampil bila ada URL kanonis (sama seperti
+  // og:url) — halaman error/akun tanpa pageUrl tetap bersih.
+  const hreflangTags = canonical ? `<link rel="alternate" hreflang="id" href="${canonical}"><link rel="alternate" hreflang="x-default" href="${canonical}">` : '';
+  const metaTags = `<meta property="og:title" content="${pageTitle} — ${siteTitle}"><meta property="og:type" content="${ogType === 'article' ? 'article' : 'website'}"><meta property="og:site_name" content="${siteTitle}"><meta property="og:locale" content="id_ID">${canonical ? `<meta property="og:url" content="${canonical}">` : ''}${hreflangTags}<meta name="description" content="${desc}"><meta property="og:description" content="${desc}"><meta property="og:image" content="${ogImage}">${ogImageSize}<meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${pageTitle} — ${siteTitle}"><meta name="twitter:description" content="${desc}"><meta name="twitter:image" content="${ogImage}">`;
   const faviconTags = `<link rel="icon" type="image/png" sizes="16x16" href="${SITE_FAVICON_16}"><link rel="icon" type="image/png" sizes="32x32" href="${SITE_FAVICON_32}">` +
     (SITE_FAVICON_48 ? `<link rel="icon" type="image/png" sizes="48x48" href="${SITE_FAVICON_48}">` : '') +
     (SITE_FAVICON_96 ? `<link rel="icon" type="image/png" sizes="96x96" href="${SITE_FAVICON_96}">` : '') +

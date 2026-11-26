@@ -3049,6 +3049,9 @@ async function handleFetch(request, env, ctx) {
         const ah = adsenseHead(await getSetting(env, 'adsense_client', ''));
         if (ah) bioHtml = bioHtml.replace('</head>', ah + '</head>');
       } catch (e) {}
+      // hreflang self-referencing (26 Nov 2026): /bio hanya berbahasa
+      // Indonesia — pola injeksi yang sama seperti AdSense di atas.
+      bioHtml = bioHtml.replace('</head>', `<link rel="alternate" hreflang="id" href="${url.origin}/bio"><link rel="alternate" hreflang="x-default" href="${url.origin}/bio"></head>`);
       return new Response(bioHtml, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=300' } });
     }
 
@@ -4369,7 +4372,7 @@ async function handleFetch(request, env, ctx) {
       const content = `<h2>Tag: ${esc(label)}</h2>` + (matched.length
         ? matched.map(p => postCard(p, plugins, admin)).join('')
         : '<div class="card"><p>Belum ada post dengan tag ini.</p></div>') + `<p><a href="/">← Beranda</a></p>`;
-      return html(await renderPage(env, 'Tag: ' + label, content, pageOpts(settingsMap, env)), 200);
+      return html(await renderPage(env, 'Tag: ' + label, content, { ...pageOpts(settingsMap, env), pageUrl: url.origin + '/tag/' + wanted }), 200);
     }
 
     // ---- Post terkunci: buka kunci (rate-limit per IP + post) ----
@@ -4644,7 +4647,7 @@ requestAnimationFrame(draw);
         }
       } catch (e) { stopwatchCard = ''; }
       const content = `<div class="card" style="text-align:center;padding:28px 20px"><p style="margin:0 0 10px"><span style="display:inline-block;padding:6px 16px;border-radius:999px;background:#22c55e;color:#fff;font-weight:700;font-size:15px">● Online</span></p><h2 style="margin:6px 0 4px">Status Situs</h2><p style="font-size:42px;font-weight:800;line-height:1;margin:14px 0 2px">${days}</p><p style="margin:0 0 16px;color:#5f6b7a">hari berjalan</p><p style="margin:0">Online sejak 1 Januari 2024</p><p class="meta" style="margin-top:14px">Terakhir diperiksa: ${esc(checkedWib)} WIB (waktu halaman ini dibuka).</p><p class="meta">Catatan: halaman ini menunjukkan keterjangkauan saat ini, bukan riwayat uptime persen — tidak ada angka persen yang diklaim tanpa data monitoring.</p></div>${stopwatchCard}<div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Kunjungan tercatat — 30 hari terakhir</h2><p class="meta" style="margin:0 0 14px">Rata-rata kunjungan harian (dari log kunjungan situs). Bukan persentase uptime — situs ini tidak punya monitoring eksternal.</p>${avgVisits}</div><div class="card" style="margin-top:16px;padding:20px"><h2 style="margin:0 0 4px">Peta serangan &amp; aktivitas diblokir</h2><p class="meta" style="margin:0 0 14px">Seret globe untuk memutar. Ketuk titik untuk melihat detail serangan. Warna busur = negara penyerang (tiap negara warnanya beda). Semua busur menuju hozinking.my.id.</p><p class="meta">${esc(globeNote)}</p><p class="meta" id="feed-status">${esc(feedStatus)}</p><canvas id="attack-globe" style="width:100%;height:300px;display:block"></canvas><p class="meta" id="globe-detail">Ketuk titik di globe untuk melihat detail serangan.</p><ul style="margin:14px 0 0;padding-left:20px">${globeList}</ul>${feedListHtml}</div><script>${globeScript}</script><p><a class="read-more" href="/">← Beranda</a></p>`;
-      return html(await renderPage(env, 'Status Situs', content), 200);
+      return html(await renderPage(env, 'Status Situs', content, { pageUrl: url.origin + '/uptime' }), 200);
     }
 
     // ---- Halaman statis: Kebijakan Privasi + Tentang (21 Nov 2026) ----
@@ -4653,22 +4656,26 @@ requestAnimationFrame(draw);
     // footer semua halaman + sitemap.
     if (request.method === 'GET' && (path === '/privasi' || path === '/privasi/')) {
       const content = `<div class="card"><h2>Kebijakan Privasi</h2><p class="meta">Terakhir diperbarui: 21 November 2026</p><p>Situs ini menghormati privasi pengunjung. Halaman ini menjelaskan data apa yang dikumpulkan hozinking.my.id, untuk apa, dan hak Anda atas data tersebut.</p><h3>Data yang kami kumpulkan</h3><ul><li><b>Akun:</b> bila Anda membuat akun, kami menyimpan nama pengguna, alamat email, dan kata sandi dalam bentuk hash (tidak pernah disimpan sebagai teks biasa).</li><li><b>Komentar:</b> nama dan isi komentar yang Anda kirim, beserta status moderasinya.</li><li><b>Data kunjungan:</b> halaman yang dibuka dan waktu kunjungan dicatat untuk statistik situs.</li><li><b>Data teknis:</b> alamat IP dan user-agent dicatat di log keamanan untuk mencegah spam, serangan, dan penyalahgunaan (termasuk pembatasan laju permintaan).</li><li><b>Cookie:</b> cookie sesi untuk menjaga status login dan preferensi tampilan.</li></ul><h3>Iklan Google</h3><p>Situs ini menampilkan iklan melalui Google AdSense. Google menggunakan cookie untuk menampilkan iklan, termasuk iklan yang dipersonalisasi berdasarkan kunjungan Anda ke situs ini dan situs lain. Anda dapat menonaktifkan personalisasi iklan melalui <a href="https://adssettings.google.com">Pengaturan Iklan Google</a>. Pelajari lebih lanjut di <a href="https://policies.google.com/technologies/ads">kebijakan iklan Google</a>.</p><h3>Bagaimana data dipakai</h3><p>Data dipakai untuk menjalankan situs, menampilkan konten, memoderasi komentar, dan menjaga keamanan. Data tidak dijual dan tidak dibagikan ke pihak ketiga, kecuali kepada penyedia layanan yang diperlukan untuk menjalankan situs (misalnya Cloudflare sebagai penyedia hosting dan Google sebagai penyedia iklan).</p><h3>Hak Anda</h3><p>Anda dapat meminta penghapusan akun, komentar, atau data pribadi Anda. Untuk permintaan terkait data pribadi, hubungi pemilik situs melalui <a href="/kontak">halaman Kontak</a> (contact@hozinking.my.id).</p></div><p><a class="read-more" href="/">← Beranda</a></p>`;
-      return html(await renderPage(env, 'Kebijakan Privasi', content), 200);
+      return html(await renderPage(env, 'Kebijakan Privasi', content, { pageUrl: url.origin + '/privasi' }), 200);
     }
     if (request.method === 'GET' && (path === '/tentang' || path === '/tentang/')) {
       const content = `<div class="card"><h2>Tentang hozinking.my.id</h2><p>hozinking.my.id adalah situs pribadi Hozin King — tempat menulis, berkarya, dan membagikan proyek.</p><p>Di sini ada artikel teknologi, Cerpen Hozin (kumpulan cerita pendek), dan proyek aplikasi serta game Android buatan sendiri. Semua dikerjakan langsung oleh pemilik situs, dari ide sampai rilis.</p><p>Situs ini juga menjadi rumah bagi Cerpen Hozin: baca ceritanya, dan dukung penulisnya. Daftar proyek dan tautan lainnya ada di halaman Bio.</p></div><p><a class="read-more" href="/">← Beranda</a></p>`;
-      return html(await renderPage(env, 'Tentang', content), 200);
+      return html(await renderPage(env, 'Tentang', content, { pageUrl: url.origin + '/tentang' }), 200);
     }
     if (request.method === 'GET' && (path === '/kontak' || path === '/kontak/')) {
       const content = `<div class="card"><h2>Kontak</h2><p>Untuk pertanyaan seputar situs ini, Cerpen Hozin, atau proyek yang dibagikan di sini, hubungi pemilik situs melalui email:</p><p><b><a href="mailto:contact@hozinking.my.id">contact@hozinking.my.id</a></b></p><p class="meta">Email dibaca langsung oleh pemilik situs; balasan mungkin perlu waktu.</p></div><p><a class="read-more" href="/">← Beranda</a></p>`;
-      return html(await renderPage(env, 'Kontak', content), 200);
+      return html(await renderPage(env, 'Kontak', content, { pageUrl: url.origin + '/kontak' }), 200);
     }
 
     // ---- Sitemap + robots (audit 30 Okt 2026: sitemap.xml tadinya 404) ----
     if (path === '/sitemap.xml' && request.method === 'GET') {
       const rows = await env.DB.prepare(`SELECT * FROM cms_posts WHERE status = 'published' AND visibility = 'public' AND publish_at <= ? ORDER BY updated_at DESC`).bind(nowIso).all();
-      const urls = [`<url><loc>${esc(url.origin)}/</loc></url>`, `<url><loc>${esc(url.origin)}/privasi</loc></url>`, `<url><loc>${esc(url.origin)}/tentang</loc></url>`, `<url><loc>${esc(url.origin)}/kontak</loc></url>`, ...(rows.results || []).map(p => `<url><loc>${esc(url.origin)}/post/${esc(p.slug)}</loc><lastmod>${esc(String(p.updated_at || p.created_at || '').slice(0, 10))}</lastmod></url>`)];
-      const xml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.join('')}</urlset>`;
+      // hreflang di sitemap (26 Nov 2026): tiap URL menunjuk ke dirinya
+      // sendiri sebagai id + x-default — situs hanya berbahasa Indonesia.
+      const hl = (loc) => `<xhtml:link rel="alternate" hreflang="id" href="${loc}"/><xhtml:link rel="alternate" hreflang="x-default" href="${loc}"/>`;
+      const u = (loc, extra = '') => `<url><loc>${loc}</loc>${hl(loc)}${extra}</url>`;
+      const urls = [u(esc(url.origin) + '/'), u(esc(url.origin) + '/privasi'), u(esc(url.origin) + '/tentang'), u(esc(url.origin) + '/kontak'), ...(rows.results || []).map(p => u(esc(url.origin) + '/post/' + esc(p.slug), `<lastmod>${esc(String(p.updated_at || p.created_at || '').slice(0, 10))}</lastmod>`))];
+      const xml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">${urls.join('')}</urlset>`;
       return new Response(xml, { status: 200, headers: { 'content-type': 'application/xml; charset=utf-8' } });
     }
     if (path === '/robots.txt' && request.method === 'GET') {
